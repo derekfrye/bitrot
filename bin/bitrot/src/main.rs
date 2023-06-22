@@ -1,7 +1,7 @@
 
 
 use std::io;
-use std::env;
+// use std::env;
 use std::fs;
 use std::io::BufRead;
 use md5::Digest;
@@ -9,36 +9,35 @@ use regex::Regex;
 // use std::error::Error;
 use thiserror::Error;
 use anyhow::{Context, Result};
-
+use clap::Parser;
 
 
 fn main()-> Result<()>{
 
-    let args: Vec<String> = env::args().collect();
-    let path_to_movies = &args[1];
-    let path_to_par2s = &args[2];
-
-    println!("Using movie path {} and par2 path {}", path_to_movies, path_to_par2s);
+    let args = Args::parse();
     
-    
-    let movies = fs::read_dir(path_to_movies)?
-        .map(|res| res.map(|e| e.path()))
-        .collect::<Result<Vec<_>, io::Error>>()?;
+    if args.mode == "ck" {
+        println!("Using movie path {} and par2 path {}", args.path_to_movies, args.path_to_par2s);    
+        
+        let movies = fs::read_dir(args.path_to_movies)?
+            .map(|res| res.map(|e| e.path()))
+            .collect::<Result<Vec<_>, io::Error>>()?;
 
-    for movie_as_path in movies.iter() {
-        
-        // idea for converting to string from https://stackoverflow.com/questions/37388107/how-to-convert-the-pathbuf-to-string
-        let movie_as_str = movie_as_path.to_string_lossy();
-        let movie_basename = movie_as_path.file_name().unwrap().to_string_lossy();
-        
-        let x = validate_ondisk_md5(&movie_as_str, &movie_basename, &path_to_par2s)?;
-        
+        // iterate through movies and do the compare
+        for movie_as_path in movies.iter() {
+            
+            // idea for converting to string from https://stackoverflow.com/questions/37388107/how-to-convert-the-pathbuf-to-string
+            let movie_as_str = movie_as_path.to_string_lossy();
+            let movie_basename = movie_as_path.file_name().unwrap().to_string_lossy();
+            
+            let _ = validate_ondisk_md5(&movie_as_str, &movie_basename, &args.path_to_par2s, args.bufsize)?;
+        }
+
     }
-
     Ok(())
 }
 
-fn validate_ondisk_md5(movie_path: &str, movie_basenm: &str, par_path: &str)-> Result<(), anyhow::Error> {
+fn validate_ondisk_md5(movie_path: &str, movie_basenm: &str, par_path: &str, bufsize: u16)-> Result<(), anyhow::Error> {
 
     let re = Regex::new(r"\.[Mm][4pP][vV4]$").unwrap();
     let md5ending =".md5.txt";
@@ -50,11 +49,13 @@ fn validate_ondisk_md5(movie_path: &str, movie_basenm: &str, par_path: &str)-> R
         par.push_str(md5ending); // /par2path/movienm.md5.txt
         let par_as_path = std::path::Path::new(&par);
 
+        println!("Checking {}...", movie_basenm);
+
         // if /par2path/movienm.md5.txt exists and is readable
         if fs::metadata(par_as_path).is_ok() {
 
-            // println!("Checking {}...", movie_as_str);
-            let digest = cksum(&movie_path);
+            
+            let digest = cksum(&movie_path, bufsize);
             
             let mut md5hash_fromdisk = String::from("x");
             
@@ -62,13 +63,14 @@ fn validate_ondisk_md5(movie_path: &str, movie_basenm: &str, par_path: &str)-> R
             // reads just the first entries in teh file, before any spaces or newllines
             if par_as_path.metadata().unwrap().len() > 0 {
                 md5hash_fromdisk = fs::read_to_string(par_as_path).unwrap().split_whitespace().collect();
+                // println!("read {}", md5hash_fromdisk);
             }
 
             // tell caller this integrity check failed
             if md5hash_fromdisk != format!("{:x}", digest) {
                 //Err(InvalidLookahead(movie_path));
                 // return Err(AppError::ConfigLoad { source: movie_path });
-                return Err(WordCountError::EmptySource)
+                return Err(AppError::MismatchError)
                     .context(format!("FAIL, mismatch between {} on-disk md5.", movie_path));
             }
             // else {
@@ -76,18 +78,23 @@ fn validate_ondisk_md5(movie_path: &str, movie_basenm: &str, par_path: &str)-> R
             //         .context(format!("SUCCESS, match between {} on-disk md5.", movie_path));
             // }
         }
+        else {
+            return Err(AppError::EmptySource)
+                    .context(format!("No md5 on disk found for {}", movie_path));
+        }
     }
 
     Ok(())
 }
 
-fn cksum(file_path: &str) -> Digest{
+fn cksum(file_path: &str, bufsize: u16) -> Digest{
     // copy/paste from https://stackoverflow.com/questions/75442962/how-to-do-partial-read-and-calculate-md5sum-of-a-large-file-in-rust
     let f = fs::File::open(file_path).unwrap();
     // Find the length of the file
     let len = f.metadata().unwrap().len();
-    // Decide on a reasonable buffer size (100MB in this case, fastest will depend on hardware)
-    let buf_len = len.min(1000000*1024*500) as usize;
+    // Decide on a reasonable buffer size (500MB in this case, fastest will depend on hardware)
+    let ss: u64 = 1000000000 * bufsize as u64;
+    let buf_len = len.min(ss.into()) as usize;
     let mut buf = io::BufReader::with_capacity(buf_len, f);
     let mut context = md5::Context::new();
     
@@ -108,19 +115,43 @@ fn cksum(file_path: &str) -> Digest{
     return digest;
 }
 
+// help at https://docs.rs/clap/latest/clap/_derive/_tutorial/index.html
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Path to the data files to checksum
+    #[arg(short = 'd', long,  value_name = "MOVIES")]
+    path_to_movies: String,
+
+    /// Path to the on-disk checksums, must match by /data files/filename.md5.txt
+    #[arg(short = 'p', long, value_name = "PAR2s")]
+    path_to_par2s: String,
+
+    /// Not supported yet
+    #[arg(short, long)]
+    verbose: bool,
+
+    /// Mode to operate in. Ck or create.
+    #[arg(short = 'm', long,  value_name = "MODE")]
+    mode: String,
+
+    /// Mode to operate in. Ck or create.
+    #[arg(short, long,  value_name = "BUFFERSIZE")]
+    bufsize: u16,
+}
 
 // taken from https://nick.groenen.me/posts/rust-error-handling/
-/// WordCountError enumerates all possible errors returned by this library.
 #[derive(Error, Debug)]
-pub enum WordCountError {
+enum AppError {
     /// Represents an empty source. For example, an empty text file being given
     /// as input to `count_words()`.
-    #[error("Source contains no data")]
+    #[error("Missing MD5")]
     EmptySource,
 
-    /// Represents a failure to read from input.
-    #[error("Read error")]
-    ReadError { source: std::io::Error },
+    // /// Represents a failure to read from input.
+    #[error("Mismatch MD5")]
+    MismatchError,
+    // ReadError { source: std::io::Error },    
 
     /// Represents all other cases of `std::io::Error`.
     #[error(transparent)]
