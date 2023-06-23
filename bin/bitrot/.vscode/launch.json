@@ -20,8 +20,15 @@
                 }
             },
             "args": [
+                "--path-to-movies",
                 "/home/mini/tmp/",
-                "/home/mini/tmp2/"
+                "--path-to-par2s",
+                "/home/mini/tmp2/",
+                "--mode",
+                "ck",
+                "--bufsize",
+                "512",
+                "--verbose"
             ],
             "cwd": "${workspaceFolder}"
         },

@@ -11,3 +11,6 @@ regex = "1"
 thiserror = "1"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+chrono = "0.4"
+indicatif = "0.17.5"
+console = "0.15.7"

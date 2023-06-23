@@ -1,5 +1,3 @@
-
-
 use std::io;
 // use std::env;
 use std::fs;
@@ -10,34 +8,55 @@ use regex::Regex;
 use thiserror::Error;
 use anyhow::{Context, Result};
 use clap::Parser;
-
+use chrono::{Timelike, Local};
+use indicatif::{ProgressBar, ProgressStyle, MultiProgress};
+use std::time::Duration;
+use console::{style};
 
 fn main()-> Result<()>{
 
     let args = Args::parse();
     
     if args.mode == "ck" {
-        println!("Using movie path {} and par2 path {}", args.path_to_movies, args.path_to_par2s);    
+        println!("Using data path {} and cksum path {}", args.path_to_data, args.cksums);    
         
-        let movies = fs::read_dir(args.path_to_movies)?
+        let movies = fs::read_dir(args.path_to_data)?
             .map(|res| res.map(|e| e.path()))
             .collect::<Result<Vec<_>, io::Error>>()?;
 
+        let now = Local::now();
+        let (is_pm, hour) = now.hour12();
+        println!("{:02}:{:02}:{:02}{} Processing {} files..."
+            ,  style(hour).bold().dim()
+            ,  style(now.minute()).bold().dim()
+            ,  style(now.second()).bold().dim()
+            ,  style(if is_pm { "p" } else { "a" }).bold().dim()
+            , movies.len()
+        );
+
+        let i = movies.len();
+        let pb = build_progress_bar_export(i);
+        
         // iterate through movies and do the compare
         for movie_as_path in movies.iter() {
-            
             // idea for converting to string from https://stackoverflow.com/questions/37388107/how-to-convert-the-pathbuf-to-string
             let movie_as_str = movie_as_path.to_string_lossy();
             let movie_basename = movie_as_path.file_name().unwrap().to_string_lossy();
             
-            let _ = validate_ondisk_md5(&movie_as_str, &movie_basename, &args.path_to_par2s, args.bufsize)?;
+            pb[0].set_message(format!("{movie_basename}..."));
+            let _ = validate_ondisk_md5(&movie_as_str, &movie_basename, &args.cksums, args.bufsize, args.verbose)?;
+            pb[0].inc(1);
+            pb[1].inc(1);
         }
+
+        pb[0].finish();
+        pb[1].finish();
 
     }
     Ok(())
 }
 
-fn validate_ondisk_md5(movie_path: &str, movie_basenm: &str, par_path: &str, bufsize: u16)-> Result<(), anyhow::Error> {
+fn validate_ondisk_md5(movie_path: &str, movie_basenm: &str, par_path: &str, bufsize: u16, verbose: bool)-> Result<(), anyhow::Error> {
 
     let re = Regex::new(r"\.[Mm][4pP][vV4]$").unwrap();
     let md5ending =".md5.txt";
@@ -49,7 +68,9 @@ fn validate_ondisk_md5(movie_path: &str, movie_basenm: &str, par_path: &str, buf
         par.push_str(md5ending); // /par2path/movienm.md5.txt
         let par_as_path = std::path::Path::new(&par);
 
-        println!("Checking {}...", movie_basenm);
+        if verbose {
+            println!("Checking {}...", movie_basenm);
+        }
 
         // if /par2path/movienm.md5.txt exists and is readable
         if fs::metadata(par_as_path).is_ok() {
@@ -120,12 +141,12 @@ fn cksum(file_path: &str, bufsize: u16) -> Digest{
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Path to the data files to checksum
-    #[arg(short = 'd', long,  value_name = "MOVIES")]
-    path_to_movies: String,
+    #[arg(short = 'd', long,  value_name = "DATA")]
+    path_to_data: String,
 
     /// Path to the on-disk checksums, must match by /data files/filename.md5.txt
-    #[arg(short = 'p', long, value_name = "PAR2s")]
-    path_to_par2s: String,
+    #[arg(short = 'c', long, value_name = "CKSUMS")]
+    cksums: String,
 
     /// Not supported yet
     #[arg(short, long)]
@@ -135,7 +156,7 @@ struct Args {
     #[arg(short = 'm', long,  value_name = "MODE")]
     mode: String,
 
-    /// Mode to operate in. Ck or create.
+    /// Buffer size for reading files, in MiB. 512 seems to work well.
     #[arg(short, long,  value_name = "BUFFERSIZE")]
     bufsize: u16,
 }
@@ -156,4 +177,43 @@ enum AppError {
     /// Represents all other cases of `std::io::Error`.
     #[error(transparent)]
     IOError(#[from] std::io::Error),
+}
+
+fn build_progress_bar_export(total_messages: usize) -> Vec<ProgressBar> {
+    
+    
+
+    let mut z: Vec<ProgressBar> = Vec::new();
+    let m = MultiProgress::new();
+    
+    let pb = m.add(ProgressBar::new(total_messages.try_into().unwrap()));
+    // z.append(pb);
+    
+    let spinner_style = ProgressStyle::with_template("{prefix:.bold.dim} {spinner} {wide_msg}")
+        .unwrap()
+        .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ");
+
+    pb.set_style(spinner_style.clone());
+
+    pb.set_position(0);
+    pb.enable_steady_tick(Duration::from_millis(100));
+    
+    let pb1 = m.add(ProgressBar::new(total_messages.try_into().unwrap()));
+
+    pb1.set_style(
+        ProgressStyle::default_bar()
+            .template(
+                "{spinner:.green} [{elapsed}] [{bar:.blue}] {pos}/{len} (ETA: {eta})",
+            )
+            .unwrap()
+            .progress_chars("#>-"),
+    );
+
+    pb1.set_position(0);
+    pb1.enable_steady_tick(Duration::from_millis(100));
+
+    z.insert(0, pb);
+    z.insert(1, pb1);
+
+    return z;
 }
