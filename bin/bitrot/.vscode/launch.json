@@ -20,15 +20,18 @@
                 }
             },
             "args": [
-                "--path-to-movies",
+                "--path-to-data",
                 "/home/mini/tmp/",
-                "--path-to-par2s",
+                "--path-to-cksums",
                 "/home/mini/tmp2/",
                 "--mode",
                 "ck",
                 "--bufsize",
                 "512",
-                "--verbose"
+                "--data-filename-match",
+                ".[Mm][pP4][4vV]$",
+                "--thread-count",
+                "2"
             ],
             "cwd": "${workspaceFolder}"
         },

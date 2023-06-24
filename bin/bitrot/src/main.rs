@@ -1,45 +1,40 @@
-use std::io;
-// use std::env;
-use std::fs;
-use std::io::BufRead;
-// use std::path::{Path, PathBuf};
-// use clap::error::Result;
-use md5::Digest;
-use regex::Regex;
-// use std::error::Error;
 use anyhow::{Context, Result};
 use chrono::{Local, Timelike};
 use clap::Parser;
 use console::style;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use md5::Digest;
+use regex::Regex;
+use std::fs;
+use std::io;
+use std::io::BufRead;
+use std::path::PathBuf;
 use std::time::Duration;
 use thiserror::Error;
 
 fn main() -> Result<()> {
     let args = Args::parse();
 
+    if 0 == args.thread_count {
+        panic!("wha");
+    }
+
     if args.mode == "ck" {
         println!(
-            "Using data path {} and cksum path {}",
-            args.path_to_data, args.cksums
+            "Using data path {} and checksums path {}",
+            args.path_to_data, args.path_to_cksums
         );
 
         // r"\.[Mm][4pP][vV4]$"
         let re = Regex::new(&args.data_filename_match).unwrap();
 
         // idea from https://stackoverflow.com/questions/58062887/filtering-files-or-directories-discovered-with-fsread-dir
-        let movies: Vec<_> = fs::read_dir(args.path_to_data)?
+        let data_files: Vec<_> = fs::read_dir(args.path_to_data)?
             .into_iter()
             .filter(|z| z.is_ok())
             .map(|r| r.unwrap().path())
             .filter(|z| z.is_file())
             .into_iter()
-            // .filter(|t| {  })
-            // .into_iter().collect();
-            // .collect::Result<Vec<_>, io::e();
-            // .collect::<Result<Vec<PathBuf>>, io::Error>()
-            // .collect::Vec<PathBuf>()
-            // .into_iter()
             .filter(|ab| re.is_match(&ab.file_name().unwrap().to_string_lossy()))
             .collect();
 
@@ -51,29 +46,63 @@ fn main() -> Result<()> {
             style(now.minute()).bold().dim(),
             style(now.second()).bold().dim(),
             style(if is_pm { "p" } else { "a" }).bold().dim(),
-            movies.len()
+            data_files.len()
         );
 
-        let i = movies.len();
-        let pb = build_progress_bar_export(i);
+        let pb = build_progress_bar_export(data_files.len());
 
         // iterate through movies and do the compare
-        for movie_as_path in movies.iter() {
+        for movie_as_path in data_files.iter() {
             // idea for converting to string from https://stackoverflow.com/questions/37388107/how-to-convert-the-pathbuf-to-string
             let movie_as_str = movie_as_path.to_string_lossy();
             let movie_basename = movie_as_path.file_name().unwrap().to_string_lossy();
 
             pb[0].set_message(format!("{movie_basename}..."));
-            let _ =
-                validate_ondisk_md5(&movie_as_str, &movie_basename, &args.cksums, args.bufsize)?;
+            let _ = validate_ondisk_md5(
+                &movie_as_str,
+                &movie_basename,
+                &args.path_to_cksums,
+                args.bufsize,
+            )?;
             pb[0].inc(1);
             pb[1].inc(1);
         }
 
         pb[0].finish();
         pb[1].finish();
+
+        let zz = assign_work(data_files, args.thread_count);
+        let tjkj = zz.len();
     }
+
     Ok(())
+}
+
+fn assign_work(mut z: Vec<PathBuf>, threadcnt: u16) -> Vec<Work> {
+    let mut x: Vec<Work> = Vec::new();
+
+    // these are the movies
+    z.sort_by_key(|x| x.metadata().unwrap().len());
+    z.reverse();
+
+    // let threadworkers = Vec::new();
+
+    // now there's a queue per thread in x
+    for ia in 0..threadcnt {
+        // let ab: Vec<PathBuf> = Vec::new();
+        let work = Work {
+            wrok: Vec::new(), // , thread_num: ia
+        };
+        x.insert(ia.into(), work);
+    }
+
+    for ia in 0..z.len() {
+        x[ia % threadcnt as usize]
+            .wrok
+            .push(z[ia].to_string_lossy().into_owned());
+    }
+
+    return x;
 }
 
 fn validate_ondisk_md5(
@@ -156,13 +185,13 @@ fn cksum(file_path: &str, bufsize: u16) -> Digest {
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Path to the data files to checksum
+    /// Path to the data files to checksum.
     #[arg(short = 'd', long, value_name = "DATA")]
     path_to_data: String,
 
-    /// Path to the on-disk checksums, must match by /data files/filename.md5.txt
+    /// Path to the on-disk checksums, must match by /data files/filename.md5.txt.
     #[arg(short = 'c', long, value_name = "CKSUMS")]
-    cksums: String,
+    path_to_cksums: String,
 
     /// Mode to operate in. Ck or create.
     #[arg(short = 'm', long, value_name = "MODE")]
@@ -172,9 +201,13 @@ struct Args {
     #[arg(short, long, value_name = "BUFFERSIZE")]
     bufsize: u16,
 
-    /// Regex pattern of data files to match against
+    /// Regex pattern of data files to match against.
     #[arg(short = 'r', long, value_name = "REGEX")]
     data_filename_match: String,
+
+    /// Number of threads to read and checksum data.
+    #[arg(short, long, value_name = "THREADCOUNT")]
+    thread_count: u16,
 }
 
 // taken from https://nick.groenen.me/posts/rust-error-handling/
@@ -226,4 +259,9 @@ fn build_progress_bar_export(total_messages: usize) -> Vec<ProgressBar> {
     z.insert(1, pb1);
 
     return z;
+}
+
+struct Work {
+    // thread_num: u16,
+    wrok: Vec<String>,
 }
