@@ -31,7 +31,7 @@
                 "--data-filename-match",
                 ".[Mm][pP4][4vV]$",
                 "--thread-count",
-                "2"
+                "1"
             ],
             "cwd": "${workspaceFolder}"
         },

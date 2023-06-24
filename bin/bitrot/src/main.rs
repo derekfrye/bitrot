@@ -1,25 +1,39 @@
+mod progress;
+// use crate::progress::hosting;
+
 use anyhow::{Context, Result};
 use chrono::{Local, Timelike};
 use clap::Parser;
 use console::style;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use std::time::Duration;
 use md5::Digest;
 use regex::Regex;
 use std::fs;
 use std::io;
 use std::io::BufRead;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crossbeam_channel::{unbounded, Sender};
 use std::thread;
-use std::time::Duration;
+
 use thiserror::Error;
 
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    if 0 == args.thread_count {
+    if args.thread_count == 0 {
         panic!("wha");
+    }
+
+    if let Some(d) = args.error_output_file.as_deref() {
+        let x = Path::new(d);
+        if fs::metadata(x).is_ok() {
+            if args.pretty_print {
+                println!("Writing to error file {}", d);
+            }
+        } else {
+            panic!("Cannot write to {}", d);
+        }
     }
 
     if args.mode == "ck" {
@@ -52,38 +66,23 @@ fn main() -> Result<()> {
             data_files.len()
         );
 
-        let pb = build_progress_bar_export(data_files.len(), args.thread_count);
+        let pb = progress::build_progress_bar_export(data_files.len(), args.thread_count, args.pretty_print);
 
         let zz = assign_work(data_files, args.thread_count);
         let (tx, rx) = unbounded();
-        // let kjdfj = args.path_to_cksums.clone();
+
         let mut i = 0;
         for x in zz {
             let tx1 = tx.clone();
             let kjdfj = args.path_to_cksums.clone();
             thread::spawn(move || {
-                // pb[i].set_message(format!("{movie_basename}..."));
-
-                // let msg = [i ,   ];
-
                 let _ = do_work(x.wrok, &kjdfj, args.bufsize, i, tx1);
-
-                // let vals = vec![
-                //     String::from("hi"),
-                //     String::from("from"),
-                //     String::from("the"),
-                //     String::from("thread"),
-                // ];
-
-                // for val in vals {
-                //     tx1.send(val).unwrap();
-                //     thread::sleep(Duration::from_secs(1));
-                // }
             });
             i += 1;
         }
         drop(tx);
 
+        let final_progress_bar = args.thread_count.to_string().parse::<usize>().unwrap();
         for received in rx {
             // println!("Got: {}", received);
             let xa = received.split_terminator("|").collect::<Vec<&str>>();
@@ -91,23 +90,16 @@ fn main() -> Result<()> {
             let sb = xa[0].parse::<usize>().unwrap();
             let djk = xa[1];
             if xa.len() == 2 {
-                pb[sb].set_message(format!("{djk}..."));
+                // pb[sb].set_message(format!("{djk}..."));
+                progress::set_message(&pb[sb], djk);
             } else if xa.len() == 3 {
-                pb[sb].finish();
+                progress::finish_progress_bar(&pb[sb]);
             }
             // pb[args.thread_count.to_string().parse::<usize>().unwrap()].set_message(format!("..."));
-            pb[args.thread_count.to_string().parse::<usize>().unwrap()].inc(1);
+            progress::increment_progress_bar(&pb[final_progress_bar]);
         }
 
-        // // iterate through movies and do the compare
-        // for movie_as_path in data_files.iter() {
-
-        //     pb[0].inc(1);
-        //     pb[1].inc(1);
-        // }
-
-        // pb[0].finish();
-        pb[1].finish();
+        progress::finish_progress_bar(&pb[final_progress_bar]);
     }
 
     Ok(())
@@ -180,9 +172,9 @@ fn validate_ondisk_md5(
     // if re.is_match(movie_path) {
 
     let mut par = String::from(par_path);
-    par.push_str(&movie_basenm); // /par2path/movienm
-    par.push_str(md5ending); // /par2path/movienm.md5.txt
-    let par_as_path = std::path::Path::new(&par);
+    par.push_str(&movie_basenm); // /cksumpath/datafilenm
+    par.push_str(md5ending); // /cksumpath/datafilenm.md5.txt
+    let par_as_path = Path::new(&par);
 
     // if /par2path/movienm.md5.txt exists and is readable
     if fs::metadata(par_as_path).is_ok() {
@@ -246,7 +238,7 @@ fn cksum(file_path: &str, bufsize: u16) -> Digest {
 }
 
 // help at https://docs.rs/clap/latest/clap/_derive/_tutorial/index.html
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Path to the data files to checksum.
@@ -269,9 +261,17 @@ struct Args {
     #[arg(short = 'r', long, value_name = "REGEX")]
     data_filename_match: String,
 
-    /// Number of threads to read and checksum data.
+    /// Number of threads to read and checksum data. I suggest set to num of cpu cores.
     #[arg(short, long, value_name = "THREADCOUNT")]
     thread_count: u16,
+
+    /// Whether to print progress or not.
+    #[arg(short, long)]
+    pretty_print: bool,
+
+    /// File to write errors to. If not set, halts program on first error.
+    #[arg(short, long, value_name = "ERRORFILE")]
+    error_output_file: Option<String>,
 }
 
 // taken from https://nick.groenen.me/posts/rust-error-handling/
@@ -291,41 +291,7 @@ enum AppError {
     IOError(#[from] std::io::Error),
 }
 
-fn build_progress_bar_export(total_messages: usize, threadcnt: u16) -> Vec<ProgressBar> {
-    let mut z: Vec<ProgressBar> = Vec::new();
-    let m = MultiProgress::new();
 
-    for i in 0..threadcnt {
-        let pb = m.add(ProgressBar::new(total_messages.try_into().unwrap()));
-        // z.append(pb);
-
-        let spinner_style = ProgressStyle::with_template("{prefix:.bold.dim} {spinner} {wide_msg}")
-            .unwrap()
-            .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ");
-
-        pb.set_style(spinner_style.clone());
-
-        pb.set_position(0);
-        pb.enable_steady_tick(Duration::from_millis(100));
-        z.insert(i.into(), pb);
-    }
-
-    let pb1 = m.add(ProgressBar::new(total_messages.try_into().unwrap()));
-
-    pb1.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed}] [{bar:.blue}] {pos}/{len} (ETA: {eta})")
-            .unwrap()
-            .progress_chars("#>-"),
-    );
-
-    pb1.set_position(0);
-    pb1.enable_steady_tick(Duration::from_millis(100));
-
-    z.insert(threadcnt.into(), pb1);
-
-    return z;
-}
 
 struct Work {
     // thread_num: u16,
