@@ -9,6 +9,9 @@ use std::fs;
 use std::io;
 use std::io::BufRead;
 use std::path::PathBuf;
+
+use crossbeam_channel::{unbounded, Sender};
+use std::thread;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -49,31 +52,94 @@ fn main() -> Result<()> {
             data_files.len()
         );
 
-        let pb = build_progress_bar_export(data_files.len());
-
-        // iterate through movies and do the compare
-        for movie_as_path in data_files.iter() {
-            // idea for converting to string from https://stackoverflow.com/questions/37388107/how-to-convert-the-pathbuf-to-string
-            let movie_as_str = movie_as_path.to_string_lossy();
-            let movie_basename = movie_as_path.file_name().unwrap().to_string_lossy();
-
-            pb[0].set_message(format!("{movie_basename}..."));
-            let _ = validate_ondisk_md5(
-                &movie_as_str,
-                &movie_basename,
-                &args.path_to_cksums,
-                args.bufsize,
-            )?;
-            pb[0].inc(1);
-            pb[1].inc(1);
-        }
-
-        pb[0].finish();
-        pb[1].finish();
+        let pb = build_progress_bar_export(data_files.len(), args.thread_count);
 
         let zz = assign_work(data_files, args.thread_count);
-        let tjkj = zz.len();
+        let (tx, rx) = unbounded();
+        // let kjdfj = args.path_to_cksums.clone();
+        let mut i = 0;
+        for x in zz {
+            let tx1 = tx.clone();
+            let kjdfj = args.path_to_cksums.clone();
+            thread::spawn(move || {
+                // pb[i].set_message(format!("{movie_basename}..."));
+
+                // let msg = [i ,   ];
+
+                let _ = do_work(x.wrok, &kjdfj, args.bufsize, i, tx1);
+
+                // let vals = vec![
+                //     String::from("hi"),
+                //     String::from("from"),
+                //     String::from("the"),
+                //     String::from("thread"),
+                // ];
+
+                // for val in vals {
+                //     tx1.send(val).unwrap();
+                //     thread::sleep(Duration::from_secs(1));
+                // }
+            });
+            i += 1;
+        }
+        drop(tx);
+
+        for received in rx {
+            // println!("Got: {}", received);
+            let xa = received.split_terminator("|").collect::<Vec<&str>>();
+
+            let sb = xa[0].parse::<usize>().unwrap();
+            let djk = xa[1];
+            if xa.len() == 2 {
+                pb[sb].set_message(format!("{djk}..."));
+            } else if xa.len() == 3 {
+                pb[sb].finish();
+            }
+            // pb[args.thread_count.to_string().parse::<usize>().unwrap()].set_message(format!("..."));
+            pb[args.thread_count.to_string().parse::<usize>().unwrap()].inc(1);
+        }
+
+        // // iterate through movies and do the compare
+        // for movie_as_path in data_files.iter() {
+
+        //     pb[0].inc(1);
+        //     pb[1].inc(1);
+        // }
+
+        // pb[0].finish();
+        pb[1].finish();
     }
+
+    Ok(())
+}
+
+fn do_work(
+    xx: Vec<PathBuf>,
+    path_to_cksums: &str,
+    bufsize: u16,
+    statusbar: u16,
+    ab: Sender<String>,
+) -> Result<()> {
+    for x in xx {
+        // idea for converting to string from https://stackoverflow.com/questions/37388107/how-to-convert-the-pathbuf-to-string
+        let movie_as_str = x.to_string_lossy();
+        let movie_basename = x.file_name().unwrap().to_string_lossy();
+
+        let mut status_bar_and_working_file = statusbar.to_string();
+        status_bar_and_working_file.push_str("|");
+        status_bar_and_working_file.push_str(&movie_basename);
+
+        ab.send(status_bar_and_working_file).unwrap();
+
+        // let _ = validate_ondisk_md5(&movie_as_str, &movie_basename, &path_to_cksums, bufsize)?;
+        thread::sleep(Duration::from_millis(1500));
+    }
+
+    let mut status_bar_and_working_file = statusbar.to_string();
+    status_bar_and_working_file.push_str("|");
+    status_bar_and_working_file.push_str(" ");
+    status_bar_and_working_file.push_str("done");
+    ab.send(status_bar_and_working_file).unwrap();
 
     Ok(())
 }
@@ -83,7 +149,7 @@ fn assign_work(mut z: Vec<PathBuf>, threadcnt: u16) -> Vec<Work> {
 
     // these are the movies
     z.sort_by_key(|x| x.metadata().unwrap().len());
-    z.reverse();
+    // z.reverse();
 
     // let threadworkers = Vec::new();
 
@@ -97,9 +163,7 @@ fn assign_work(mut z: Vec<PathBuf>, threadcnt: u16) -> Vec<Work> {
     }
 
     for ia in 0..z.len() {
-        x[ia % threadcnt as usize]
-            .wrok
-            .push(z[ia].to_string_lossy().into_owned());
+        x[ia % threadcnt as usize].wrok.push(z[ia].to_owned());
     }
 
     return x;
@@ -227,21 +291,24 @@ enum AppError {
     IOError(#[from] std::io::Error),
 }
 
-fn build_progress_bar_export(total_messages: usize) -> Vec<ProgressBar> {
+fn build_progress_bar_export(total_messages: usize, threadcnt: u16) -> Vec<ProgressBar> {
     let mut z: Vec<ProgressBar> = Vec::new();
     let m = MultiProgress::new();
 
-    let pb = m.add(ProgressBar::new(total_messages.try_into().unwrap()));
-    // z.append(pb);
+    for i in 0..threadcnt {
+        let pb = m.add(ProgressBar::new(total_messages.try_into().unwrap()));
+        // z.append(pb);
 
-    let spinner_style = ProgressStyle::with_template("{prefix:.bold.dim} {spinner} {wide_msg}")
-        .unwrap()
-        .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ");
+        let spinner_style = ProgressStyle::with_template("{prefix:.bold.dim} {spinner} {wide_msg}")
+            .unwrap()
+            .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ");
 
-    pb.set_style(spinner_style.clone());
+        pb.set_style(spinner_style.clone());
 
-    pb.set_position(0);
-    pb.enable_steady_tick(Duration::from_millis(100));
+        pb.set_position(0);
+        pb.enable_steady_tick(Duration::from_millis(100));
+        z.insert(i.into(), pb);
+    }
 
     let pb1 = m.add(ProgressBar::new(total_messages.try_into().unwrap()));
 
@@ -255,13 +322,12 @@ fn build_progress_bar_export(total_messages: usize) -> Vec<ProgressBar> {
     pb1.set_position(0);
     pb1.enable_steady_tick(Duration::from_millis(100));
 
-    z.insert(0, pb);
-    z.insert(1, pb1);
+    z.insert(threadcnt.into(), pb1);
 
     return z;
 }
 
 struct Work {
     // thread_num: u16,
-    wrok: Vec<String>,
+    wrok: Vec<PathBuf>,
 }
