@@ -1,13 +1,16 @@
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::time::Duration;
 
-pub fn build_progress_bar_export(
-    total_messages: usize,
-    threadcnt: u16,
-    prettyprint: bool,
-) -> Vec<ProgressBar> {
-    let mut z: Vec<ProgressBar> = Vec::new();
-    if !prettyprint {
+pub struct Bars {
+    bars: Vec<ProgressBar>,
+    // prettyprint: bool
+}
+
+pub fn build_progress_bar_export(total_messages: usize, threadcnt: u16, prettyprint: bool) -> Bars {
+    let mut b = Bars { bars: Vec::new() };
+
+    // let mut z: Vec<ProgressBar> = Vec::new();
+    if prettyprint {
         let m = MultiProgress::new();
 
         for i in 0..threadcnt {
@@ -22,8 +25,9 @@ pub fn build_progress_bar_export(
             pb.set_style(spinner_style.clone());
 
             pb.set_position(0);
-            pb.enable_steady_tick(Duration::from_millis(100));
-            z.insert(i.into(), pb);
+            pb.enable_steady_tick(Duration::from_millis(200));
+            // z.insert(i.into(), pb);
+            b.bars.insert(i.into(), pb);
         }
 
         let pb1 = m.add(ProgressBar::new(total_messages.try_into().unwrap()));
@@ -36,21 +40,30 @@ pub fn build_progress_bar_export(
         );
 
         pb1.set_position(0);
-        pb1.enable_steady_tick(Duration::from_millis(100));
+        pb1.enable_steady_tick(Duration::from_millis(200));
 
-        z.insert(threadcnt.into(), pb1);
+        // z.insert(threadcnt.into(), pb1);
+        b.bars.insert(threadcnt.into(), pb1);
     }
-    return z;
+    return b;
 }
 
-pub fn increment_progress_bar(b: &ProgressBar) {
-    b.inc(1);
+pub fn increment_progress_bar(b: usize, z: &Bars) {
+    if z.bars.len() >= b + 1 {
+        z.bars[b].inc(1);
+        // b.inc(1);
+    }
 }
 
-pub fn finish_progress_bar(b: &ProgressBar) {
-b.finish();
+pub fn finish_progress_bar(b: usize, z: &Bars) {
+    // b.finish();
+    if z.bars.len() >= b + 1 {
+        z.bars[b].finish();
+    }
 }
 
-pub fn set_message(b: &ProgressBar, s: &str){
-    b.set_message(format!("{s}..."));
+pub fn set_message(b: usize, s: &str, z: &Bars) {
+    if z.bars.len() >= b + 1 {
+        z.bars[b].set_message(format!("{s}..."));
+    }
 }

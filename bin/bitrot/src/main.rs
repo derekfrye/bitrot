@@ -5,15 +5,17 @@ use anyhow::{Context, Result};
 use chrono::{Local, Timelike};
 use clap::Parser;
 use console::style;
-use std::time::Duration;
 use md5::Digest;
 use regex::Regex;
 use std::fs;
 use std::io;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::channel;
+use std::sync::mpsc::Sender;
+use std::time::Duration;
 
-use crossbeam_channel::{unbounded, Sender};
+// use crossbeam_channel::{unbounded, Sender};
 use std::thread;
 
 use thiserror::Error;
@@ -66,10 +68,14 @@ fn main() -> Result<()> {
             data_files.len()
         );
 
-        let pb = progress::build_progress_bar_export(data_files.len(), args.thread_count, args.pretty_print);
+        let pb = progress::build_progress_bar_export(
+            data_files.len(),
+            args.thread_count,
+            args.pretty_print,
+        );
 
         let zz = assign_work(data_files, args.thread_count);
-        let (tx, rx) = unbounded();
+        let (tx, rx) = channel();
 
         let mut i = 0;
         for x in zz {
@@ -91,15 +97,17 @@ fn main() -> Result<()> {
             let djk = xa[1];
             if xa.len() == 2 {
                 // pb[sb].set_message(format!("{djk}..."));
-                progress::set_message(&pb[sb], djk);
+                progress::set_message(sb, djk, &pb);
             } else if xa.len() == 3 {
-                progress::finish_progress_bar(&pb[sb]);
+                progress::finish_progress_bar(sb, &pb);
+            } else if xa.len() == 4 {
+                // pb[args.thread_count.to_string().parse::<usize>().unwrap()].set_message(format!("..."));
+                progress::increment_progress_bar(final_progress_bar, &pb);
             }
-            // pb[args.thread_count.to_string().parse::<usize>().unwrap()].set_message(format!("..."));
-            progress::increment_progress_bar(&pb[final_progress_bar]);
         }
 
-        progress::finish_progress_bar(&pb[final_progress_bar]);
+        progress::finish_progress_bar(final_progress_bar, &pb);
+        thread::sleep(Duration::from_millis(5000));
     }
 
     Ok(())
@@ -121,18 +129,32 @@ fn do_work(
         status_bar_and_working_file.push_str("|");
         status_bar_and_working_file.push_str(&movie_basename);
 
+        // send we're working on file
         ab.send(status_bar_and_working_file).unwrap();
 
         // let _ = validate_ondisk_md5(&movie_as_str, &movie_basename, &path_to_cksums, bufsize)?;
-        thread::sleep(Duration::from_millis(1500));
+        thread::sleep(Duration::from_millis(5000));
+
+        // send we're done w/this unit of work
+        let mut status_bar_and_working_file = statusbar.to_string();
+        status_bar_and_working_file.push_str("|");
+        status_bar_and_working_file.push_str(" ");
+        status_bar_and_working_file.push_str("done");
+        status_bar_and_working_file.push_str("|");
+        status_bar_and_working_file.push_str(" ");
+        status_bar_and_working_file.push_str("|");
+        status_bar_and_working_file.push_str(" ");
+        ab.send(status_bar_and_working_file).unwrap();
     }
 
     let mut status_bar_and_working_file = statusbar.to_string();
     status_bar_and_working_file.push_str("|");
     status_bar_and_working_file.push_str(" ");
     status_bar_and_working_file.push_str("done");
+    status_bar_and_working_file.push_str("|");
     ab.send(status_bar_and_working_file).unwrap();
 
+    thread::sleep(Duration::from_millis(5000));
     Ok(())
 }
 
@@ -290,8 +312,6 @@ enum AppError {
     #[error(transparent)]
     IOError(#[from] std::io::Error),
 }
-
-
 
 struct Work {
     // thread_num: u16,

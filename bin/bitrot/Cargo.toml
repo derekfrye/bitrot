@@ -14,4 +14,11 @@ clap = { version = "4", features = ["derive"] }
 chrono = "0.4"
 indicatif = "0.17.5"
 console = "0.15.7"
-crossbeam-channel = "0.5.8"
+# crossbeam-channel = "0.5.8"
+
+[profile.release]
+#opt-level = 'z'     # Optimize for size
+lto = true          # Enable link-time optimization
+codegen-units = 1   # Reduce number of codegen units to increase optimizations
+#panic = 'abort'     # Abort on panic
+strip = true        # Strip symbols from binary*
