@@ -2,6 +2,8 @@ use std::io;
 // use std::env;
 use std::fs;
 use std::io::BufRead;
+// use std::path::{Path};
+// use clap::error::Result;
 use md5::Digest;
 use regex::Regex;
 // use std::error::Error;
@@ -13,6 +15,7 @@ use indicatif::{ProgressBar, ProgressStyle, MultiProgress};
 use std::time::Duration;
 use console::{style};
 
+
 fn main()-> Result<()>{
 
     let args = Args::parse();
@@ -20,9 +23,16 @@ fn main()-> Result<()>{
     if args.mode == "ck" {
         println!("Using data path {} and cksum path {}", args.path_to_data, args.cksums);    
         
-        let movies = fs::read_dir(args.path_to_data)?
-            .map(|res| res.map(|e| e.path()))
-            .collect::<Result<Vec<_>, io::Error>>()?;
+        // idea from https://stackoverflow.com/questions/58062887/filtering-files-or-directories-discovered-with-fsread-dir
+        let movies: Vec<_> = fs::read_dir(args.path_to_data)?
+            .into_iter()
+            .filter(|z| z.is_ok())
+            .map(|r| r.unwrap().path())
+            .filter(|z| z.is_file())
+            // .into_iter().collect();
+            // .collect::Result<Vec<_>, io::e();
+            // .collect::<Result<Vec<PathBuf>>, io::Error>()?;
+            .collect();
 
         let now = Local::now();
         let (is_pm, hour) = now.hour12();
@@ -34,6 +44,7 @@ fn main()-> Result<()>{
             , movies.len()
         );
 
+
         let i = movies.len();
         let pb = build_progress_bar_export(i);
         
@@ -44,7 +55,7 @@ fn main()-> Result<()>{
             let movie_basename = movie_as_path.file_name().unwrap().to_string_lossy();
             
             pb[0].set_message(format!("{movie_basename}..."));
-            let _ = validate_ondisk_md5(&movie_as_str, &movie_basename, &args.cksums, args.bufsize, args.verbose)?;
+            let _ = validate_ondisk_md5(&movie_as_str, &movie_basename, &args.cksums, args.bufsize)?;
             pb[0].inc(1);
             pb[1].inc(1);
         }
@@ -56,7 +67,7 @@ fn main()-> Result<()>{
     Ok(())
 }
 
-fn validate_ondisk_md5(movie_path: &str, movie_basenm: &str, par_path: &str, bufsize: u16, verbose: bool)-> Result<(), anyhow::Error> {
+fn validate_ondisk_md5(movie_path: &str, movie_basenm: &str, par_path: &str, bufsize: u16)-> Result<(), anyhow::Error> {
 
     let re = Regex::new(r"\.[Mm][4pP][vV4]$").unwrap();
     let md5ending =".md5.txt";
@@ -68,13 +79,8 @@ fn validate_ondisk_md5(movie_path: &str, movie_basenm: &str, par_path: &str, buf
         par.push_str(md5ending); // /par2path/movienm.md5.txt
         let par_as_path = std::path::Path::new(&par);
 
-        if verbose {
-            println!("Checking {}...", movie_basenm);
-        }
-
         // if /par2path/movienm.md5.txt exists and is readable
         if fs::metadata(par_as_path).is_ok() {
-
             
             let digest = cksum(&movie_path, bufsize);
             
@@ -84,7 +90,6 @@ fn validate_ondisk_md5(movie_path: &str, movie_basenm: &str, par_path: &str, buf
             // reads just the first entries in teh file, before any spaces or newllines
             if par_as_path.metadata().unwrap().len() > 0 {
                 md5hash_fromdisk = fs::read_to_string(par_as_path).unwrap().split_whitespace().collect();
-                // println!("read {}", md5hash_fromdisk);
             }
 
             // tell caller this integrity check failed
@@ -94,10 +99,6 @@ fn validate_ondisk_md5(movie_path: &str, movie_basenm: &str, par_path: &str, buf
                 return Err(AppError::MismatchError)
                     .context(format!("FAIL, mismatch between {} on-disk md5.", movie_path));
             }
-            // else {
-            //     return Err(WordCountError::EmptySource)
-            //         .context(format!("SUCCESS, match between {} on-disk md5.", movie_path));
-            // }
         }
         else {
             return Err(AppError::EmptySource)
@@ -147,10 +148,6 @@ struct Args {
     /// Path to the on-disk checksums, must match by /data files/filename.md5.txt
     #[arg(short = 'c', long, value_name = "CKSUMS")]
     cksums: String,
-
-    /// Not supported yet
-    #[arg(short, long)]
-    verbose: bool,
 
     /// Mode to operate in. Ck or create.
     #[arg(short = 'm', long,  value_name = "MODE")]
