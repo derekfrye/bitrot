@@ -1,3 +1,4 @@
+mod error;
 mod progress;
 // use crate::progress::hosting;
 
@@ -18,7 +19,7 @@ use std::time::Duration;
 // use crossbeam_channel::{unbounded, Sender};
 use std::thread;
 
-use thiserror::Error;
+// use thiserror::Error;
 
 fn main() -> Result<()> {
     let args = Args::parse();
@@ -27,16 +28,16 @@ fn main() -> Result<()> {
         panic!("wha");
     }
 
-    if let Some(d) = args.error_output_file.as_deref() {
-        let x = Path::new(d);
-        if fs::metadata(x).is_ok() {
-            if args.pretty_print {
-                println!("Writing to error file {}", d);
-            }
-        } else {
-            panic!("Cannot write to {}", d);
+    // if let Some(d) = args.error_output_file.as_deref() {
+    let x = Path::new(d);
+    if fs::metadata(x).is_ok() {
+        if args.pretty_print {
+            println!("Writing to error file {}", d);
         }
+    } else {
+        panic!("Cannot write to {}", d);
     }
+    // }
 
     if args.mode == "ck" {
         println!(
@@ -81,8 +82,13 @@ fn main() -> Result<()> {
         for x in zz {
             let tx1 = tx.clone();
             let kjdfj = args.path_to_cksums.clone();
+            let jkdf = args.unit_testing.clone();
             thread::spawn(move || {
-                let _ = do_work(x.wrok, &kjdfj, args.bufsize, i, tx1);
+                if jkdf {
+                    let _ = do_work(x.wrok, i, tx1);
+                } else {
+                    let _ = validate_ondisk_md5(x.wrok, &kjdfj, args.bufsize, i, tx1);
+                }
             });
             i += 1;
         }
@@ -107,7 +113,9 @@ fn main() -> Result<()> {
         }
 
         progress::finish_progress_bar(final_progress_bar, &pb);
-        thread::sleep(Duration::from_millis(5000));
+        if args.unit_testing {
+            thread::sleep(Duration::from_millis(5000));
+        }
     }
 
     Ok(())
@@ -115,14 +123,14 @@ fn main() -> Result<()> {
 
 fn do_work(
     xx: Vec<PathBuf>,
-    path_to_cksums: &str,
-    bufsize: u16,
+    // path_to_cksums: &str,
+    // bufsize: u16,
     statusbar: u16,
     ab: Sender<String>,
 ) -> Result<()> {
     for x in xx {
         // idea for converting to string from https://stackoverflow.com/questions/37388107/how-to-convert-the-pathbuf-to-string
-        let movie_as_str = x.to_string_lossy();
+        // let movie_as_str = x.to_string_lossy();
         let movie_basename = x.file_name().unwrap().to_string_lossy();
 
         let mut status_bar_and_working_file = statusbar.to_string();
@@ -184,50 +192,71 @@ fn assign_work(mut z: Vec<PathBuf>, threadcnt: u16) -> Vec<Work> {
 }
 
 fn validate_ondisk_md5(
-    movie_path: &str,
-    movie_basenm: &str,
+    xx: Vec<PathBuf>,
+    // movie_basenm: &str,
     par_path: &str,
     bufsize: u16,
+    statusbar: u16,
+    ab: Sender<String>,
 ) -> Result<(), anyhow::Error> {
     let md5ending = ".md5.txt";
 
     // if re.is_match(movie_path) {
+    for x in xx {
+        let movie_as_str = x.to_string_lossy();
+        let movie_basename = x.file_name().unwrap().to_string_lossy();
 
-    let mut par = String::from(par_path);
-    par.push_str(&movie_basenm); // /cksumpath/datafilenm
-    par.push_str(md5ending); // /cksumpath/datafilenm.md5.txt
-    let par_as_path = Path::new(&par);
+        let mut status_bar_and_working_file = statusbar.to_string();
+        status_bar_and_working_file.push_str("|");
+        status_bar_and_working_file.push_str(&movie_basename);
+        // send we're working on file
+        ab.send(status_bar_and_working_file).unwrap();
 
-    // if /par2path/movienm.md5.txt exists and is readable
-    if fs::metadata(par_as_path).is_ok() {
-        let digest = cksum(&movie_path, bufsize);
+        let mut par = String::from(par_path);
+        par.push_str(&movie_basename); // /cksumpath/datafilenm
+        par.push_str(md5ending); // /cksumpath/datafilenm.md5.txt
+        let par_as_path = Path::new(&par);
 
-        let mut md5hash_fromdisk = String::from("x");
+        // if /par2path/movienm.md5.txt exists and is readable
+        if fs::metadata(par_as_path).is_ok() {
+            let digest = cksum(&movie_as_str, bufsize);
 
-        // got this ideas from initial question on https://stackoverflow.com/questions/75442962/how-to-do-partial-read-and-calculate-md5sum-of-a-large-file-in-rust
-        // reads just the first entries in teh file, before any spaces or newllines
-        if par_as_path.metadata().unwrap().len() > 0 {
-            md5hash_fromdisk = fs::read_to_string(par_as_path)
-                .unwrap()
-                .split_whitespace()
-                .collect();
+            let mut md5hash_fromdisk = String::from("x");
+
+            // got this ideas from initial question on https://stackoverflow.com/questions/75442962/how-to-do-partial-read-and-calculate-md5sum-of-a-large-file-in-rust
+            // reads just the first entries in teh file, before any spaces or newllines
+            if par_as_path.metadata().unwrap().len() > 0 {
+                md5hash_fromdisk = fs::read_to_string(par_as_path)
+                    .unwrap()
+                    .split_whitespace()
+                    .collect();
+            }
+
+            // tell caller this integrity check failed
+            if md5hash_fromdisk != format!("{:x}", digest) {
+                //Err(InvalidLookahead(movie_path));
+                // return Err(AppError::ConfigLoad { source: movie_path });
+                return Err(error::AppError::MismatchError).context(format!(
+                    "FAIL, mismatch between {} on-disk md5.",
+                    &movie_basename
+                ));
+            }
+        } else {
+            return Err(error::AppError::EmptySource)
+                .context(format!("No md5 on disk found for {}", &movie_basename));
         }
 
-        // tell caller this integrity check failed
-        if md5hash_fromdisk != format!("{:x}", digest) {
-            //Err(InvalidLookahead(movie_path));
-            // return Err(AppError::ConfigLoad { source: movie_path });
-            return Err(AppError::MismatchError).context(format!(
-                "FAIL, mismatch between {} on-disk md5.",
-                movie_path
-            ));
-        }
-    } else {
-        return Err(AppError::EmptySource)
-            .context(format!("No md5 on disk found for {}", movie_path));
+        // send we're done w/this unit of work
+        let mut status_bar_and_working_file = statusbar.to_string();
+        status_bar_and_working_file.push_str("|");
+        status_bar_and_working_file.push_str(" ");
+        status_bar_and_working_file.push_str("done");
+        status_bar_and_working_file.push_str("|");
+        status_bar_and_working_file.push_str(" ");
+        status_bar_and_working_file.push_str("|");
+        status_bar_and_working_file.push_str(" ");
+        ab.send(status_bar_and_working_file).unwrap();
     }
-    // }
-
     Ok(())
 }
 
@@ -293,27 +322,23 @@ struct Args {
 
     /// File to write errors to. If not set, halts program on first error.
     #[arg(short, long, value_name = "ERRORFILE")]
-    error_output_file: Option<String>,
-}
+    error_output_file: String,
 
-// taken from https://nick.groenen.me/posts/rust-error-handling/
-#[derive(Error, Debug)]
-enum AppError {
-    /// Represents an empty source. For example, an empty text file being given
-    /// as input to `count_words()`.
-    #[error("Missing MD5")]
-    EmptySource,
-
-    // /// Represents a failure to read from input.
-    #[error("Mismatch MD5")]
-    MismatchError,
-    // ReadError { source: std::io::Error },
-    /// Represents all other cases of `std::io::Error`.
-    #[error(transparent)]
-    IOError(#[from] std::io::Error),
+    /// Do not checksum. Instead, pretend to.
+    #[arg(short, long, value_name = "TESTINGONLY")]
+    unit_testing: bool,
 }
 
 struct Work {
     // thread_num: u16,
     wrok: Vec<PathBuf>,
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn it_works() {
+        let result = 2 + 2;
+        assert_eq!(result, 4);
+    }
 }
