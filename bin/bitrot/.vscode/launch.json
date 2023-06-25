@@ -32,7 +32,8 @@
                 ".[Mm][pP4][4vV]$",
                 "--thread-count",
                 "1",
-                "--pretty-print"
+                "--pretty-print",
+                "--unit_testing",
             ],
             "cwd": "${workspaceFolder}"
         },
