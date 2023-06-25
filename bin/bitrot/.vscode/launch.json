@@ -33,7 +33,9 @@
                 "--thread-count",
                 "1",
                 "--pretty-print",
-                "--unit_testing",
+                // "--unit-testing",
+                "--error-output-file",
+                "/home/mini/docker/bin/bitrot/a"
             ],
             "cwd": "${workspaceFolder}"
         },

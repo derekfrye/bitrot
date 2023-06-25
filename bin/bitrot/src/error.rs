@@ -9,8 +9,9 @@ pub enum AppError {
     EmptySource,
 
     // /// Represents a failure to read from input.
-    #[error("Mismatch MD5")]
-    MismatchError,
+    // #[error("Mismatch MD5")]
+    // MismatchError,
+    
     // ReadError { source: std::io::Error },
     /// Represents all other cases of `std::io::Error`.
     #[error(transparent)]

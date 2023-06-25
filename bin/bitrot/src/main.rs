@@ -28,15 +28,9 @@ fn main() -> Result<()> {
         panic!("wha");
     }
 
-    // if let Some(d) = args.error_output_file.as_deref() {
-    let x = Path::new(d);
-    if fs::metadata(x).is_ok() {
-        if args.pretty_print {
-            println!("Writing to error file {}", d);
-        }
-    } else {
-        panic!("Cannot write to {}", d);
-    }
+    // let x = Path::new(&args.error_output_file);
+    let _=fs::write(&args.error_output_file, "tt\n");
+    
     // }
 
     if args.mode == "ck" {
@@ -109,7 +103,14 @@ fn main() -> Result<()> {
             } else if xa.len() == 4 {
                 // pb[args.thread_count.to_string().parse::<usize>().unwrap()].set_message(format!("..."));
                 progress::increment_progress_bar(final_progress_bar, &pb);
-            }
+            } else if xa.len() == 7 {
+                let mut data = String::from("Error: ");
+                data.push_str(xa[4]);
+                data.push_str(&format!(", expected: {}", xa[5]));
+                data.push_str(&format!(", got: {}\n", xa[6]));
+                // data.p
+                fs::write( &args.error_output_file, data).unwrap();
+                }
         }
 
         progress::finish_progress_bar(final_progress_bar, &pb);
@@ -236,10 +237,34 @@ fn validate_ondisk_md5(
             if md5hash_fromdisk != format!("{:x}", digest) {
                 //Err(InvalidLookahead(movie_path));
                 // return Err(AppError::ConfigLoad { source: movie_path });
-                return Err(error::AppError::MismatchError).context(format!(
-                    "FAIL, mismatch between {} on-disk md5.",
-                    &movie_basename
-                ));
+                // return Err(error::AppError::MismatchError).context(format!(
+                //     "FAIL, mismatch between {} on-disk md5.",
+                //     &movie_basename
+                // ));
+                // 7-array
+                // pos 1
+                let mut status_bar_and_working_file = statusbar.to_string();
+                status_bar_and_working_file.push_str("|");
+                // pos 2
+                status_bar_and_working_file.push_str(" ");
+                status_bar_and_working_file.push_str("|");
+                // pos 3
+                status_bar_and_working_file.push_str(" ");
+                status_bar_and_working_file.push_str("|");
+                // pos 4
+                status_bar_and_working_file.push_str(" ");
+                status_bar_and_working_file.push_str("|");
+                // pos 5
+                status_bar_and_working_file.push_str(&movie_basename);
+                status_bar_and_working_file.push_str("|");
+                // pos 6
+                status_bar_and_working_file.push_str(&md5hash_fromdisk);
+                status_bar_and_working_file.push_str("|");
+                // pos 7
+                status_bar_and_working_file.push_str(&format!("{:x}", digest));
+
+                // send msg
+                ab.send(status_bar_and_working_file).unwrap();
             }
         } else {
             return Err(error::AppError::EmptySource)
