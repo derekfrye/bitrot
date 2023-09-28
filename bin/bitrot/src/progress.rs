@@ -68,3 +68,20 @@ pub fn set_message(b: usize, s: &str, z: &Bars) {
         
     }
 }
+
+pub struct ProgressMessage {
+    pub bar_number: usize,
+    pub status_code: ProgressStatus,
+pub  file_name: String ,
+pub err: String,
+pub md5_expected: String,
+pub md5_computed: String,
+}
+
+pub enum ProgressStatus {
+    Started,
+    MovieCompleted,
+    ThreadCompleted,
+    MovieError,
+    ParFileError,
+}

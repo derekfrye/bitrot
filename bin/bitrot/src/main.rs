@@ -4,7 +4,6 @@ mod progress;
 mod args;
 
 use anyhow::Result;
-// use clap::Parser;
 
 // if you want to use some old manual "debug" stuff below
 // use chrono::{Local, Timelike};
@@ -16,14 +15,14 @@ use std::fs;
 use std::io::Write;
 
 use std::path::PathBuf;
-use std::sync::mpsc::channel;
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{ channel, Receiver, Sender };
+// use std::sync::mpsc::Sender;
 use std::thread;
 use std::time::Duration;
 
-fn main() -> Result<()> {
-    // let args = ;
+use crate::progress::ProgressStatus;
 
+fn main() -> Result<()> {
     let args = args::args_checks();
 
     if args.mode == "ck" {
@@ -66,25 +65,23 @@ fn main() -> Result<()> {
         );
 
         let zz = assign_work(data_files, args.thread_count);
-        let (tx, rx) = channel();
+        let (tx, rx): (
+            Sender<progress::ProgressMessage>,
+            Receiver<progress::ProgressMessage>,
+        ) = channel();
 
         let mut status_bar_line_entry = 0;
         for x in zz {
             let tx1 = tx.clone();
             let kjdfj = args.path_to_cksums.clone();
-            let jkdf = args.unit_testing.clone();
             thread::spawn(move || {
-                if jkdf {
-                    let _ = do_unit_tests(x.wrok, status_bar_line_entry, tx1);
-                } else {
-                    let _ = check::validate_ondisk_md5(
-                        x.wrok,
-                        &kjdfj,
-                        args.bufsize,
-                        status_bar_line_entry,
-                        tx1
-                    );
-                }
+                let _ = check::validate_ondisk_md5(
+                    x.wrok,
+                    &kjdfj,
+                    args.bufsize,
+                    status_bar_line_entry,
+                    tx1
+                );
             });
             status_bar_line_entry += 1;
         }
@@ -93,62 +90,60 @@ fn main() -> Result<()> {
         let final_progress_bar = args.thread_count.to_string().parse::<usize>().unwrap();
         for received in rx {
             // println!("Got: {}", received);
-            let xa = received.split_terminator("|").collect::<Vec<&str>>();
 
-            let sb = xa[0].parse::<usize>().unwrap();
-            let djk = xa[1];
-            // len of two is messaged when we're starting work on a file
-            if xa.len() == 2 {
-                // pb[sb].set_message(format!("{djk}..."));
-                progress::set_message(sb, djk, &pb);
-            } else if
-                // len of three is used when marking the thread as done
-                xa.len() == 3
-            {
-                progress::set_message(sb, "Thread done.", &pb);
-                progress::finish_progress_bar(sb, &pb);
-            } else if
-                // len of 4 used when incrementing progress on this thread to the next file in its queue
-                xa.len() == 4
-            {
-                progress::increment_progress_bar(final_progress_bar, &pb);
-            } else if
-                // len of 5 used to indicate the par2 file didn't exist, wasn't readable, etc.
-                xa.len() == 5
-            {
-                let mut data = String::from("Error: ");
-                data.push_str(xa[1]);
+            // let xb = received;
 
-                let mut fil = fs::OpenOptions
-                    ::new()
-                    .write(true)
-                    .append(true)
-                    .create(true)
-                    .open(&args.error_output_file)?;
+            // let xa = received.split_terminator("|").collect::<Vec<&str>>();
+            // let sb = xa[0].parse::<usize>().unwrap();
 
-                fil.lock_exclusive()?;
-                fil.write(data.as_bytes()).unwrap();
-                fil.unlock()?;
-            } else if
-                // len of 7 used to indciate there was a checksum mismatch for the file
-                xa.len() == 7
-            {
-                let mut data = String::from("Error: ");
-                data.push_str(xa[4]);
-                data.push_str(&format!(", expected: {}", xa[5]));
-                data.push_str(&format!(", got: {}\n", xa[6]));
+            match received.status_code {
+                ProgressStatus::Started => {
+                    progress::set_message(received.bar_number, &received.file_name, &pb);
+                }
+                ProgressStatus::MovieCompleted => {
+                    progress::increment_progress_bar(received.bar_number, &pb);
+                }
+                ProgressStatus::MovieError => {
+                    let mut data = String::from("Error: ");
+                    data.push_str(&received.file_name);
+                    data.push_str(&format!(", expected: {}", &received.md5_expected));
+                    data.push_str(&format!(", got: {}\n", &received.md5_computed));
 
-                let mut fil = fs::OpenOptions
-                    ::new()
-                    .write(true)
-                    .append(true)
-                    .create(true)
-                    .open(&args.error_output_file)?;
-                fil.lock_exclusive()?;
+                    let mut fil = fs::OpenOptions
+                        ::new()
+                        .write(true)
+                        .append(true)
+                        .create(true)
+                        .open(&args.error_output_file)?;
+                    fil.lock_exclusive()?;
 
-                // let mut xxx = fs::OpenOptions::new()
-                fil.write(data.as_bytes()).unwrap();
-                fil.unlock()?;
+                    // let mut xxx = fs::OpenOptions::new()
+                    fil.write(data.as_bytes()).unwrap();
+                    fil.unlock()?;
+                }
+                ProgressStatus::ParFileError => {
+                    let mut data = String::from("Error: ");
+                    data.push_str(&received.file_name);
+
+                    let mut fil = fs::OpenOptions
+                        ::new()
+                        .write(true)
+                        .append(true)
+                        .create(true)
+                        .open(&args.error_output_file)?;
+
+                    fil.lock_exclusive()?;
+                    fil.write(data.as_bytes()).unwrap();
+                    fil.unlock()?;
+                }
+                ProgressStatus::ThreadCompleted => {
+                    // let mut x: usize =1;
+                    // x = x+1;
+                    // progress::set_message(received.bar_number, &received.file_name, &pb);
+                    // &received.bar_number.clone_into(&mut x);
+                    progress::set_message(received.bar_number, "Thread done.", &pb);
+                    progress::finish_progress_bar(received.bar_number, &pb);
+                }
             }
         }
 
@@ -158,56 +153,6 @@ fn main() -> Result<()> {
         }
     }
 
-    Ok(())
-}
-
-// fn zip (z: &str, zz: &str){
-//     let mut xxx = fs::OpenOptions::new().append(true).open(zz).expect("cannot open file");
-//     xxx.write(z.as_bytes());
-// }
-
-fn do_unit_tests(
-    xx: Vec<PathBuf>,
-    // path_to_cksums: &str,
-    // bufsize: u16,
-    statusbar: u16,
-    ab: Sender<String>
-) -> Result<()> {
-    for x in xx {
-        // idea for converting to string from https://stackoverflow.com/questions/37388107/how-to-convert-the-pathbuf-to-string
-        // let movie_as_str = x.to_string_lossy();
-        let movie_basename = x.file_name().unwrap().to_string_lossy();
-
-        let mut status_bar_and_working_file = statusbar.to_string();
-        status_bar_and_working_file.push_str("|");
-        status_bar_and_working_file.push_str(&movie_basename);
-
-        // send we're working on file
-        ab.send(status_bar_and_working_file).unwrap();
-
-        // let _ = validate_ondisk_md5(&movie_as_str, &movie_basename, &path_to_cksums, bufsize)?;
-        thread::sleep(Duration::from_millis(5000));
-
-        // send we're done w/this unit of work
-        let mut status_bar_and_working_file = statusbar.to_string();
-        status_bar_and_working_file.push_str("|");
-        status_bar_and_working_file.push_str(" ");
-        status_bar_and_working_file.push_str("done");
-        status_bar_and_working_file.push_str("|");
-        status_bar_and_working_file.push_str(" ");
-        status_bar_and_working_file.push_str("|");
-        status_bar_and_working_file.push_str(" ");
-        ab.send(status_bar_and_working_file).unwrap();
-    }
-
-    let mut status_bar_and_working_file = statusbar.to_string();
-    status_bar_and_working_file.push_str("|");
-    status_bar_and_working_file.push_str(" ");
-    status_bar_and_working_file.push_str("done");
-    status_bar_and_working_file.push_str("|");
-    ab.send(status_bar_and_working_file).unwrap();
-
-    thread::sleep(Duration::from_millis(5000));
     Ok(())
 }
 

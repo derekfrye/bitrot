@@ -1,10 +1,13 @@
 use md5::Digest;
+// use std::fmt::format;
 use std::io;
 use std::io::BufRead;
 use std::fs;
 
-use std::path::{Path, PathBuf};
+use std::path::{ Path, PathBuf };
 use std::sync::mpsc::Sender;
+
+use crate::progress;
 
 pub fn cksum(file_path: &str, bufsize: u16) -> Digest {
     // copy/paste from https://stackoverflow.com/questions/75442962/how-to-do-partial-read-and-calculate-md5sum-of-a-large-file-in-rust
@@ -12,7 +15,7 @@ pub fn cksum(file_path: &str, bufsize: u16) -> Digest {
     // Find the length of the file
     let len = f.metadata().unwrap().len();
     // Decide on a reasonable buffer size (500MB in this case, fastest will depend on hardware)
-    let ss: u64 = 1000000000 * bufsize as u64;
+    let ss: u64 = 1000000000 * (bufsize as u64);
     let buf_len = len.min(ss.into()) as usize;
     let mut buf = io::BufReader::with_capacity(buf_len, f);
     let mut context = md5::Context::new();
@@ -40,7 +43,7 @@ pub fn validate_ondisk_md5(
     par_path: &str,
     bufsize: u16,
     statusbar: u16,
-    transmission_channel: Sender<String>,
+    transmission_channel: Sender<progress::ProgressMessage>
 ) -> Result<(), anyhow::Error> {
     let md5ending = ".md5.txt";
 
@@ -53,8 +56,19 @@ pub fn validate_ondisk_md5(
         let mut status_bar_and_working_file = statusbar.to_string();
         status_bar_and_working_file.push_str("|");
         status_bar_and_working_file.push_str(&movie_basename);
+
+        let sbar = progress::ProgressMessage {
+            bar_number: statusbar as usize,
+            file_name: movie_basename.to_string(),
+            err: String::from(""),
+            md5_computed: String::from(""),
+            md5_expected: String::from(""),
+            status_code: progress::ProgressStatus::Started,
+        };
+
         // send we're working on file
-        transmission_channel.send(status_bar_and_working_file).unwrap();
+        // transmission_channel.send(status_bar_and_working_file).unwrap();
+        transmission_channel.send(sbar).unwrap();
 
         let mut par = String::from(par_path);
         par.push_str(&movie_basename); // /cksumpath/datafilenm
@@ -74,12 +88,21 @@ pub fn validate_ondisk_md5(
         let zfdfas = fs::read_to_string(par_as_path).unwrap_or_else(|_| String::from("default"));
 
         if "default" == zfdfas {
-            
-            
+            let sbar_and_working_file = progress::ProgressMessage {
+                bar_number: statusbar as usize,
+                file_name: movie_basename.to_string(),
+                err: format!("No md5 on disk found for {}\n", &movie_basename.trim()),
+                md5_computed: String::from(""),
+                md5_expected: String::from(""),
+                status_code: progress::ProgressStatus::ParFileError,
+            };
+
             let mut status_bar_and_working_file = statusbar.to_string();
             status_bar_and_working_file.push_str("|");
             // pos 2
-            status_bar_and_working_file.push_str(format!("No md5 on disk found for {}\n", &movie_basename.trim()).as_str());
+            status_bar_and_working_file.push_str(
+                format!("No md5 on disk found for {}\n", &movie_basename.trim()).as_str()
+            );
             status_bar_and_working_file.push_str("|");
             // pos 3
             status_bar_and_working_file.push_str(" ");
@@ -89,8 +112,9 @@ pub fn validate_ondisk_md5(
             status_bar_and_working_file.push_str("|");
             // pos 5
             status_bar_and_working_file.push_str(&movie_basename);
-            transmission_channel.send(status_bar_and_working_file).unwrap();
-            
+            // transmission_channel.send(status_bar_and_working_file).unwrap();
+            transmission_channel.send(sbar_and_working_file).unwrap();
+
             // i think (hope?) this return value is ignored
             // return Err(error::AppError::EmptySource)
             //     .context(format!("No md5 on disk found for {}", &movie_basename));
@@ -109,6 +133,16 @@ pub fn validate_ondisk_md5(
                 // ));
                 // 7-array
                 // pos 1
+
+                let sbsbba = progress::ProgressMessage {
+                    bar_number: statusbar as usize,
+                    file_name: movie_basename.to_string(),
+                    err: String::from(""),
+                    md5_computed: md5hash_fromdisk.to_string(),
+                    md5_expected: format!("{:x}", digest).to_string(),
+                    status_code: progress::ProgressStatus::MovieError,
+                };
+
                 let mut status_bar_and_working_file = statusbar.to_string();
                 status_bar_and_working_file.push_str("|");
                 // pos 2
@@ -130,7 +164,8 @@ pub fn validate_ondisk_md5(
                 status_bar_and_working_file.push_str(&format!("{:x}", digest));
 
                 // send msg
-                transmission_channel.send(status_bar_and_working_file).unwrap();
+                // transmission_channel.send(status_bar_and_working_file).unwrap();
+                transmission_channel.send(sbsbba).unwrap();
             }
         }
         // } else {
@@ -147,16 +182,36 @@ pub fn validate_ondisk_md5(
         status_bar_and_working_file.push_str(" ");
         status_bar_and_working_file.push_str("|");
         status_bar_and_working_file.push_str(" ");
-        transmission_channel.send(status_bar_and_working_file).unwrap();
+        // transmission_channel.send(status_bar_and_working_file).unwrap();
+
+        let s4bsbb = progress::ProgressMessage {
+            bar_number: statusbar as usize,
+            file_name: movie_basename.to_string(),
+            err: String::from(""),
+            md5_computed: String::from(""),
+            md5_expected: String::from(""),
+            status_code: progress::ProgressStatus::MovieCompleted,
+        };
+        transmission_channel.send(s4bsbb).unwrap();
     }
 
     let mut status_bar_and_working_file = statusbar.to_string();
     status_bar_and_working_file.push_str("|");
-    
+
     status_bar_and_working_file.push_str("done");
     status_bar_and_working_file.push_str("|");
     status_bar_and_working_file.push_str(" ");
-    transmission_channel.send(status_bar_and_working_file).unwrap();
+    // transmission_channel.send(status_bar_and_working_file).unwrap();
+
+    let s4b444sbb = progress::ProgressMessage {
+        bar_number: statusbar as usize,
+        file_name: String::from(""),
+        err: String::from(""),
+        md5_computed: String::from(""),
+        md5_expected: String::from(""),
+        status_code: progress::ProgressStatus::ThreadCompleted,
+    };
+    transmission_channel.send(s4b444sbb).unwrap();
 
     Ok(())
 }
