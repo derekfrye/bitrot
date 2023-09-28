@@ -58,12 +58,13 @@ pub fn increment_progress_bar(b: usize, z: &Bars) {
 pub fn finish_progress_bar(b: usize, z: &Bars) {
     // b.finish();
     if z.bars.len() >= b + 1 {
-        z.bars[b].finish();
+        z.bars[b].finish_and_clear();
     }
 }
 
 pub fn set_message(b: usize, s: &str, z: &Bars) {
     if z.bars.len() >= b + 1 {
-        z.bars[b].set_message(format!("{s}..."));
+        z.bars[b].set_message(format!("{s}"));
+        
     }
 }

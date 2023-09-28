@@ -29,13 +29,13 @@
                 "--bufsize",
                 "512",
                 "--data-filename-match",
-                ".[m][pP4][4vV]$",
+                ".[Mm][pP4][4vV]$",
                 "--thread-count",
-                "1",
+                "4",
                 "--pretty-print",
                 // "--unit-testing",
                 "--error-output-file",
-                "/home/mini/docker/bin/bitrot/a"
+                "/home/m1n2/docker/bin/bitrot/a"
             ],
             "cwd": "${workspaceFolder}"
         },

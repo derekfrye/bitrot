@@ -105,6 +105,7 @@ fn main() -> Result<()> {
             } 
             // marking the file as done
             else if xa.len() == 3 {
+                progress::set_message(sb, "Thread done.", &pb);
                 progress::finish_progress_bar(sb, &pb);
             } 
             // just incrementing progress for the file
@@ -112,6 +113,11 @@ fn main() -> Result<()> {
                 // pb[args.thread_count.to_string().parse::<usize>().unwrap()].set_message(format!("..."));
                 progress::increment_progress_bar(final_progress_bar, &pb);
                 // progress::finish_progress_bar(sb, &pb);
+                // if xa[0]== "3"{
+                //     // let z = String
+                    
+                //     progress::finish_progress_bar(sb, &pb);
+                // }
             } 
             // the par2 file didn't exist, wasn't readable, etc.
             else if xa.len() == 5 {
@@ -376,6 +382,15 @@ fn validate_ondisk_md5(
         status_bar_and_working_file.push_str(" ");
         transmission_channel.send(status_bar_and_working_file).unwrap();
     }
+
+    let mut status_bar_and_working_file = statusbar.to_string();
+    status_bar_and_working_file.push_str("|");
+    
+    status_bar_and_working_file.push_str("done");
+    status_bar_and_working_file.push_str("|");
+    status_bar_and_working_file.push_str(" ");
+    transmission_channel.send(status_bar_and_working_file).unwrap();
+
     Ok(())
 }
 
