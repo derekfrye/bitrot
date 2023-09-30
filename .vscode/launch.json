@@ -31,7 +31,7 @@
                 "--data-filename-match",
                 ".[Mm][pP4][4vV]$",
                 "--thread-count",
-                "4",
+                "1",
                 "--pretty-print",
                 // "--unit-testing",
                 "--error-output-file",

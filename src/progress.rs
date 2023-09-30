@@ -1,5 +1,11 @@
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{ MultiProgress, ProgressBar, ProgressStyle };
 use std::time::Duration;
+use fs2::FileExt;
+
+use std::fs;
+use std::io::Write;
+
+use crate::args::ArgsClean;
 
 pub struct Bars {
     bars: Vec<ProgressBar>,
@@ -17,10 +23,11 @@ pub fn build_progress_bar_export(total_messages: usize, threadcnt: u16, prettypr
             let pb = m.add(ProgressBar::new(total_messages.try_into().unwrap()));
             // z.append(pb);
 
-            let spinner_style =
-                ProgressStyle::with_template("{prefix:.bold.dim} {spinner} {wide_msg}")
-                    .unwrap()
-                    .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ");
+            let spinner_style = ProgressStyle::with_template(
+                "{prefix:.bold.dim} {spinner} {wide_msg}"
+            )
+                .unwrap()
+                .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ");
 
             pb.set_style(spinner_style.clone());
 
@@ -36,7 +43,7 @@ pub fn build_progress_bar_export(total_messages: usize, threadcnt: u16, prettypr
             ProgressStyle::default_bar()
                 .template("{spinner:.green} [{elapsed}] [{bar:.blue}] {pos}/{len} (ETA: {eta})")
                 .unwrap()
-                .progress_chars("#>-"),
+                .progress_chars("#>-")
         );
 
         pb1.set_position(0);
@@ -65,23 +72,92 @@ pub fn finish_progress_bar(b: usize, z: &Bars) {
 pub fn set_message(b: usize, s: &str, z: &Bars) {
     if z.bars.len() >= b + 1 {
         z.bars[b].set_message(format!("{s}"));
-        
     }
 }
 
+#[derive(Copy, Clone)]
 pub struct ProgressMessage {
     pub bar_number: usize,
     pub status_code: ProgressStatus,
-pub  file_name: String ,
-pub err: String,
-pub md5_expected: String,
-pub md5_computed: String,
+    // most modern filesystems appear to be 255 filename max. 
+    // pub file_name: [u8; 255],
+    // our err msg length is filename max + 2 checksums + some words
+    // pub err: [u8; 1024],
+    pub file_number: usize,
+    pub ondisk_digest: [u8; 16],
+    pub computed_digest: [u8; 16],
 }
 
+
+
+#[derive(Copy, Clone)]
 pub enum ProgressStatus {
     Started,
     MovieCompleted,
     ThreadCompleted,
     MovieError,
     ParFileError,
+    Requesting,
 }
+
+
+pub fn something( file_name: &str, received: ProgressMessage, pb: &Bars, args: &ArgsClean ){
+    
+        // println!("Got: {}", received);
+
+        // let xb = received;
+
+        // let xa = received.split_terminator("|").collect::<Vec<&str>>();
+        // let sb = xa[0].parse::<usize>().unwrap();
+
+        match received. status_code {
+            ProgressStatus::Started => {
+                let fssn=file_name;
+                set_message(received.bar_number, &fssn.to_owned().to_string(), &pb);
+            }
+            ProgressStatus::MovieCompleted => {
+                increment_progress_bar(args.thread_count as usize, &pb);
+            }
+            ProgressStatus::ParFileError | ProgressStatus::MovieError => {
+                let mut fil = fs::OpenOptions
+                    ::new()
+                    .write(true)
+                    .append(true)
+                    .create(true)
+                    .open(&args.error_output_file).unwrap();
+
+                    let fssn=file_name;
+
+                fil.lock_exclusive();
+                match received.status_code {
+                    ProgressStatus::ParFileError =>{
+                        fil.write(        format!("No md5 on disk found for {}\n", fssn)
+                        .as_bytes()).unwrap();
+                    }
+                    _ => {
+                        fil.write(        format!(
+                            "Error: {}, on-disk checksum: {}, our checksum: {}\n",
+                            fssn,
+                            format!("{:?}", received.ondisk_digest ),
+                            format!("{:?}", received.computed_digest)
+                        ).as_bytes() ).unwrap();
+                    }
+                }
+                
+                fil.unlock();
+            }
+            ProgressStatus::ThreadCompleted => {
+                set_message(received.bar_number, "Thread done.", &pb);
+                finish_progress_bar(received.bar_number, &pb);
+            }
+            ProgressStatus::Requesting => {}
+        }
+
+        
+    // if args.unit_testing {
+    //     thread::sleep(Duration::from_millis(5000));
+    // }
+    }
+
+    
+

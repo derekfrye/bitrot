@@ -97,6 +97,7 @@ struct Args {
     unit_testing: bool,
 }
 
+#[derive( Clone)]
 pub struct ArgsClean {
     pub path_to_data: String,
     pub path_to_cksums: String,
