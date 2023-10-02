@@ -3,7 +3,7 @@ mod error;
 mod progress;
 mod args;
 
-use anyhow::Result;
+use anyhow::{Result, Ok};
 
 // if you want to use some old manual "debug" stuff below
 // use chrono::{Local, Timelike};
@@ -25,7 +25,7 @@ use std::sync::{ mpsc, Mutex };
 use crate::progress::{ProgressStatus, ProgressMessage};
 // use tokio::sync::mpsc;
 // use async_std::sync;
-use async_std::channel::{ unbounded };
+use async_std::channel::unbounded ;
 // use async_std::task;
 
 #[derive(Clone)]
@@ -38,6 +38,11 @@ pub struct UnitsOfWork {
     file_name: Vec<UnitOfWork>,
 }
 
+struct HmmFukya {
+    movie_basename: String,
+    progress_msg: ProgressMessage,
+}
+
 // // https://doc.rust-lang.org/book/ch17-01-what-is-oo.html
 impl UnitsOfWork {
     pub fn add(&mut self, value: UnitOfWork) {
@@ -46,27 +51,12 @@ impl UnitsOfWork {
     }
 }
 
-// pub fn remove(&mut self) -> Option<UnitOfWork>{
-//     let result = self.file_name.pop();
-//     match result {
-//         Some(value) => {
+struct Handles {
+join_handle:     std::thread::JoinHandle<()>,  
+    unit_of_work: async_std::channel::Sender<Option<UnitOfWork>>,  
+    progress_message: async_std::channel::Receiver<ProgressMessage>,
+}
 
-//             Some(value)
-//         }
-//         None => None,
-//     }
-// }
-
-//     fn inc_file_number(&mut self){
-//         if(self.file_number.len()==0){
-//             self.file_number.push(0);
-//         }
-//         else{
-// let max =self.file_number.iter().max().unwrap();
-// self.file_number.push(max+1);
-//         }
-//     }
-// }
 
 fn main() -> Result<()> {
     let args = args::args_checks();
@@ -96,8 +86,8 @@ fn main() -> Result<()> {
         let data_file_len = data_files.len();
 
         let data_files_mutexed = Mutex::new(data_files);
-        let mut handles = vec![];
-        let mut fils = UnitsOfWork { file_name: vec![] };
+        let mut handles:Vec<Handles>= vec![];
+        
 
         // old manual "debug" stuff
         // let now = Local::now();
@@ -126,109 +116,41 @@ fn main() -> Result<()> {
                 check::do_work(i as usize, ttj, worker_tx, worker_rx);
             });
 
-            handles.push((handle, tx, main_rx));
+            //handles.push((handle, tx, main_rx));
+            handles.push( Handles { join_handle: handle, unit_of_work: tx, progress_message: main_rx });
         }
-
-        // let zz = assign_work(args.thread_count);
-        // let (tx, rx): (
-        //     Sender<progress::ProgressMessage>,
-        //     Receiver<progress::ProgressMessage>,
-        // ) = channel();
-
-        // let mut status_bar_line_entry = 0;
-        // for x in zz {
-        //     let tx1 = tx.clone();
-        //     // let rx1 = rx.clone();
-        //     let kjdfj = args.path_to_cksums.clone();
-        //     thread::spawn(move || {
-        //         let _ = check::validate_ondisk_md5(
-        //             x.wrok,
-        //             &kjdfj,
-        //             args.bufsize,
-        //             status_bar_line_entry,
-        //             tx1,
-
-        //         );
-        //     });
-        //     status_bar_line_entry += 1;
-        // }
-        // drop(tx);
 
         let final_progress_bar = args.thread_count.to_string().parse::<usize>().unwrap();
 
         let mut i = 0;
+        let mut doing_nothing = true;
         loop {
-            // let active = handles
-            // .iter()
-            // .filter(|(_, tx, main_rx)| {
-            //     match main_rx.recv().
-            // }
+            
+            let mut fils = UnitsOfWork { file_name: vec![] };
 
-            let active = handles
-                .iter()
-                .filter(|(_, tx, main_rx)| {
-                    match main_rx.try_recv() {
-                        // If a message is received
-                      Ok( iak  ) => {
-                        match iak.status_code {
-                            // ifthe message received is that the thread wants a file to process, pop the next file and send it back
-                            ProgressStatus::Requesting =>{
-                            let mut path_opt: Option<UnitOfWork> = Default::default();
-                            {
-                                let mut bc_locked = data_files_mutexed.lock().unwrap();
-                                let ab = bc_locked.pop();
-                                let path_opt = UnitOfWork {
-                                    file_name: ab.unwrap(),
-                                    file_number: i,
-                                };
-
-                                let abc = path_opt.clone();
-                                fils.add(abc);
-
-                                i += 1;
-                            }
-                            let jimminy: Option<UnitOfWork> = path_opt.clone();
-                            tx.send(path_opt);
-                            match jimminy {
-                                Some(i) => {
-                                    let movie_basename = i.file_name
-                                        .file_name()
-                                        .unwrap()
-                                        .to_string_lossy();
-                                    progress::something(&movie_basename, iak, &pb, &args);
-                                }
-                                None => {}
-                            }
-                        }
-                        other => {
-                            let movie_basename = fils.file_name[iak.file_number].file_name
-                                .file_name()
-                                .unwrap()
-                                .to_string_lossy();
-                            progress::something(&movie_basename, iak, &pb, &args);
-                        }
-                    }
-                    true    
-                    }
-                    Err(_)=>{
-                        false
-                    }    
+            for Hanx in handles{
+            let typos = poll_work(Hanx, data_files_mutexed).unwrap();
+            progress::something(&typos.movie_basename, typos.progress_msg, &pb, &args);
+            match typos.progress_msg.status_code {
+                ProgressStatus::DoingNothin => 
+                {
+                                    }
+                other => {
+doing_nothing = false
                 }
             }
-            )
-                .count();
-
-            // If no active threads remain, break
-            if active == 0 {
-                break;
             }
+
+            if doing_nothing{
+    break;
+}
 
             // Sleep for a while before checking again
             thread::sleep(std::time::Duration::from_millis(10));
         }
 
-        for (handle, _, _) in handles {
-            handle.join().unwrap();
+        for handle in handles {
+            handle.join_handle.join().unwrap();
         }
 
         progress::finish_progress_bar(final_progress_bar, &pb);
@@ -237,54 +159,81 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-async fn poll_work() -> Vec<(std::thread::JoinHandle<()>,  async_std::channel::Sender<Option<UnitOfWork>>,  async_std::channel::Receiver<ProgressMessage>)>{
+ fn poll_work(Hanx:  Handles, muta: Mutex<Vec<PathBuf>>)
+-> Result<HmmFukya>
+{
+
+
+    let all_done = HmmFukya{
+        movie_basename: String::from(""),
+    progress_msg: ProgressMessage { bar_number: 0, status_code: ProgressStatus::MovieError, file_number: 0, ondisk_digest: Default::default(), computed_digest: Default::default() }
+    };
+
+    let abd= Hanx.progress_message.recv();
+        match abd {
+            // If a message is received at all
+          Ok( iak  ) => {
+            match iak.status_code {
+                // ifthe message received is that the thread wants a file to process, pop the next file and send it back
+                ProgressStatus::Requesting =>{
+                let mut path_opt: Option<UnitOfWork> = Default::default();
+                {
+                    let mut bc_locked = muta.lock().unwrap();
+                    let ab = bc_locked.pop();
+                    let path_opt = UnitOfWork {
+                        file_name: ab.unwrap(),
+                        // file_number: i,
+                    };
+
+                    let abc = path_opt.clone();
+                    // fils.add(abc);
+
+                    // i += 1;
+                }
+                let jimminy: Option<UnitOfWork> = path_opt.clone();
+              Hanx.unit_of_work.send(path_opt);
+                match jimminy {
+                    Some(i) => {
+                        let movie_basename = i.file_name
+                            .file_name()
+                            .unwrap()
+                            .to_string_lossy();
+                        let f = HmmFukya {
+movie_basename: movie_basename.to_string(),
+progress_msg: iak,
+                        };
+                        // progress::something(&movie_basename, iak, &pb, &args);
+                        Ok(f);
+                    }
+                    None => {}
+                }
+            }
+            other => {
+
+                let f = HmmFukya {
+                    movie_basename: String::from(""),
+progress_msg: iak,};
+Ok(f);
+                }
+                // let movie_basename = fils.file_name[iak.file_number].file_name
+                //     .file_name()
+                //     .unwrap()
+                //     .to_string_lossy();
+                // progress::something(&movie_basename, iak, &pb, &args);
+            }
+        
+        
+        }
+        Err(_)=>{
+            
+        }    
+    }
+
+
+            
+Ok(all_done)
+
 
 }
 
-// fn assign_work(threadcnt: u16) -> Vec<Work> {
-//     let mut x: Vec<Work> = Vec::new();
 
-//     // these are the movies
-//     // z.sort_by_key(|x| x.metadata().unwrap().len());
-//     // z.reverse();
-
-//     // now there's a queue per thread in x
-//     for ia in 0..threadcnt {
-//         // let ab: Vec<PathBuf> = Vec::new();
-//         let work = Work {
-//             wrok: Vec::new(), // , thread_num: ia
-//         };
-//         x.insert(ia.into(), work);
-//     }
-
-//     for ia in 0..z.len() {
-
-// let tt = FilesToWork {
-// path_buf: z[ia],
-// file_num: ia
-// };
-
-//         x[ia % (threadcnt as usize)].wrok.push(tt);
-//     }
-
-//     return x;
-// }
-
-// struct Work {
-//     // thread_num: u16,
-//     wrok: Vec<FilesToWork>,
-// }
-
-// pub struct FilesToWork {
-//     path_buf: PathBuf,
-//     file_num: usize,
-// }
-
-// #[cfg(test)]
-// mod tests {
-//     #[test]
-//     fn it_works() {
-//         let result = 2 + 2;
-//         assert_eq!(result, 4);
-//     }
-// }

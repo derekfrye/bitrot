@@ -98,6 +98,7 @@ pub enum ProgressStatus {
     MovieError,
     ParFileError,
     Requesting,
+    DoingNothin,
 }
 
 
@@ -150,7 +151,8 @@ pub fn something( file_name: &str, received: ProgressMessage, pb: &Bars, args: &
                 set_message(received.bar_number, "Thread done.", &pb);
                 finish_progress_bar(received.bar_number, &pb);
             }
-            ProgressStatus::Requesting => {}
+            other => {}
+
         }
 
         
