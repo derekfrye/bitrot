@@ -14,14 +14,19 @@ use regex::Regex;
 use std::fs;
 use std::io::Write;
 
+use async_std::task;
 use std::path::PathBuf;
-use std::sync::mpsc::{ channel, Receiver, Sender };
+// use std::sync::mpsc::{  Receiver, Sender };
 // use std::sync::mpsc::Sender;
 use std::thread;
 use std::time::Duration;
 use std::sync::{ mpsc, Mutex };
 
-use crate::progress::ProgressStatus;
+use crate::progress::{ProgressStatus, ProgressMessage};
+// use tokio::sync::mpsc;
+// use async_std::sync;
+use async_std::channel::{ unbounded };
+// use async_std::task;
 
 #[derive(Clone)]
 pub struct UnitOfWork {
@@ -113,9 +118,10 @@ fn main() -> Result<()> {
         );
 
         for i in 0..args.thread_count {
-            let (tx, worker_rx) = mpsc::channel();
-            let (worker_tx, main_rx) = mpsc::channel();
+            let (tx, worker_rx) = unbounded();
+            let (worker_tx, main_rx) = unbounded();
             let ttj = args.clone();
+
             let handle = thread::spawn(move || {
                 check::do_work(i as usize, ttj, worker_tx, worker_rx);
             });
@@ -152,58 +158,64 @@ fn main() -> Result<()> {
 
         let mut i = 0;
         loop {
+            // let active = handles
+            // .iter()
+            // .filter(|(_, tx, main_rx)| {
+            //     match main_rx.recv().
+            // }
+
             let active = handles
                 .iter()
                 .filter(|(_, tx, main_rx)| {
-                    let zz = main_rx.try_recv();
-                     
-                        // If a message is received, pop the next file and send it back
-                        match zz.unwrap().status_code {
-                            ProgressStatus::Requesting => {
-                                let mut path_opt: Option<UnitOfWork> = Default::default();
-                                {
-                                    let mut bc_locked = data_files_mutexed.lock().unwrap();
-                                    let ab = bc_locked.pop();
-                                    let path_opt = UnitOfWork {
-                                        file_name: ab.unwrap(),
-                                        file_number: i,
-                                    };
+                    match main_rx.try_recv() {
+                        // If a message is received
+                      Ok( iak  ) => {
+                        match iak.status_code {
+                            // ifthe message received is that the thread wants a file to process, pop the next file and send it back
+                            ProgressStatus::Requesting =>{
+                            let mut path_opt: Option<UnitOfWork> = Default::default();
+                            {
+                                let mut bc_locked = data_files_mutexed.lock().unwrap();
+                                let ab = bc_locked.pop();
+                                let path_opt = UnitOfWork {
+                                    file_name: ab.unwrap(),
+                                    file_number: i,
+                                };
 
-                                    let abc = path_opt.clone();
-                                    fils.add(abc);
+                                let abc = path_opt.clone();
+                                fils.add(abc);
 
-                                    i += 1;
-                                }
-                                let jimminy: Option<UnitOfWork> = path_opt.clone();
-                                tx.send(path_opt).unwrap();
-                                match jimminy {
-                                    Some(i) =>{
-
-                                        let movie_basename = i
-                                        
-                                        .file_name.file_name()
+                                i += 1;
+                            }
+                            let jimminy: Option<UnitOfWork> = path_opt.clone();
+                            tx.send(path_opt);
+                            match jimminy {
+                                Some(i) => {
+                                    let movie_basename = i.file_name
+                                        .file_name()
                                         .unwrap()
                                         .to_string_lossy();
-                                    progress::something(&movie_basename, zz.unwrap(), &pb, &args);
-                                    }
-                                    None => {}
+                                    progress::something(&movie_basename, iak, &pb, &args);
                                 }
-
-                                
-                            }
-                            other => {
-                                let movie_basename = fils.file_name[
-                                    zz.unwrap().file_number
-                                ].file_name
-                                    .file_name()
-                                    .unwrap()
-                                    .to_string_lossy();
-                                progress::something(&movie_basename, zz.unwrap(), &pb, &args);
+                                None => {}
                             }
                         }
-                        true
-                     
-                })
+                        other => {
+                            let movie_basename = fils.file_name[iak.file_number].file_name
+                                .file_name()
+                                .unwrap()
+                                .to_string_lossy();
+                            progress::something(&movie_basename, iak, &pb, &args);
+                        }
+                    }
+                    true    
+                    }
+                    Err(_)=>{
+                        false
+                    }    
+                }
+            }
+            )
                 .count();
 
             // If no active threads remain, break
@@ -223,6 +235,10 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn poll_work() -> Vec<(std::thread::JoinHandle<()>,  async_std::channel::Sender<Option<UnitOfWork>>,  async_std::channel::Receiver<ProgressMessage>)>{
+
 }
 
 // fn assign_work(threadcnt: u16) -> Vec<Work> {

@@ -5,8 +5,9 @@ use std::io;
 use std::io::BufRead;
 use std::fs;
 use std::path::Path;
-use std::sync::mpsc::Sender;
+// use std::sync::mpsc::Sender;
 use std::str;
+
 
 fn cksum(file_path: &str, bufsize: u16) -> Digest {
     // copy/paste from https://stackoverflow.com/questions/75442962/how-to-do-partial-read-and-calculate-md5sum-of-a-large-file-in-rust
@@ -36,7 +37,7 @@ fn cksum(file_path: &str, bufsize: u16) -> Digest {
     return digest;
 }
 
-pub fn do_work(statusbar: usize, a: ArgsClean, tx_back_to_main: Sender<progress::ProgressMessage>, rx_from_main_to_me: std::sync::mpsc::Receiver<Option<UnitOfWork>>) {
+pub async fn do_work(statusbar: usize, a: ArgsClean, tx_back_to_main: async_std::channel::Sender<progress::ProgressMessage>, rx_from_main_to_me: async_std::channel::Receiver<Option<UnitOfWork>>) {
 
     let mut sbar = progress::ProgressMessage {
         bar_number: statusbar as usize,
@@ -52,18 +53,18 @@ pub fn do_work(statusbar: usize, a: ArgsClean, tx_back_to_main: Sender<progress:
 
     loop {
         // Ask the main thread for the next PathBuf
-        tx_back_to_main.send(sbar).unwrap();
+        tx_back_to_main.send(sbar).await.unwrap();
         
-        match rx_from_main_to_me.recv().unwrap() {
-            Some(path) => {
+        match rx_from_main_to_me.recv().await {
+            Ok( Some(path)) => {
                 // println!("Thread {:?} working on file: {:?}", std::thread::current().id(), path.file_name);
                 // Here you can add the code to process the file if needed.
                 validate_ondisk_md5(path, &a, statusbar, &tx_back_to_main);
             },
-            None => {
+          Ok(  None)|Err(_) => {
                 // No more files to process
                 sbar.status_code= progress::ProgressStatus::ThreadCompleted;
-                tx_back_to_main.send(sbar).unwrap();
+                tx_back_to_main.send(sbar).await.unwrap();
                 break;
             }
         }
@@ -77,7 +78,7 @@ fn validate_ondisk_md5(
     // par_path: &str,
     // bufsize: u16,
     statusbar: usize,
-    transmission_channel: &Sender<progress::ProgressMessage>,
+    transmission_channel: &async_std::channel::Sender<progress::ProgressMessage>,
    
 ) -> Result<(), anyhow::Error> {
     let md5ending = ".md5.txt";
@@ -108,7 +109,7 @@ let movie_bytes = movie_basename.as_bytes().chunks(255).into_iter().next().unwra
         sbar.file_number= xx.file_number;
 
         // send we're working on file
-        transmission_channel.send(sbar).unwrap();
+        transmission_channel.send(sbar);
 
         let mut par = String::from(a.path_to_cksums.to_string());
         par.push_str(&movie_basename); // /cksumpath/datafilenm
@@ -138,7 +139,7 @@ let movie_bytes = movie_basename.as_bytes().chunks(255).into_iter().next().unwra
 // sbar.err = format!("No md5 on disk found for {}\n", &movie_basename.trim());
 sbar.status_code = progress::ProgressStatus::ParFileError;
 
-            transmission_channel.send(sbar).unwrap();
+            transmission_channel.send(sbar);
         } else {
             let md5hash_fromdisk = zfdfas.split_whitespace().next().unwrap();
 
@@ -165,7 +166,7 @@ sbar.ondisk_digest = md5hash_fromdisk.as_bytes().try_into().unwrap();
 sbar.computed_digest = formatted_cksum.as_bytes().try_into().unwrap();
 
                 // send msg
-                transmission_channel.send(sbar).unwrap();
+                transmission_channel.send(sbar);
             }
         // }
 
@@ -178,7 +179,7 @@ sbar.computed_digest = formatted_cksum.as_bytes().try_into().unwrap();
         //     status_code: progress::ProgressStatus::MovieCompleted,
         // };
         sbar.status_code= progress::ProgressStatus::MovieCompleted;
-        transmission_channel.send(sbar).unwrap();
+        transmission_channel.send(sbar);
     }
 
     // let s4b444sbb = progress::ProgressMessage {
@@ -190,7 +191,7 @@ sbar.computed_digest = formatted_cksum.as_bytes().try_into().unwrap();
     //     status_code: progress::ProgressStatus::ThreadCompleted,
     // };
     sbar.status_code= progress::ProgressStatus::ThreadCompleted;
-    transmission_channel.send(sbar).unwrap();
+    transmission_channel.send(sbar);
 
     Ok(())
 }
