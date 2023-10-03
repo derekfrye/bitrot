@@ -129,7 +129,7 @@ pub fn something( file_name: &str, received: ProgressMessage, pb: &Bars, args: &
 
                     let fssn=file_name;
 
-                fil.lock_exclusive();
+                fil.lock_exclusive().unwrap();
                 match received.status_code {
                     ProgressStatus::ParFileError =>{
                         fil.write(        format!("No md5 on disk found for {}\n", fssn)
@@ -145,13 +145,13 @@ pub fn something( file_name: &str, received: ProgressMessage, pb: &Bars, args: &
                     }
                 }
                 
-                fil.unlock();
+                fil.unlock().unwrap()
             }
             ProgressStatus::ThreadCompleted => {
                 set_message(received.bar_number, "Thread done.", &pb);
                 finish_progress_bar(received.bar_number, &pb);
             }
-            other => {}
+            _ => {}
 
         }
 
