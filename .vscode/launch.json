@@ -32,7 +32,7 @@
                 ".[Mm][pP4][4vV]$",
                 "--thread-count",
                 "1",
-                "--pretty-print",
+                // "--pretty-print",
                 // "--unit-testing",
                 "--error-output-file",
                 "/home/m1n2/docker/bin/bitrot/a"

@@ -38,7 +38,7 @@ pub fn do_work(
             }
             Ok(None) | Err(_) => {
                 // No more files to process
-                sbar.status_code = progress::ProgressStatus::ThreadCompleted;
+                sbar.status_code = progress::ProgressStatus::DoingNothin;
                 tx_back_to_main.send(sbar).unwrap();
                 break;
             }

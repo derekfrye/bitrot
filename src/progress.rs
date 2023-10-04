@@ -90,7 +90,7 @@ pub struct ProgressMessage {
 
 
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub enum ProgressStatus {
     Started,
     MovieCompleted,

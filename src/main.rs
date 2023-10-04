@@ -138,8 +138,14 @@ fn main() -> Result<()> {
                 let status_update = poll_worker(hndl, &data_files_mutexed).unwrap();
                 progress::something(&status_update.movie_basename, status_update.progress_msg, &pb, &args);
                 match status_update.progress_msg.status_code {
-                    ProgressStatus::DoingNothin => {}
-                    _ => {
+                    ProgressStatus::DoingNothin => {
+                        doing_nothing = true;
+                    }
+                    ProgressStatus::ThreadCompleted => {
+                        println!("Did a file.");
+                    }
+                    other => {
+                        println!("{:#?}", other);
                         doing_nothing = false;
                     }
                 }
