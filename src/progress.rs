@@ -79,16 +79,14 @@ pub fn set_message(b: usize, s: &str, z: &Bars) {
 pub struct ProgressMessage {
     pub bar_number: usize,
     pub status_code: ProgressStatus,
-    // most modern filesystems appear to be 255 filename max. 
+    // most modern filesystems appear to be 255 filename max.
     // pub file_name: [u8; 255],
     // our err msg length is filename max + 2 checksums + some words
     // pub err: [u8; 1024],
     pub file_number: usize,
-    pub ondisk_digest: [u8; 16],
-    pub computed_digest: [u8; 16],
+    pub ondisk_digest: [char; 32],
+    pub computed_digest: [char; 32],
 }
-
-
 
 #[derive(Copy, Clone, Debug)]
 pub enum ProgressStatus {
@@ -99,67 +97,64 @@ pub enum ProgressStatus {
     ParFileError,
     Requesting,
     DoingNothin,
+    ThreadError,
 }
 
+pub fn something(file_name: &str, received: ProgressMessage, pb: &Bars, args: &ArgsClean) {
+    match received.status_code {
+        ProgressStatus::Started => {
+            let fssn = file_name;
+            set_message(received.bar_number, &fssn.to_owned().to_string(), &pb);
+        }
+        ProgressStatus::MovieCompleted => {
+            increment_progress_bar(args.thread_count as usize, &pb);
+        }
+        ProgressStatus::ParFileError | ProgressStatus::MovieError => {
+            let mut fil = fs::OpenOptions
+                ::new()
+                .write(true)
+                .append(true)
+                .create(true)
+                .open(&args.error_output_file)
+                .unwrap();
 
-pub fn something( file_name: &str, received: ProgressMessage, pb: &Bars, args: &ArgsClean ){
-    
-        // println!("Got: {}", received);
+            let fssn = file_name;
 
-        // let xb = received;
-
-        // let xa = received.split_terminator("|").collect::<Vec<&str>>();
-        // let sb = xa[0].parse::<usize>().unwrap();
-
-        match received. status_code {
-            ProgressStatus::Started => {
-                let fssn=file_name;
-                set_message(received.bar_number, &fssn.to_owned().to_string(), &pb);
-            }
-            ProgressStatus::MovieCompleted => {
-                increment_progress_bar(args.thread_count as usize, &pb);
-            }
-            ProgressStatus::ParFileError | ProgressStatus::MovieError => {
-                let mut fil = fs::OpenOptions
-                    ::new()
-                    .write(true)
-                    .append(true)
-                    .create(true)
-                    .open(&args.error_output_file).unwrap();
-
-                    let fssn=file_name;
-
-                fil.lock_exclusive().unwrap();
-                match received.status_code {
-                    ProgressStatus::ParFileError =>{
-                        fil.write(        format!("No md5 on disk found for {}\n", fssn)
-                        .as_bytes()).unwrap();
-                    }
-                    _ => {
-                        fil.write(        format!(
+            fil.lock_exclusive().unwrap();
+            match received.status_code {
+                ProgressStatus::ParFileError => {
+                    fil.write(format!("No md5 on disk found for {}\n", fssn).as_bytes()).unwrap();
+                }
+                _ => {
+                    fil.write(
+                        format!(
                             "Error: {}, on-disk checksum: {}, our checksum: {}\n",
                             fssn,
-                            format!("{:?}", received.ondisk_digest ),
-                            format!("{:?}", received.computed_digest)
-                        ).as_bytes() ).unwrap();
-                    }
+                            format!("{}", get_a_str(received.ondisk_digest)),
+                            format!("{:?}", get_a_str(received.computed_digest))
+                        ).as_bytes()
+                    ).unwrap();
                 }
-                
-                fil.unlock().unwrap()
             }
-            ProgressStatus::ThreadCompleted => {
-                set_message(received.bar_number, "Thread done.", &pb);
-                finish_progress_bar(received.bar_number, &pb);
-            }
-            _ => {}
 
+            fil.unlock().unwrap()
         }
+        ProgressStatus::ThreadCompleted => {
+            set_message(received.bar_number, "Thread done.", &pb);
+            finish_progress_bar(received.bar_number, &pb);
+        }
+        _ => {}
+    }
 
-        
     // if args.unit_testing {
     //     thread::sleep(Duration::from_millis(5000));
     // }
+}
+
+fn get_a_str(ch: [char; 32]) -> String {
+    let mut x = String::from("");
+    for ab in ch {
+        x.push(ab);
     }
-
-    
-
+    return x;
+}

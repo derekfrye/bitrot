@@ -33,21 +33,9 @@ pub struct UnitOfWork {
     file_number: usize,
 }
 
-pub struct UnitsOfWork {
-    file_name: Vec<UnitOfWork>,
-}
-
 struct StatusUpdate {
     movie_basename: String,
     progress_msg: ProgressMessage,
-}
-
-// // https://doc.rust-lang.org/book/ch17-01-what-is-oo.html
-impl UnitsOfWork {
-    pub fn add(&mut self, value: UnitOfWork) {
-        let max = if self.file_name.len() == 0 { 0 } else { self.file_name.len() - 1 };
-        self.file_name.push(UnitOfWork { file_name: value.file_name, file_number: max });
-    }
 }
 
 struct WorkerThread {
@@ -84,14 +72,20 @@ fn main() -> Result<()> {
         let data_file_len = data_filest.len();
 
         let mut data_files: Vec<UnitOfWork> = vec![];
+        let mut data_files_stable: Vec<UnitOfWork> = vec![];
         let mut cntre = 0;
         for i in data_filest {
             let u = UnitOfWork { file_name: i, file_number: cntre };
+            let ub = u.clone();
             data_files.push(u);
+            data_files_stable.push(ub);
             cntre += 1;
         }
 
+        // let _jkdfjd= data_files[0];
+
         let data_files_mutexed = Mutex::new(data_files);
+        let data_files_stable_mutexed = Mutex::new(data_files_stable);
         let mut handles: Vec<WorkerThread> = vec![];
 
         // old manual "debug" stuff
@@ -135,17 +129,26 @@ fn main() -> Result<()> {
         let mut doing_nothing = true;
         loop {
             for hndl in &handles {
-                let status_update = poll_worker(hndl, &data_files_mutexed).unwrap();
-                progress::something(&status_update.movie_basename, status_update.progress_msg, &pb, &args);
+                let status_update = poll_worker(
+                    hndl,
+                    &data_files_mutexed,
+                    &data_files_stable_mutexed
+                ).unwrap();
+                progress::something(
+                    &status_update.movie_basename,
+                    status_update.progress_msg,
+                    &pb,
+                    &args
+                );
                 match status_update.progress_msg.status_code {
-                    ProgressStatus::DoingNothin => {
+                    ProgressStatus::DoingNothin | ProgressStatus::ThreadError => {
                         doing_nothing = true;
                     }
                     ProgressStatus::ThreadCompleted => {
-                        println!("Did a file.");
+                        // println!("Did a file.");
                     }
-                    other => {
-                        println!("{:#?}", other);
+                    _ => {
+                        // println!("{:#?}", other);
                         doing_nothing = false;
                     }
                 }
@@ -168,12 +171,16 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn poll_worker(worker_thread: &WorkerThread, muta: &Mutex<Vec<UnitOfWork>>) -> Result<StatusUpdate> {
+fn poll_worker(
+    worker_thread: &WorkerThread,
+    muta: &Mutex<Vec<UnitOfWork>>,
+    mutb: &Mutex<Vec<UnitOfWork>>
+) -> Result<StatusUpdate> {
     let mut status_report = StatusUpdate {
         movie_basename: String::from(""),
         progress_msg: ProgressMessage {
             bar_number: 0,
-            status_code: ProgressStatus::MovieError,
+            status_code: ProgressStatus::Started,
             file_number: 0,
             ondisk_digest: Default::default(),
             computed_digest: Default::default(),
@@ -187,42 +194,56 @@ fn poll_worker(worker_thread: &WorkerThread, muta: &Mutex<Vec<UnitOfWork>>) -> R
             match i.status_code {
                 // if the thread wants a file, pop the next one and send it
                 ProgressStatus::Requesting => {
-                    let mut path_opt: Option<UnitOfWork> = Some(UnitOfWork {
-                        file_name: Default::default(),
-                        file_number: 0,
-                    });
-                    {
-                        let mut bc_locked = muta.lock().unwrap();
-                        path_opt = bc_locked.pop().clone();
-                    }
-                    // clone this before we send it back, since we're going to ...
-                    // let jimminy: Option<UnitOfWork> = path_opt.clone();
-                    // send the unit of work back to the thread
+                    let mut bc_locked = muta.lock().unwrap();
+                    let path_opt = bc_locked.pop().clone();
+                    let _abc = bc_locked.len();
                     worker_thread.unit_of_work.send(path_opt).unwrap();
-                    
-                    // match jimminy {
-                    //     Some(i) => {
-                    //         let movie_basename = i.file_name.file_name().unwrap().to_string_lossy();
-                    //         let f = StatusUpdate {
-                    //             movie_basename: movie_basename.to_string(),
-                    //             progress_msg: thread_progress.unwrap(),
-                    //         };
-                    //         status_report = f;
-                    //     }
-                    //     None => {}
-                    // }
-                    
                 }
                 _ => {
-                    let f = StatusUpdate {
+                    // let  bc_locked = muta.lock().unwrap();
+                    let abc_locked = mutb.lock().unwrap();
+
+                    let mut f = StatusUpdate {
                         movie_basename: String::from(""),
                         progress_msg: thread_progress.unwrap(),
                     };
+
+                    // let abcdefg = thread_progress.unwrap().file_number;
+                    // let mut acdefg:usize = 0;
+                    // for i in 0.. bc_locked.len() {
+
+                    //      acdefg = bc_locked[i].file_number.into();
+
+                    // }
+
+                    if
+                        abc_locked
+                            .iter()
+                            .any(
+                                |axe: &UnitOfWork|
+                                    axe.file_number == thread_progress.unwrap().file_number
+                            )
+                    {
+                        let z = abc_locked
+                            .iter()
+                            .position(
+                                |axe: &UnitOfWork|
+                                    axe.file_number == thread_progress.unwrap().file_number
+                            )
+                            .unwrap();
+                        f.movie_basename = abc_locked[z].file_name
+                            .file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .to_string();
+                    }
                     status_report = f;
                 }
             }
         }
-        Err(_) => {}
+        Err(_) => {
+            status_report.progress_msg.status_code = ProgressStatus::ThreadError;
+        }
     }
 
     Ok(status_report)
