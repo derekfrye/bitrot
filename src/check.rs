@@ -1,5 +1,6 @@
 use crate::{ progress, UnitOfWork, args::ArgsClean };
 
+// use anyhow::Ok;
 // use async_std::fs;
 use md5::Digest;
 // use core::slice::SlicePattern;
@@ -19,17 +20,13 @@ pub fn do_work(
     let mut sbar = progress::ProgressMessage {
         bar_number: statusbar as usize,
         file_number: 0,
-        // file_name: movie_bytes.try_into().unwrap(),
-        // err: [0].try_into().unwrap(),
-        // md5_computed: String::from(""),
-        // md5_expected: String::from(""),
         status_code: progress::ProgressStatus::Requesting,
         computed_digest: Default::default(),
         ondisk_digest: Default::default(),
     };
 
     loop {
-        // Ask the main thread for the next PathBuf
+        // Ask the main thread for the next item
         tx_back_to_main.send(sbar).unwrap();
 
         match rx_from_main_to_me.recv() {
@@ -40,7 +37,7 @@ pub fn do_work(
             Ok(None) | Err(_) => {
                 // No more files to process
                 sbar.status_code = progress::ProgressStatus::DoingNothin;
-                tx_back_to_main.send(sbar).unwrap();
+                tx_back_to_main.send(sbar).unwrap_or_default();
                 break;
             }
         }
@@ -65,6 +62,11 @@ fn validate_ondisk_md5(
 
     let movie_as_str = xx.file_name.to_string_lossy();
     let movie_basename = xx.file_name.file_name().unwrap().to_string_lossy();
+    
+    let mut _i = 0;
+    if &movie_basename == "a.mp4" {
+        _i+=1;
+    }
 
     sbar.file_number = xx.file_number;
 
@@ -84,17 +86,17 @@ fn validate_ondisk_md5(
     // on https://stackoverflow.com/questions/75442962/how-to-do-partial-read-and-calculate-md5sum-of-a-large-file-in-rust
     // reads just the first entries in teh file, before any spaces or newllines
     // if par_as_path.metadata().unwrap().len() > 0 {
-    let zfdfas: String = std::fs
+    let md5_ondisk: String = std::fs
         ::read_to_string(par_as_path)
         .unwrap_or_else(|_| String::from("default"));
 
-    if "default" == zfdfas {
+    if "default" == md5_ondisk {
         // sbar.err = format!("No md5 on disk found for {}\n", &movie_basename.trim());
         sbar.status_code = progress::ProgressStatus::ParFileError;
 
         transmission_channel.send(sbar).unwrap();
     } else {
-        let md5hash_fromdisk = zfdfas
+        let md5hash_fromdisk = md5_ondisk
             .split_whitespace()
             .next()
             .unwrap_or_else(|| "0000000000000000");
@@ -127,8 +129,8 @@ fn validate_ondisk_md5(
         transmission_channel.send(sbar).unwrap();
     }
 
-    sbar.status_code = progress::ProgressStatus::ThreadCompleted;
-    transmission_channel.send(sbar).unwrap();
+    // sbar.status_code = progress::ProgressStatus::ThreadCompleted;
+    // transmission_channel.send(sbar).unwrap();
 }
 
 fn cksum(file_path: &str, bufsize: u16) -> Digest {

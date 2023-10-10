@@ -4,7 +4,6 @@ mod progress;
 mod args;
 
 use anyhow::Result;
-// use std::result::Result::Ok;
 
 // if you want to use some old manual "debug" stuff below
 // use chrono::{Local, Timelike};
@@ -13,19 +12,13 @@ use anyhow::Result;
 use regex::Regex;
 use std::fs;
 
-// use async_std::task;
 use std::path::PathBuf;
 use std::sync::mpsc::{ channel, Receiver, Sender };
-// use std::sync::mpsc::Sender;
 use std::thread;
 // use std::time::Duration;
 use std::sync::Mutex;
 
 use crate::progress::{ ProgressStatus, ProgressMessage };
-// use std::sync::mpsc;
-// use async_std::sync;
-// use async_std::channel::unbounded ;
-// use async_std::task;
 
 #[derive(Clone)]
 pub struct UnitOfWork {
@@ -115,7 +108,6 @@ fn main() -> Result<()> {
                 check::do_work(i as usize, ttj, worker_tx, worker_rx);
             });
 
-            //handles.push((handle, tx, main_rx));
             handles.push(WorkerThread {
                 join_handle: handle,
                 unit_of_work: tx,
@@ -134,19 +126,21 @@ fn main() -> Result<()> {
                     &data_files_mutexed,
                     &data_files_stable_mutexed
                 ).unwrap();
-                progress::something(
+
+                progress::advance_progress_bars(
                     &status_update.movie_basename,
                     status_update.progress_msg,
                     &pb,
                     &args
                 );
+                
                 match status_update.progress_msg.status_code {
                     ProgressStatus::DoingNothin | ProgressStatus::ThreadError => {
                         doing_nothing = true;
                     }
-                    ProgressStatus::ThreadCompleted => {
-                        // println!("Did a file.");
-                    }
+                    // ProgressStatus::ThreadCompleted => {
+                    //     println!("Did a file.");
+                    // }
                     _ => {
                         // println!("{:#?}", other);
                         doing_nothing = false;
@@ -158,12 +152,15 @@ fn main() -> Result<()> {
             }
 
             // Sleep for a while before checking again
-            thread::sleep(std::time::Duration::from_millis(10));
+            thread::sleep(std::time::Duration::from_millis(100));
         }
 
-        for hndl in handles {
-            hndl.join_handle.join().unwrap();
-        }
+        // for hndl in handles {
+        //     hndl.join_handle.join().unwrap();
+        // }
+
+        // Sleep for a while before checking again
+        thread::sleep(std::time::Duration::from_millis(1000));
 
         progress::finish_progress_bar(final_progress_bar, &pb);
     }
@@ -195,9 +192,14 @@ fn poll_worker(
                 // if the thread wants a file, pop the next one and send it
                 ProgressStatus::Requesting => {
                     let mut bc_locked = muta.lock().unwrap();
+                    if bc_locked.len() > 0 {
                     let path_opt = bc_locked.pop().clone();
                     let _abc = bc_locked.len();
                     worker_thread.unit_of_work.send(path_opt).unwrap();
+                    }
+                    else {
+                        worker_thread.unit_of_work.send(None).unwrap();
+                    }
                 }
                 _ => {
                     // let  bc_locked = muta.lock().unwrap();
@@ -207,14 +209,6 @@ fn poll_worker(
                         movie_basename: String::from(""),
                         progress_msg: thread_progress.unwrap(),
                     };
-
-                    // let abcdefg = thread_progress.unwrap().file_number;
-                    // let mut acdefg:usize = 0;
-                    // for i in 0.. bc_locked.len() {
-
-                    //      acdefg = bc_locked[i].file_number.into();
-
-                    // }
 
                     if
                         abc_locked

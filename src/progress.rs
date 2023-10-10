@@ -1,11 +1,11 @@
-use indicatif::{ MultiProgress, ProgressBar, ProgressStyle };
-use std::time::Duration;
-use fs2::FileExt;
+use crate::args::ArgsClean;
 
 use std::fs;
 use std::io::Write;
+use std::time::Duration;
 
-use crate::args::ArgsClean;
+use fs2::FileExt;
+use indicatif::{ MultiProgress, ProgressBar, ProgressStyle };
 
 pub struct Bars {
     bars: Vec<ProgressBar>,
@@ -55,7 +55,7 @@ pub fn build_progress_bar_export(total_messages: usize, threadcnt: u16, prettypr
     return b;
 }
 
-pub fn increment_progress_bar(b: usize, z: &Bars) {
+fn increment_progress_bar(b: usize, z: &Bars) {
     if z.bars.len() >= b + 1 {
         z.bars[b].inc(1);
         // b.inc(1);
@@ -69,7 +69,7 @@ pub fn finish_progress_bar(b: usize, z: &Bars) {
     }
 }
 
-pub fn set_message(b: usize, s: &str, z: &Bars) {
+fn set_message(b: usize, s: &str, z: &Bars) {
     if z.bars.len() >= b + 1 {
         z.bars[b].set_message(format!("{s}"));
     }
@@ -79,10 +79,6 @@ pub fn set_message(b: usize, s: &str, z: &Bars) {
 pub struct ProgressMessage {
     pub bar_number: usize,
     pub status_code: ProgressStatus,
-    // most modern filesystems appear to be 255 filename max.
-    // pub file_name: [u8; 255],
-    // our err msg length is filename max + 2 checksums + some words
-    // pub err: [u8; 1024],
     pub file_number: usize,
     pub ondisk_digest: [char; 32],
     pub computed_digest: [char; 32],
@@ -92,7 +88,7 @@ pub struct ProgressMessage {
 pub enum ProgressStatus {
     Started,
     MovieCompleted,
-    ThreadCompleted,
+    // ThreadCompleted,
     MovieError,
     ParFileError,
     Requesting,
@@ -100,11 +96,18 @@ pub enum ProgressStatus {
     ThreadError,
 }
 
-pub fn something(file_name: &str, received: ProgressMessage, pb: &Bars, args: &ArgsClean) {
+pub fn advance_progress_bars(
+    file_name: &str,
+    received: ProgressMessage,
+    pb: &Bars,
+    args: &ArgsClean
+) {
     match received.status_code {
         ProgressStatus::Started => {
             let fssn = file_name;
-            set_message(received.bar_number, &fssn.to_owned().to_string(), &pb);
+            if fssn != "" {
+                set_message(received.bar_number, &fssn.to_owned().to_string(), &pb);
+            }
         }
         ProgressStatus::MovieCompleted => {
             increment_progress_bar(args.thread_count as usize, &pb);
@@ -139,9 +142,9 @@ pub fn something(file_name: &str, received: ProgressMessage, pb: &Bars, args: &A
 
             fil.unlock().unwrap()
         }
-        ProgressStatus::ThreadCompleted => {
+        ProgressStatus::DoingNothin => {
             set_message(received.bar_number, "Thread done.", &pb);
-            finish_progress_bar(received.bar_number, &pb);
+            // finish_progress_bar(received.bar_number, &pb);
         }
         _ => {}
     }
