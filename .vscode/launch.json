@@ -21,9 +21,9 @@
             },
             "args": [
                 "--path-to-data",
-                "/home/m1n2/tmp/",
+                "${workspaceFolder}/tmp/",
                 "--path-to-cksums",
-                "/home/m1n2/tmp2/",
+                "${workspaceFolder}/tmp2/",
                 "--mode",
                 "ck",
                 "--bufsize",
@@ -31,11 +31,11 @@
                 "--data-filename-match",
                 ".[Mm][pP4][4vV]$",
                 "--thread-count",
-                "4",
+                "3",
                 "--pretty-print",
                 // "--unit-testing",
                 "--error-output-file",
-                "/home/m1n2/docker/bin/bitrot/a"
+                "${workspaceFolder}/a"
             ],
             "cwd": "${workspaceFolder}"
         },

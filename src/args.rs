@@ -15,6 +15,7 @@ pub fn args_checks() -> ArgsClean {
         pretty_print: xx.pretty_print,
         error_output_file: xx.error_output_file,
         unit_testing: xx.unit_testing,
+        alternate_scheduler: xx.alternate_scheduler
     };
     // let mut jkdfjak = ArgsClean::new();
 
@@ -95,8 +96,13 @@ struct Args {
     /// Do not checksum. Instead, pretend to.
     #[arg(short, long, value_name = "TESTINGONLY")]
     unit_testing: bool,
+
+    /// Use alternate scheduler. Appears less performant. Not recommended. See github issue #1.
+    #[arg(short, long, value_name = "ALTSCHEDULER")]
+    alternate_scheduler: bool,
 }
 
+#[derive( Clone)]
 pub struct ArgsClean {
     pub path_to_data: String,
     pub path_to_cksums: String,
@@ -107,4 +113,5 @@ pub struct ArgsClean {
     pub pretty_print: bool,
     pub error_output_file: String,
     pub unit_testing: bool,
+    pub alternate_scheduler: bool,
 }
