@@ -84,7 +84,7 @@ pub struct ProgressMessage {
     pub computed_digest: [char; 32],
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub enum ProgressStatus {
     Started,
     MovieCompleted,

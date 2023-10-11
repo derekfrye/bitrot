@@ -35,6 +35,7 @@ struct WorkerThread {
     join_handle: std::thread::JoinHandle<()>,
     unit_of_work: Sender<Option<UnitOfWork>>,
     progress_message: Receiver<ProgressMessage>,
+    thread_status: ProgressStatus,
 }
 
 fn main() -> Result<()> {
@@ -79,7 +80,8 @@ fn main() -> Result<()> {
 
         let data_files_mutexed = Mutex::new(data_files);
         let data_files_stable_mutexed = Mutex::new(data_files_stable);
-        let mut handles: Vec<WorkerThread> = vec![];
+        let handles: Vec<WorkerThread> = vec![];
+        let handles_mutexed = Mutex::new(handles);
 
         // old manual "debug" stuff
         // let now = Local::now();
@@ -108,21 +110,26 @@ fn main() -> Result<()> {
                 check::do_work(i as usize, ttj, worker_tx, worker_rx);
             });
 
-            handles.push(WorkerThread {
-                join_handle: handle,
-                unit_of_work: tx,
-                progress_message: main_rx,
-            });
+            {
+                let mut abc = handles_mutexed.lock().unwrap();
+                abc.push(WorkerThread {
+                    join_handle: handle,
+                    unit_of_work: tx,
+                    progress_message: main_rx,
+                    thread_status: ProgressStatus::Requesting,
+                });
+            }
         }
 
         let final_progress_bar = args.thread_count.to_string().parse::<usize>().unwrap();
 
         // let mut i = 0;
-        let mut doing_nothing = true;
+        // let mut doing_nothing = true;
         loop {
-            for hndl in &handles {
+            let mut abc = handles_mutexed.lock().unwrap();
+            for hndl in 0..abc.len() {
                 let status_update = poll_worker(
-                    hndl,
+                    &abc[hndl],
                     &data_files_mutexed,
                     &data_files_stable_mutexed
                 ).unwrap();
@@ -133,21 +140,28 @@ fn main() -> Result<()> {
                     &pb,
                     &args
                 );
-                
+
                 match status_update.progress_msg.status_code {
                     ProgressStatus::DoingNothin | ProgressStatus::ThreadError => {
-                        doing_nothing = true;
+                        abc[hndl].thread_status = ProgressStatus::DoingNothin;
+                        //  handles.last().unwrap().join_handle.join().unwrap();
                     }
                     // ProgressStatus::ThreadCompleted => {
                     //     println!("Did a file.");
                     // }
                     _ => {
                         // println!("{:#?}", other);
-                        doing_nothing = false;
+
                     }
                 }
             }
-            if doing_nothing {
+
+            if
+                abc
+                    .iter()
+                    .all(|axe: &WorkerThread| axe.thread_status == ProgressStatus::DoingNothin)
+            {
+                let _ = 1 + 1;
                 break;
             }
 
@@ -155,9 +169,15 @@ fn main() -> Result<()> {
             thread::sleep(std::time::Duration::from_millis(100));
         }
 
-        // for hndl in handles {
-        //     hndl.join_handle.join().unwrap();
-        // }
+        // handles.last().unwrap().join_handle.join().unwrap();
+
+        {
+            let mut abc = handles_mutexed.lock().unwrap();
+            for _ in 0..abc.len() {
+                let t = abc.pop().unwrap();
+                t.join_handle.join().unwrap();
+            }
+        }
 
         // Sleep for a while before checking again
         thread::sleep(std::time::Duration::from_millis(1000));
@@ -193,11 +213,10 @@ fn poll_worker(
                 ProgressStatus::Requesting => {
                     let mut bc_locked = muta.lock().unwrap();
                     if bc_locked.len() > 0 {
-                    let path_opt = bc_locked.pop().clone();
-                    let _abc = bc_locked.len();
-                    worker_thread.unit_of_work.send(path_opt).unwrap();
-                    }
-                    else {
+                        let path_opt = bc_locked.pop().clone();
+                        let _abc = bc_locked.len();
+                        worker_thread.unit_of_work.send(path_opt).unwrap();
+                    } else {
                         worker_thread.unit_of_work.send(None).unwrap();
                     }
                 }
