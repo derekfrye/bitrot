@@ -1,5 +1,6 @@
 use crate::{ progress, UnitOfWork, args::ArgsClean };
 
+// use clap::Arg;
 // use anyhow::Ok;
 // use async_std::fs;
 use md5::Digest;
@@ -44,6 +45,17 @@ pub fn do_work(
     }
 }
 
+pub fn do_work_main(
+    pathbufs: Vec<UnitOfWork>,
+    a: ArgsClean,
+    statusbar: u16,
+    tx_back_to_main: Sender<progress::ProgressMessage>
+) {
+    for x in pathbufs {
+        validate_ondisk_md5(x, &a, statusbar.into(), &tx_back_to_main);
+    }
+}
+
 fn validate_ondisk_md5(
     xx: UnitOfWork,
     a: &ArgsClean,
@@ -62,10 +74,10 @@ fn validate_ondisk_md5(
 
     let movie_as_str = xx.file_name.to_string_lossy();
     let movie_basename = xx.file_name.file_name().unwrap().to_string_lossy();
-    
+
     let mut _i = 0;
     if &movie_basename == "a.mp4" {
-        _i+=1;
+        _i += 1;
     }
 
     sbar.file_number = xx.file_number;
@@ -106,7 +118,7 @@ fn validate_ondisk_md5(
         // hashes do not match
         if md5hash_fromdisk != formatted_cksum {
             sbar.status_code = progress::ProgressStatus::MovieError;
-            
+
             sbar.ondisk_digest = md5hash_fromdisk
                 .chars()
                 .take(32)
@@ -139,7 +151,8 @@ fn cksum(file_path: &str, bufsize: u16) -> Digest {
     // Find the length of the file
     let len = f.metadata().unwrap().len();
     // Decide on a reasonable buffer size (500MB in this case, fastest will depend on hardware)
-    let ss: u64 = 1000000000 * (bufsize as u64);
+    let ss: u64 = 1024 * 1024 * (bufsize as u64);
+    // println!("Buffer size {}MiB", ss / 1024 / 1024 );
     let buf_len = len.min(ss.into()) as usize;
     let mut buf = io::BufReader::with_capacity(buf_len, f);
     let mut context = md5::Context::new();

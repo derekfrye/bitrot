@@ -3,12 +3,14 @@ mod error;
 mod progress;
 mod args;
 
-use anyhow::Result;
+use anyhow::{ Result, Ok };
+// use std::result::Result::Ok;
 
 // if you want to use some old manual "debug" stuff below
 // use chrono::{Local, Timelike};
 // use console::style;
 
+use args::ArgsClean;
 use regex::Regex;
 use std::fs;
 
@@ -42,18 +44,18 @@ fn main() -> Result<()> {
     let args = args::args_checks();
 
     if args.mode == "ck" {
-        println!(
-            "Using data path {} and checksums path {}",
-            args.path_to_data,
-            args.path_to_cksums
-        );
+        // println!(
+        //     "Using data path {} and checksums path {}",
+        //     args.path_to_data,
+        //     args.path_to_cksums
+        // );
 
         // r"\.[Mm][4pP][vV4]$"
         let re = Regex::new(&args.data_filename_match).unwrap();
 
         // idea from https://stackoverflow.com/questions/58062887/filtering-files-or-directories-discovered-with-fsread-dir
         // let data_files: Arc<Mutex<Vec<_>>> = Arc::new(Mutex::new(fs
-        let data_filest: Vec<_> = fs
+        let data_filest: Vec<PathBuf> = fs
             ::read_dir(&args.path_to_data)?
             .into_iter()
             .filter(|z| z.is_ok())
@@ -63,128 +65,203 @@ fn main() -> Result<()> {
             .filter(|ab| re.is_match(&ab.file_name().unwrap().to_string_lossy()))
             .collect();
 
-        let data_file_len = data_filest.len();
-
-        let mut data_files: Vec<UnitOfWork> = vec![];
-        let mut data_files_stable: Vec<UnitOfWork> = vec![];
-        let mut cntre = 0;
-        for i in data_filest {
-            let u = UnitOfWork { file_name: i, file_number: cntre };
-            let ub = u.clone();
-            data_files.push(u);
-            data_files_stable.push(ub);
-            cntre += 1;
+        if args.alternate_scheduler {
+            let _ = alternate_scheduler(data_filest, args);
+        } else {
+            let _ = main_scheduler(data_filest, args);
         }
+    }
 
-        // let _jkdfjd= data_files[0];
+    Ok(())
+}
 
-        let data_files_mutexed = Mutex::new(data_files);
-        let data_files_stable_mutexed = Mutex::new(data_files_stable);
-        let handles: Vec<WorkerThread> = vec![];
-        let handles_mutexed = Mutex::new(handles);
+fn main_scheduler(data_files: Vec<PathBuf>, args: ArgsClean) -> Result<()> {
+    let pb = progress::build_progress_bar_export(
+        data_files.len(),
+        args.thread_count,
+        args.pretty_print
+    );
 
-        // old manual "debug" stuff
-        // let now = Local::now();
-        // let (is_pm, hour) = now.hour12();
-        // println!(
-        //     "{:02}:{:02}:{:02}{} Processing {} files...",
-        //     style(hour).bold().dim(),
-        //     style(now.minute()).bold().dim(),
-        //     style(now.second()).bold().dim(),
-        //     style(if is_pm { "p" } else { "a" }).bold().dim(),
-        //     data_files.len()
-        // );
+    let tb = data_files.clone();
+    let zz = assign_work(data_files, args.thread_count);
+    let (tx, rx): (
+        Sender<progress::ProgressMessage>,
+        Receiver<progress::ProgressMessage>,
+    ) = channel();
 
-        let pb = progress::build_progress_bar_export(
-            data_file_len,
-            args.thread_count,
-            args.pretty_print
+    let mut status_bar_line_entry = 0;
+    for x in zz {
+        let tx1 = tx.clone();
+        let kjdfj = args.clone();
+        thread::spawn(move || {
+            let _ = check::do_work_main(x, kjdfj, status_bar_line_entry, tx1);
+        });
+        status_bar_line_entry += 1;
+    }
+    drop(tx);
+
+    let final_progress_bar = args.thread_count.to_string().parse::<usize>().unwrap();
+    for received in rx {
+        progress::advance_progress_bars(
+            &tb[received.file_number].file_name().unwrap().to_string_lossy(),
+            received,
+            &pb,
+            &args
         );
+        thread::sleep(std::time::Duration::from_millis(100));
+    }
 
-        for i in 0..args.thread_count {
-            let (tx, worker_rx) = channel();
-            let (worker_tx, main_rx) = channel();
-            let ttj = args.clone();
+    progress::finish_progress_bar(final_progress_bar, &pb);
+    Ok(())
+}
 
-            let handle = thread::spawn(move || {
-                check::do_work(i as usize, ttj, worker_tx, worker_rx);
-            });
+fn assign_work(mut z: Vec<PathBuf>, threadcnt: u16) -> Vec<Vec<UnitOfWork>> {
+    let mut x: Vec<Vec<UnitOfWork>> = vec![];
 
-            {
-                let mut abc = handles_mutexed.lock().unwrap();
-                abc.push(WorkerThread {
-                    join_handle: handle,
-                    unit_of_work: tx,
-                    progress_message: main_rx,
-                    thread_status: ProgressStatus::Requesting,
-                });
-            }
-        }
+    // these are the movies
+    z.sort_by_key(|x| x.metadata().unwrap().len());
+    // z.reverse();
 
-        let final_progress_bar = args.thread_count.to_string().parse::<usize>().unwrap();
+    // now there's a queue for each thread
+    for _ in 0..threadcnt {
+        // let ab: Vec<PathBuf> = Vec::new();
+        let work: Vec<UnitOfWork> = vec![];
+        // x.insert(ia.into(), work);
+        // work.insert(index, element)
+        x.push(work);
+    }
 
-        // let mut i = 0;
-        // let mut doing_nothing = true;
-        loop {
-            let mut abc = handles_mutexed.lock().unwrap();
-            for hndl in 0..abc.len() {
-                let status_update = poll_worker(
-                    &abc[hndl],
-                    &data_files_mutexed,
-                    &data_files_stable_mutexed
-                ).unwrap();
+    // assign each file into the thread queues
+    let mut i = 0;
+    for ia in 0..z.len() {
+        let t = UnitOfWork {
+            file_name: z[ia].to_owned(),
+            file_number: i, // file number doesn't matter for this scheduler
+        };
+        x[ia % (threadcnt as usize)].push(t);
+        i += 1;
+    }
 
-                progress::advance_progress_bars(
-                    &status_update.movie_basename,
-                    status_update.progress_msg,
-                    &pb,
-                    &args
-                );
+    return x;
+}
 
-                match status_update.progress_msg.status_code {
-                    ProgressStatus::DoingNothin | ProgressStatus::ThreadError => {
-                        abc[hndl].thread_status = ProgressStatus::DoingNothin;
-                        //  handles.last().unwrap().join_handle.join().unwrap();
-                    }
-                    // ProgressStatus::ThreadCompleted => {
-                    //     println!("Did a file.");
-                    // }
-                    _ => {
-                        // println!("{:#?}", other);
+fn alternate_scheduler(data_filest: Vec<PathBuf>, args: ArgsClean) -> Result<()> {
+    let data_file_len = data_filest.len();
 
-                    }
-                }
-            }
+    let mut data_files: Vec<UnitOfWork> = vec![];
+    let mut data_files_stable: Vec<UnitOfWork> = vec![];
+    let mut cntre = 0;
+    for i in data_filest {
+        let u = UnitOfWork { file_name: i, file_number: cntre };
+        let ub = u.clone();
+        data_files.push(u);
+        data_files_stable.push(ub);
+        cntre += 1;
+    }
 
-            if
-                abc
-                    .iter()
-                    .all(|axe: &WorkerThread| axe.thread_status == ProgressStatus::DoingNothin)
-            {
-                let _ = 1 + 1;
-                break;
-            }
+    // let _jkdfjd= data_files[0];
 
-            // Sleep for a while before checking again
-            thread::sleep(std::time::Duration::from_millis(100));
-        }
+    let data_files_mutexed = Mutex::new(data_files);
+    let data_files_stable_mutexed = Mutex::new(data_files_stable);
+    let handles: Vec<WorkerThread> = vec![];
+    let handles_mutexed = Mutex::new(handles);
 
-        // handles.last().unwrap().join_handle.join().unwrap();
+    // old manual "debug" stuff
+    // let now = Local::now();
+    // let (is_pm, hour) = now.hour12();
+    // println!(
+    //     "{:02}:{:02}:{:02}{} Processing {} files...",
+    //     style(hour).bold().dim(),
+    //     style(now.minute()).bold().dim(),
+    //     style(now.second()).bold().dim(),
+    //     style(if is_pm { "p" } else { "a" }).bold().dim(),
+    //     data_files.len()
+    // );
+
+    let pb = progress::build_progress_bar_export(
+        data_file_len,
+        args.thread_count,
+        args.pretty_print
+    );
+
+    for i in 0..args.thread_count {
+        let (tx, worker_rx) = channel();
+        let (worker_tx, main_rx) = channel();
+        let ttj = args.clone();
+
+        let handle = thread::spawn(move || {
+            check::do_work(i as usize, ttj, worker_tx, worker_rx);
+        });
 
         {
             let mut abc = handles_mutexed.lock().unwrap();
-            for _ in 0..abc.len() {
-                let t = abc.pop().unwrap();
-                t.join_handle.join().unwrap();
+            abc.push(WorkerThread {
+                join_handle: handle,
+                unit_of_work: tx,
+                progress_message: main_rx,
+                thread_status: ProgressStatus::Requesting,
+            });
+        }
+    }
+
+    let final_progress_bar = args.thread_count.to_string().parse::<usize>().unwrap();
+
+    // let mut i = 0;
+    // let mut doing_nothing = true;
+    loop {
+        let mut abc = handles_mutexed.lock().unwrap();
+        for hndl in 0..abc.len() {
+            let status_update = poll_worker(
+                &abc[hndl],
+                &data_files_mutexed,
+                &data_files_stable_mutexed
+            ).unwrap();
+
+            progress::advance_progress_bars(
+                &status_update.movie_basename,
+                status_update.progress_msg,
+                &pb,
+                &args
+            );
+
+            match status_update.progress_msg.status_code {
+                ProgressStatus::DoingNothin | ProgressStatus::ThreadError => {
+                    abc[hndl].thread_status = ProgressStatus::DoingNothin;
+                    //  handles.last().unwrap().join_handle.join().unwrap();
+                }
+                // ProgressStatus::ThreadCompleted => {
+                //     println!("Did a file.");
+                // }
+                _ => {
+                    // println!("{:#?}", other);
+
+                }
             }
         }
 
-        // Sleep for a while before checking again
-        thread::sleep(std::time::Duration::from_millis(1000));
+        if abc.iter().all(|axe: &WorkerThread| axe.thread_status == ProgressStatus::DoingNothin) {
+            let _ = 1 + 1;
+            break;
+        }
 
-        progress::finish_progress_bar(final_progress_bar, &pb);
+        // Sleep for a while before checking again
+        thread::sleep(std::time::Duration::from_millis(100));
     }
 
+    // handles.last().unwrap().join_handle.join().unwrap();
+
+    {
+        let mut abc = handles_mutexed.lock().unwrap();
+        for _ in 0..abc.len() {
+            let t = abc.pop().unwrap();
+            t.join_handle.join().unwrap();
+        }
+    }
+
+    // Sleep for a while before checking again
+    // thread::sleep(std::time::Duration::from_millis(1000));
+
+    progress::finish_progress_bar(final_progress_bar, &pb);
     Ok(())
 }
 
@@ -207,7 +284,7 @@ fn poll_worker(
     let thread_progress = worker_thread.progress_message.recv();
     match thread_progress {
         // If a message is received at all
-        Ok(i) => {
+        Result::Ok(i) => {
             match i.status_code {
                 // if the thread wants a file, pop the next one and send it
                 ProgressStatus::Requesting => {
