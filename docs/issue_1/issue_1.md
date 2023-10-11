@@ -74,5 +74,21 @@ Whoa! Turns out that the new scheduler is *slower*. Maybe the overhead of commun
 
 If I do merge this branch back in, it should be as an optional feature, clearly.
 
+## Post merge performance update
+
+Testing on 71 files, 29GiB of data. Alternate scheduler definitely *doesn't* win!
+
+```
+# touch errors_bitrot.txt && rm errors_bitrot.txt && /usr/bin/time -p /root/bitrot -d /jf_data/ -c /jf_par2/ -m ck -b 512 -r "<regex>" -t 4 -p -e ~/errors_bitrot.txt -a
+real 32.53
+user 51.07
+sys 12.46
+
+touch errors_bitrot.txt && rm errors_bitrot.txt && /usr/bin/time -p /root/bitrot -d /jf_data/ -c /jf_par2/ -m ck -b 512 -r "<regex>" -t 4 -p -e ~/errors_bitrot.txt  
+real 19.09
+user 50.49
+sys 7.13
+```
+
 [^1]: In [today's implmentation](https://github.com/derekfrye/bitrot/commit/9e4ecb2ca201ec5a459e4600d802a7c522d60ed4), main.rs (line 39) reads all the files matching our regex using `read_dir`, then function `assign_work()` sorts the files by `PathBuf.metadata().len()`. Finally, line 74 of main.rs cycles through the filesize-sorted `PathBuf` vector, handing each `PathBuf`` off to a new thread, one-by-one, in the sorted order.
 
