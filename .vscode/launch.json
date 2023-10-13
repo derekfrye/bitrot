@@ -35,7 +35,7 @@
                 "--pretty-print",
                 // "--unit-testing",
                 "--error-output-file",
-                "${workspaceFolder}/a"
+                "${workspaceFolder}/output.txt"
             ],
             "cwd": "${workspaceFolder}"
         },
