@@ -75,10 +75,10 @@ fn validate_ondisk_md5(
     let movie_as_str = xx.file_name.to_string_lossy();
     let movie_basename = xx.file_name.file_name().unwrap().to_string_lossy();
 
-    let mut _i = 0;
-    if &movie_basename == "a.mp4" {
-        _i += 1;
-    }
+    // let mut _i = 0;
+    // if &movie_basename == "a.mp4" {
+    //     _i += 1;
+    // }
 
     sbar.file_number = xx.file_number;
 

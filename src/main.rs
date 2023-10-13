@@ -1,5 +1,4 @@
 mod check;
-mod error;
 mod progress;
 mod args;
 
@@ -82,8 +81,8 @@ fn main_scheduler(data_files: Vec<PathBuf>, args: ArgsClean) -> Result<()> {
         args.pretty_print
     );
 
-    let tb = data_files.clone();
     let zz = assign_work(data_files, args.thread_count);
+    let tb = zz.clone();
     let (tx, rx): (
         Sender<progress::ProgressMessage>,
         Receiver<progress::ProgressMessage>,
@@ -100,18 +99,38 @@ fn main_scheduler(data_files: Vec<PathBuf>, args: ArgsClean) -> Result<()> {
     }
     drop(tx);
 
-    let final_progress_bar = args.thread_count.to_string().parse::<usize>().unwrap();
+    // let final_progress_bar = args.thread_count.to_string().parse::<usize>().unwrap();
     for received in rx {
-        progress::advance_progress_bars(
-            &tb[received.file_number].file_name().unwrap().to_string_lossy(),
-            received,
-            &pb,
-            &args
-        );
-        thread::sleep(std::time::Duration::from_millis(100));
-    }
+        let mut filenm = String::from("");
+        //         if tb.iter().any(|xa| { xa.iter().any(|x| { x.file_number == received.file_number  })  } )
+        //         {
+        // let axe:Vec<&Vec<UnitOfWork>> = tb.iter().filter(|x| { x.iter().any(|xx| {xx.file_number == received.file_number})    }  ).collect();
+        // // let axey = axe.iter().find(predicate)
+        //         }
 
-    progress::finish_progress_bar(final_progress_bar, &pb);
+        match tb.iter().find(|x| x.iter().any(|x| x.file_number == received.file_number)) {
+            Some(bx) => {
+                let px = &bx.iter().find(|x| x.file_number == received.file_number);
+                let tx = px.unwrap().file_name.file_name().unwrap().to_string_lossy();
+                filenm = tx.to_string();
+            }
+            None => {}
+        }
+
+        if args.pretty_print {
+            progress::advance_progress_bars(
+                // &tb[received.file_number].file_name().unwrap().to_string_lossy(),
+                &filenm,
+                received,
+                &pb,
+                &args
+            );
+        }
+        // thread::sleep(std::time::Duration::from_millis(50));
+    }
+    if args.pretty_print {
+        progress::finish_progress_bar(args.thread_count.to_string().parse::<usize>().unwrap(), &pb);
+    }
     Ok(())
 }
 
@@ -136,7 +155,7 @@ fn assign_work(mut z: Vec<PathBuf>, threadcnt: u16) -> Vec<Vec<UnitOfWork>> {
     for ia in 0..z.len() {
         let t = UnitOfWork {
             file_name: z[ia].to_owned(),
-            file_number: i, // file number doesn't matter for this scheduler
+            file_number: i, 
         };
         x[ia % (threadcnt as usize)].push(t);
         i += 1;
