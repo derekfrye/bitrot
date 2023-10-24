@@ -1,4 +1,4 @@
-use crate::args::ArgsClean;
+use crate::args::{ ArgsClean, Mode };
 
 use std::fs;
 use std::io::Write;
@@ -94,6 +94,7 @@ pub enum ProgressStatus {
     Requesting,
     DoingNothin,
     ThreadError,
+    WriteFileHeader,
 }
 
 pub fn advance_progress_bars(
@@ -101,18 +102,38 @@ pub fn advance_progress_bars(
     received: ProgressMessage,
     pb: &Bars,
     args: &ArgsClean
+    // full_file_name: &str,
 ) {
+    // let mut fil = fs::OpenOptions
+    // ::new()
+    // .write(true)
+    // .append(true)
+    // .create(true)
+    // .open(&args.error_output_file)
+    // .unwrap();
+
+    let fssn = file_name;
+
     match received.status_code {
         ProgressStatus::Started => {
-            let fssn = file_name;
+            // let fssn = file_name;
             if fssn != "" {
                 set_message(received.bar_number, &fssn.to_owned().to_string(), &pb);
             }
         }
-        ProgressStatus::MovieCompleted |ProgressStatus::ParFileError | ProgressStatus::MovieError => {
+        | ProgressStatus::MovieCompleted
+        | ProgressStatus::ParFileError
+        | ProgressStatus::MovieError => {
             increment_progress_bar(args.thread_count as usize, &pb);
+            // println!("mode {:?}.", args.mode);
+            // if args.mode == Mode::Create {
+            // fil.lock_exclusive().unwrap();
+            // fil.write(format!("{},{}\n", get_a_str(received.computed_digest), fssn).as_bytes()).unwrap();
+            // fil.unlock().unwrap()
+
+            // write_to_output(fssn,  full_file_name,   args, received, true);
+            // }
         }
-        
         ProgressStatus::DoingNothin => {
             set_message(received.bar_number, "Thread done.", &pb);
             // finish_progress_bar(received.bar_number, &pb);
@@ -127,38 +148,58 @@ pub fn advance_progress_bars(
 
 pub fn write_to_output(
     file_name: &str,
+    file_full_name: &str,
     args: &ArgsClean,
     received: ProgressMessage,
-)
-{
-    let mut fil = fs::OpenOptions
-                ::new()
-                .write(true)
-                .append(true)
-                .create(true)
-                .open(&args.error_output_file)
-                .unwrap();
+    append: bool
+) {
+    let mut opts = fs::OpenOptions::new();
+    if append {
+        opts.write(true).create(true).append(true);
+    } else {
+        opts.write(true).create(true).truncate(true);
+    }
 
-            let fssn = file_name;
+    let mut fil = opts.open(&args.error_output_file).unwrap();
 
+    // let fssn = file_name;
+
+    match received.status_code {
+        ProgressStatus::ParFileError => {
             fil.lock_exclusive().unwrap();
-            match received.status_code {
-                ProgressStatus::ParFileError => {
-                    fil.write(format!("No md5 on disk found for {}\n", fssn).as_bytes()).unwrap();
-                }
-                _ => {
-                    fil.write(
-                        format!(
-                            "Error: {}, on-disk checksum: {}, our checksum: {}\n",
-                            fssn,
-                            format!("{}", get_a_str(received.ondisk_digest)),
-                            format!("{:?}", get_a_str(received.computed_digest))
-                        ).as_bytes()
-                    ).unwrap();
-                }
+            fil.write(format!("No md5 on disk found for {}\n", file_name).as_bytes()).unwrap();
+        }
+        ProgressStatus::MovieError => {
+            fil.lock_exclusive().unwrap();
+            fil.write(
+                format!(
+                    "Error: {}, on-disk checksum: {}, our checksum: {}\n",
+                    file_name,
+                    format!("{}", get_a_str(received.ondisk_digest)),
+                    format!("{:?}", get_a_str(received.computed_digest))
+                ).as_bytes()
+            ).unwrap();
+        }
+        ProgressStatus::MovieCompleted => {
+            if args.mode == Mode::Create {
+                fil.write(
+                    format!(
+                        "{},{}\n",
+                        get_a_str(received.computed_digest),
+                        file_full_name
+                    ).as_bytes()
+                ).unwrap();
             }
+        }
+        ProgressStatus::WriteFileHeader => {
+            fil.write(format!("%%%% HASHDEEP-1.0\n").as_bytes()).unwrap();
+            fil.write(format!("%%%% size,md5,filename\n").as_bytes()).unwrap();
+        }
+        _ => {}
+    }
 
-            fil.unlock().unwrap()
+    let _ = fil.flush();
+    fil.unlock().unwrap()
 }
 
 fn get_a_str(ch: [char; 32]) -> String {

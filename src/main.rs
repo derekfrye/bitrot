@@ -9,7 +9,7 @@ use anyhow::{ Result, Ok };
 // use chrono::{Local, Timelike};
 // use console::style;
 
-use args::ArgsClean;
+use args::{ ArgsClean, Mode };
 use regex::Regex;
 use std::fs;
 
@@ -30,6 +30,7 @@ pub struct UnitOfWork {
 struct StatusUpdate {
     movie_basename: String,
     progress_msg: ProgressMessage,
+    file_full_name: String,
 }
 
 struct WorkerThread {
@@ -42,33 +43,46 @@ struct WorkerThread {
 fn main() -> Result<()> {
     let args = args::args_checks();
 
-    if args.mode == "ck" {
-        // println!(
-        //     "Using data path {} and checksums path {}",
-        //     args.path_to_data,
-        //     args.path_to_cksums
-        // );
+    // r"\.[Mm][4pP][vV4]$"
+    let re = Regex::new(&args.data_filename_match).unwrap();
 
-        // r"\.[Mm][4pP][vV4]$"
-        let re = Regex::new(&args.data_filename_match).unwrap();
+    // idea from https://stackoverflow.com/questions/58062887/filtering-files-or-directories-discovered-with-fsread-dir
+    // let data_files: Arc<Mutex<Vec<_>>> = Arc::new(Mutex::new(fs
+    let data_filest: Vec<PathBuf> = fs
+        ::read_dir(&args.path_to_data)?
+        .into_iter()
+        .filter(|z| z.is_ok())
+        .map(|r| r.unwrap().path())
+        .filter(|z| z.is_file())
+        .into_iter()
+        .filter(|ab| re.is_match(&ab.file_name().unwrap().to_string_lossy()))
+        .collect();
 
-        // idea from https://stackoverflow.com/questions/58062887/filtering-files-or-directories-discovered-with-fsread-dir
-        // let data_files: Arc<Mutex<Vec<_>>> = Arc::new(Mutex::new(fs
-        let data_filest: Vec<PathBuf> = fs
-            ::read_dir(&args.path_to_data)?
-            .into_iter()
-            .filter(|z| z.is_ok())
-            .map(|r| r.unwrap().path())
-            .filter(|z| z.is_file())
-            .into_iter()
-            .filter(|ab| re.is_match(&ab.file_name().unwrap().to_string_lossy()))
-            .collect();
+    // println!(
+    //     "Using data path {} and checksums path {}",
+    //     args.path_to_data,
+    //     args.path_to_cksums
+    // );
+    if args.mode == Mode::Create {
+        progress::write_to_output(
+            "",
+            "",
+            &args,
+            ProgressMessage {
+                bar_number: 0,
+                status_code: ProgressStatus::WriteFileHeader,
+                file_number: 0,
+                ondisk_digest: Default::default(),
+                computed_digest: Default::default(),
+            },
+            false
+        );
+    }
 
-        if args.alternate_scheduler {
-            let _ = alternate_scheduler(data_filest, args);
-        } else {
-            let _ = main_scheduler(data_filest, args);
-        }
+    if args.alternate_scheduler {
+        let _ = alternate_scheduler(data_filest, args);
+    } else {
+        let _ = main_scheduler(data_filest, args);
     }
 
     Ok(())
@@ -102,12 +116,14 @@ fn main_scheduler(data_files: Vec<PathBuf>, args: ArgsClean) -> Result<()> {
     // let final_progress_bar = args.thread_count.to_string().parse::<usize>().unwrap();
     for received in rx {
         let mut filenm = String::from("");
-        
+        let mut filenm_full = String::from("");
+
         match tb.iter().find(|x| x.iter().any(|x| x.file_number == received.file_number)) {
             Some(bx) => {
                 let px = &bx.iter().find(|x| x.file_number == received.file_number);
                 let tx = px.unwrap().file_name.file_name().unwrap().to_string_lossy();
                 filenm = tx.to_string();
+                filenm_full = px.unwrap().file_name.to_string_lossy().to_string();
             }
             None => {}
         }
@@ -119,14 +135,17 @@ fn main_scheduler(data_files: Vec<PathBuf>, args: ArgsClean) -> Result<()> {
                 received,
                 &pb,
                 &args
+                // &filenm_full,
             );
         }
 
-        match received.status_code{
-            ProgressStatus::ParFileError | ProgressStatus::MovieError => {
-                progress::write_to_output(&filenm, &args, received);
+        match received.status_code {
+            | ProgressStatus::ParFileError
+            | ProgressStatus::MovieError
+            | ProgressStatus::MovieCompleted => {
+                progress::write_to_output(&filenm, &filenm_full, &args, received, true);
             }
-            _=>{}
+            _ => {}
         }
 
         // thread::sleep(std::time::Duration::from_millis(50));
@@ -140,16 +159,13 @@ fn main_scheduler(data_files: Vec<PathBuf>, args: ArgsClean) -> Result<()> {
 fn assign_work(mut z: Vec<PathBuf>, threadcnt: u16) -> Vec<Vec<UnitOfWork>> {
     let mut x: Vec<Vec<UnitOfWork>> = vec![];
 
-    // these are the movies
+    // these are the files, sort them so the threads get allocated roughly equal amounts of work (ideally)
     z.sort_by_key(|x| x.metadata().unwrap().len());
     // z.reverse();
 
     // now there's a queue for each thread
     for _ in 0..threadcnt {
-        // let ab: Vec<PathBuf> = Vec::new();
         let work: Vec<UnitOfWork> = vec![];
-        // x.insert(ia.into(), work);
-        // work.insert(index, element)
         x.push(work);
     }
 
@@ -158,7 +174,7 @@ fn assign_work(mut z: Vec<PathBuf>, threadcnt: u16) -> Vec<Vec<UnitOfWork>> {
     for ia in 0..z.len() {
         let t = UnitOfWork {
             file_name: z[ia].to_owned(),
-            file_number: i, 
+            file_number: i,
         };
         x[ia % (threadcnt as usize)].push(t);
         i += 1;
@@ -238,13 +254,15 @@ fn alternate_scheduler(data_filest: Vec<PathBuf>, args: ArgsClean) -> Result<()>
                 &data_files_mutexed,
                 &data_files_stable_mutexed
             ).unwrap();
-
-            progress::advance_progress_bars(
-                &status_update.movie_basename,
-                status_update.progress_msg,
-                &pb,
-                &args
-            );
+            if args.pretty_print {
+                progress::advance_progress_bars(
+                    &status_update.movie_basename,
+                    status_update.progress_msg,
+                    &pb,
+                    &args
+                    // &status_update.file_full_name,
+                );
+            }
 
             match status_update.progress_msg.status_code {
                 ProgressStatus::DoingNothin | ProgressStatus::ThreadError => {
@@ -254,6 +272,15 @@ fn alternate_scheduler(data_filest: Vec<PathBuf>, args: ArgsClean) -> Result<()>
                 // ProgressStatus::ThreadCompleted => {
                 //     println!("Did a file.");
                 // }
+                ProgressStatus::MovieCompleted => {
+                    progress::write_to_output(
+                        &status_update.movie_basename,
+                        &status_update.file_full_name,
+                        &args,
+                        status_update.progress_msg,
+                        true
+                    );
+                }
                 _ => {
                     // println!("{:#?}", other);
 
@@ -301,6 +328,7 @@ fn poll_worker(
             ondisk_digest: Default::default(),
             computed_digest: Default::default(),
         },
+        file_full_name: String::from(""),
     };
 
     let thread_progress = worker_thread.progress_message.recv();
@@ -326,6 +354,7 @@ fn poll_worker(
                     let mut f = StatusUpdate {
                         movie_basename: String::from(""),
                         progress_msg: thread_progress.unwrap(),
+                        file_full_name: String::from(""),
                     };
 
                     if

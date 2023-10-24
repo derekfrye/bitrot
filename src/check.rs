@@ -1,3 +1,4 @@
+use crate::args::Mode;
 use crate::{ progress, UnitOfWork, args::ArgsClean };
 
 // use clap::Arg;
@@ -94,52 +95,52 @@ fn validate_ondisk_md5(
     // if fs::metadata(par_as_path).is_ok() {
     let digest = cksum(&movie_as_str, a.bufsize);
 
-    // got this idea from initial question
-    // on https://stackoverflow.com/questions/75442962/how-to-do-partial-read-and-calculate-md5sum-of-a-large-file-in-rust
-    // reads just the first entries in teh file, before any spaces or newllines
-    // if par_as_path.metadata().unwrap().len() > 0 {
-    let md5_ondisk: String = std::fs
-        ::read_to_string(par_as_path)
-        .unwrap_or_else(|_| String::from("default"));
+    let formatted_cksum = format!("{:x}", digest);
+    sbar.computed_digest = formatted_cksum
+        .chars()
+        .take(32)
+        .collect::<Vec<char>>()
+        .try_into()
+        .unwrap();
 
-    if "default" == md5_ondisk {
-        // sbar.err = format!("No md5 on disk found for {}\n", &movie_basename.trim());
-        sbar.status_code = progress::ProgressStatus::ParFileError;
+    if a.mode == Mode::Check {
+        // got this idea from initial question
+        // on https://stackoverflow.com/questions/75442962/how-to-do-partial-read-and-calculate-md5sum-of-a-large-file-in-rust
+        // reads just the first entries in teh file, before any spaces or newllines
+        // if par_as_path.metadata().unwrap().len() > 0 {
+        let md5_ondisk: String = std::fs
+            ::read_to_string(par_as_path)
+            .unwrap_or_else(|_| String::from("default"));
 
-        transmission_channel.send(sbar).unwrap();
-    } else {
-        let md5hash_fromdisk = md5_ondisk
-            .split_whitespace()
-            .next()
-            .unwrap_or_else(|| "0000000000000000");
+        if "default" == md5_ondisk {
+            // sbar.err = format!("No md5 on disk found for {}\n", &movie_basename.trim());
+            sbar.status_code = progress::ProgressStatus::ParFileError;
 
-        let formatted_cksum = format!("{:x}", digest);
-
-        // hashes do not match
-        if md5hash_fromdisk != formatted_cksum {
-            sbar.status_code = progress::ProgressStatus::MovieError;
-
-            sbar.ondisk_digest = md5hash_fromdisk
-                .chars()
-                .take(32)
-                .collect::<Vec<char>>()
-                .try_into()
-                .unwrap();
-
-            sbar.computed_digest = formatted_cksum
-                .chars()
-                .take(32)
-                .collect::<Vec<char>>()
-                .try_into()
-                .unwrap();
-
-            // tell caller this integrity check failed
             transmission_channel.send(sbar).unwrap();
-        }
+        } else {
+            let md5hash_fromdisk = md5_ondisk
+                .split_whitespace()
+                .next()
+                .unwrap_or_else(|| "0000000000000000");
 
-        sbar.status_code = progress::ProgressStatus::MovieCompleted;
-        transmission_channel.send(sbar).unwrap();
+            // hashes do not match
+            if md5hash_fromdisk != formatted_cksum {
+                sbar.status_code = progress::ProgressStatus::MovieError;
+
+                sbar.ondisk_digest = md5hash_fromdisk
+                    .chars()
+                    .take(32)
+                    .collect::<Vec<char>>()
+                    .try_into()
+                    .unwrap();
+
+                // tell caller this integrity check failed
+                transmission_channel.send(sbar).unwrap();
+            }
+        }
     }
+    sbar.status_code = progress::ProgressStatus::MovieCompleted;
+    transmission_channel.send(sbar).unwrap();
 
     // sbar.status_code = progress::ProgressStatus::ThreadCompleted;
     // transmission_channel.send(sbar).unwrap();

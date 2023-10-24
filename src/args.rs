@@ -8,16 +8,29 @@ pub fn args_checks() -> ArgsClean {
     let mut zz = ArgsClean {
         path_to_data: xx.path_to_data,
         path_to_cksums: xx.path_to_cksums,
-        mode: xx.mode,
+        mode: Mode::Check,
         bufsize: xx.bufsize,
         data_filename_match: xx.data_filename_match,
         thread_count: xx.thread_count,
         pretty_print: xx.pretty_print,
         error_output_file: xx.error_output_file,
         unit_testing: xx.unit_testing,
-        alternate_scheduler: xx.alternate_scheduler
+        alternate_scheduler: xx.alternate_scheduler,
     };
     // let mut jkdfjak = ArgsClean::new();
+
+    match xx.mode.as_str() {
+        "check" | "ck" => {
+            zz.mode = Mode::Check;
+        }
+        "create" | "cr" => {
+            zz.mode = Mode::Create;
+            // println!("mode create.");
+        }
+        x => {
+            println!("Not a valid entry: {}. Setting to {}.", x, "create");
+        }
+    }
 
     let jkd = num_cpus::get();
     if xx.thread_count == 0 || (xx.thread_count as usize) > jkd {
@@ -26,7 +39,7 @@ pub fn args_checks() -> ArgsClean {
             zz.thread_count = 1;
         } else {
             print!(
-                "You specified {} threads. You have {} cpu cores (recommended max threads). If you want to change, specify now [default {}]: ",
+                "You specified {} threads. I think you have {} cpu cores. Specify thread count [default {}]: ",
                 xx.thread_count,
                 jkd,
                 jkd
@@ -69,7 +82,7 @@ struct Args {
     #[arg(short = 'c', long, value_name = "CKSUMS")]
     path_to_cksums: String,
 
-    /// Mode to operate in. Ck or create.
+    /// Mode to operate in: check, or create.
     #[arg(short = 'm', long, value_name = "MODE")]
     mode: String,
 
@@ -89,7 +102,7 @@ struct Args {
     #[arg(short, long)]
     pretty_print: bool,
 
-    /// File to write errors to. Must be set.
+    /// File to write to. Must be set.
     #[arg(short, long, value_name = "OUTPUTFILE")]
     error_output_file: String,
 
@@ -102,11 +115,11 @@ struct Args {
     alternate_scheduler: bool,
 }
 
-#[derive( Clone)]
+#[derive(Clone)]
 pub struct ArgsClean {
     pub path_to_data: String,
     pub path_to_cksums: String,
-    pub mode: String,
+    pub mode: Mode,
     pub bufsize: u16,
     pub data_filename_match: String,
     pub thread_count: u16,
@@ -114,4 +127,10 @@ pub struct ArgsClean {
     pub error_output_file: String,
     pub unit_testing: bool,
     pub alternate_scheduler: bool,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum Mode {
+    Check,
+    Create,
 }
