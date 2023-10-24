@@ -109,11 +109,29 @@ pub fn advance_progress_bars(
                 set_message(received.bar_number, &fssn.to_owned().to_string(), &pb);
             }
         }
-        ProgressStatus::MovieCompleted => {
+        ProgressStatus::MovieCompleted |ProgressStatus::ParFileError | ProgressStatus::MovieError => {
             increment_progress_bar(args.thread_count as usize, &pb);
         }
-        ProgressStatus::ParFileError | ProgressStatus::MovieError => {
-            let mut fil = fs::OpenOptions
+        
+        ProgressStatus::DoingNothin => {
+            set_message(received.bar_number, "Thread done.", &pb);
+            // finish_progress_bar(received.bar_number, &pb);
+        }
+        _ => {}
+    }
+
+    // if args.unit_testing {
+    //     thread::sleep(Duration::from_millis(5000));
+    // }
+}
+
+pub fn write_to_output(
+    file_name: &str,
+    args: &ArgsClean,
+    received: ProgressMessage,
+)
+{
+    let mut fil = fs::OpenOptions
                 ::new()
                 .write(true)
                 .append(true)
@@ -141,17 +159,6 @@ pub fn advance_progress_bars(
             }
 
             fil.unlock().unwrap()
-        }
-        ProgressStatus::DoingNothin => {
-            set_message(received.bar_number, "Thread done.", &pb);
-            // finish_progress_bar(received.bar_number, &pb);
-        }
-        _ => {}
-    }
-
-    // if args.unit_testing {
-    //     thread::sleep(Duration::from_millis(5000));
-    // }
 }
 
 fn get_a_str(ch: [char; 32]) -> String {

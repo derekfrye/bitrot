@@ -102,12 +102,7 @@ fn main_scheduler(data_files: Vec<PathBuf>, args: ArgsClean) -> Result<()> {
     // let final_progress_bar = args.thread_count.to_string().parse::<usize>().unwrap();
     for received in rx {
         let mut filenm = String::from("");
-        //         if tb.iter().any(|xa| { xa.iter().any(|x| { x.file_number == received.file_number  })  } )
-        //         {
-        // let axe:Vec<&Vec<UnitOfWork>> = tb.iter().filter(|x| { x.iter().any(|xx| {xx.file_number == received.file_number})    }  ).collect();
-        // // let axey = axe.iter().find(predicate)
-        //         }
-
+        
         match tb.iter().find(|x| x.iter().any(|x| x.file_number == received.file_number)) {
             Some(bx) => {
                 let px = &bx.iter().find(|x| x.file_number == received.file_number);
@@ -126,6 +121,14 @@ fn main_scheduler(data_files: Vec<PathBuf>, args: ArgsClean) -> Result<()> {
                 &args
             );
         }
+
+        match received.status_code{
+            ProgressStatus::ParFileError | ProgressStatus::MovieError => {
+                progress::write_to_output(&filenm, &args, received);
+            }
+            _=>{}
+        }
+
         // thread::sleep(std::time::Duration::from_millis(50));
     }
     if args.pretty_print {
