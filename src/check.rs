@@ -19,14 +19,9 @@ pub fn do_work(
     tx_back_to_main: Sender<progress::ProgressMessage>,
     rx_from_main_to_me: Receiver<Option<UnitOfWork>>
 ) {
-    let mut sbar = progress::ProgressMessage {
-        bar_number: statusbar as usize,
-        file_number: 0,
-        status_code: progress::ProgressStatus::Requesting,
-        computed_digest: Default::default(),
-        ondisk_digest: Default::default(),
-    };
-
+    let mut sbar: progress::ProgressMessage = Default::default();
+    sbar.status_code = progress::ProgressStatus::Requesting;
+    
     loop {
         // Ask the main thread for the next item
         tx_back_to_main.send(sbar).unwrap();
@@ -64,17 +59,12 @@ fn validate_ondisk_md5(
     transmission_channel: &Sender<progress::ProgressMessage>
 ) {
     let md5ending = ".md5.txt";
-
-    let mut sbar = progress::ProgressMessage {
-        bar_number: statusbar as usize,
-        file_number: 0,
-        status_code: progress::ProgressStatus::Started,
-        computed_digest: Default::default(),
-        ondisk_digest: Default::default(),
-    };
-
-    let movie_as_str = xx.file_name.to_string_lossy();
-    let movie_basename = xx.file_name.file_name().unwrap().to_string_lossy();
+    let mut sbar:progress::ProgressMessage  = Default::default();
+    sbar.bar_number = statusbar;
+    
+    let full_filename_as_str = xx.file_name.to_string_lossy();
+    let file_basename = xx.file_name.file_name().unwrap().to_string_lossy();
+    sbar.file_size = fs::metadata(xx.file_name.as_path()).unwrap().len();
 
     // let mut _i = 0;
     // if &movie_basename == "a.mp4" {
@@ -87,13 +77,13 @@ fn validate_ondisk_md5(
     transmission_channel.send(sbar).unwrap();
 
     let mut par = String::from(a.path_to_cksums.to_string());
-    par.push_str(&movie_basename); // /cksumpath/datafilenm
+    par.push_str(&file_basename); // /cksumpath/datafilenm
     par.push_str(md5ending); // /cksumpath/datafilenm.md5.txt
     let par_as_path = Path::new(&par);
 
-    // if /par2path/movienm.md5.txt exists and is readable
+    // if /data_files/file.md5.txt exists and is readable
     // if fs::metadata(par_as_path).is_ok() {
-    let digest = cksum(&movie_as_str, a.bufsize);
+    let digest = cksum(&full_filename_as_str, a.bufsize);
 
     let formatted_cksum = format!("{:x}", digest);
     sbar.computed_digest = formatted_cksum

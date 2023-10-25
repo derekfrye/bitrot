@@ -19,6 +19,7 @@ num_cpus = "1.16.0"
 # async-std = "1.12.0"
 # hex = "0.4.3"
 # crossbeam-channel = "0.5.8"
+derivative = "2.2.0"
 
 [profile.release]
 #opt-level = 'z'     # Optimize for size

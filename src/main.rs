@@ -64,17 +64,15 @@ fn main() -> Result<()> {
     //     args.path_to_cksums
     // );
     if args.mode == Mode::Create {
+
+        let mut x:ProgressMessage=Default::default();
+        x.status_code = ProgressStatus::WriteFileHeader;
+
         progress::write_to_output(
             "",
             "",
             &args,
-            ProgressMessage {
-                bar_number: 0,
-                status_code: ProgressStatus::WriteFileHeader,
-                file_number: 0,
-                ondisk_digest: Default::default(),
-                computed_digest: Default::default(),
-            },
+            x,
             false
         );
     }
@@ -319,15 +317,11 @@ fn poll_worker(
     muta: &Mutex<Vec<UnitOfWork>>,
     mutb: &Mutex<Vec<UnitOfWork>>
 ) -> Result<StatusUpdate> {
+    let  x:ProgressMessage=Default::default();
+
     let mut status_report = StatusUpdate {
         movie_basename: String::from(""),
-        progress_msg: ProgressMessage {
-            bar_number: 0,
-            status_code: ProgressStatus::Started,
-            file_number: 0,
-            ondisk_digest: Default::default(),
-            computed_digest: Default::default(),
-        },
+        progress_msg: x,
         file_full_name: String::from(""),
     };
 

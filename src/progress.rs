@@ -6,10 +6,42 @@ use std::time::Duration;
 
 use fs2::FileExt;
 use indicatif::{ MultiProgress, ProgressBar, ProgressStyle };
+use derivative::Derivative;
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum ProgressStatus {
+    Started,
+    MovieCompleted,
+    // ThreadCompleted,
+    MovieError,
+    ParFileError,
+    Requesting,
+    DoingNothin,
+    ThreadError,
+    WriteFileHeader,
+}
 
 pub struct Bars {
     bars: Vec<ProgressBar>,
     // prettyprint: bool
+}
+
+#[derive(Copy, Clone)]
+#[derive(Derivative)]
+#[derivative(Debug, Default)]
+pub struct ProgressMessage {
+    #[derivative(Default(value = "0"))]
+    pub bar_number: usize,
+    #[derivative(Default(value = "ProgressStatus::Started"))]
+    pub status_code: ProgressStatus,
+    #[derivative(Default(value = "0"))]
+    pub file_number: usize,
+    #[derivative(Default(value = "Default::default()"))]
+    pub ondisk_digest: [char; 32],
+    #[derivative(Default(value = "Default::default()"))]
+    pub computed_digest: [char; 32],
+    #[derivative(Default(value = "0"))]
+    pub file_size: u64,
 }
 
 pub fn build_progress_bar_export(total_messages: usize, threadcnt: u16, prettyprint: bool) -> Bars {
@@ -58,12 +90,10 @@ pub fn build_progress_bar_export(total_messages: usize, threadcnt: u16, prettypr
 fn increment_progress_bar(b: usize, z: &Bars) {
     if z.bars.len() >= b + 1 {
         z.bars[b].inc(1);
-        // b.inc(1);
     }
 }
 
 pub fn finish_progress_bar(b: usize, z: &Bars) {
-    // b.finish();
     if z.bars.len() >= b + 1 {
         z.bars[b].finish_and_clear();
     }
@@ -75,43 +105,14 @@ fn set_message(b: usize, s: &str, z: &Bars) {
     }
 }
 
-#[derive(Copy, Clone)]
-pub struct ProgressMessage {
-    pub bar_number: usize,
-    pub status_code: ProgressStatus,
-    pub file_number: usize,
-    pub ondisk_digest: [char; 32],
-    pub computed_digest: [char; 32],
-}
 
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub enum ProgressStatus {
-    Started,
-    MovieCompleted,
-    // ThreadCompleted,
-    MovieError,
-    ParFileError,
-    Requesting,
-    DoingNothin,
-    ThreadError,
-    WriteFileHeader,
-}
 
 pub fn advance_progress_bars(
     file_name: &str,
     received: ProgressMessage,
     pb: &Bars,
-    args: &ArgsClean
-    // full_file_name: &str,
+    args: &ArgsClean,
 ) {
-    // let mut fil = fs::OpenOptions
-    // ::new()
-    // .write(true)
-    // .append(true)
-    // .create(true)
-    // .open(&args.error_output_file)
-    // .unwrap();
-
     let fssn = file_name;
 
     match received.status_code {
@@ -125,18 +126,9 @@ pub fn advance_progress_bars(
         | ProgressStatus::ParFileError
         | ProgressStatus::MovieError => {
             increment_progress_bar(args.thread_count as usize, &pb);
-            // println!("mode {:?}.", args.mode);
-            // if args.mode == Mode::Create {
-            // fil.lock_exclusive().unwrap();
-            // fil.write(format!("{},{}\n", get_a_str(received.computed_digest), fssn).as_bytes()).unwrap();
-            // fil.unlock().unwrap()
-
-            // write_to_output(fssn,  full_file_name,   args, received, true);
-            // }
         }
         ProgressStatus::DoingNothin => {
             set_message(received.bar_number, "Thread done.", &pb);
-            // finish_progress_bar(received.bar_number, &pb);
         }
         _ => {}
     }
@@ -184,9 +176,10 @@ pub fn write_to_output(
             if args.mode == Mode::Create {
                 fil.write(
                     format!(
-                        "{},{}\n",
+                        "{},{},{}\n",
+                        received.file_size,
                         get_a_str(received.computed_digest),
-                        file_full_name
+                        file_full_name,
                     ).as_bytes()
                 ).unwrap();
             }
