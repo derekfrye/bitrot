@@ -1,38 +1,19 @@
----
-name: Bug report
-about: Create a report to help us improve
-title: ''
-labels: ''
-assignees: ''
+<!-- **STOP and  READ** **USE THIS TEMPLATE** **NO EXCEPTIONS**:
+Be specific with your issue, people are volunteering to help you! Low effort issues are not going to get good answers!   **DO NOT REDACT** any information except passwords/keys/personal info.  You should use 3 backticks to begin and end code or output for readability.  Or use a service such as https://pastebin.com or https://gist.github.com/   -->
 
----
+#### What is the problem you are having?
 
-**Describe the bug**
-A clear and concise description of what the bug is.
 
-**To Reproduce**
-Steps to reproduce the behavior:
-1. Go to '...'
-2. Click on '....'
-3. Scroll down to '....'
-4. See error
+#### Run the command 'bitrot -V' and share the full output of the command.
 
-**Expected behavior**
-A clear and concise description of what you expected to happen.
+<!-- **STOP and  READ**: 
+Do not type in "latest".
+Do not just type in a version number. Run the command and share the full output.
+ -->
 
-**Screenshots**
-If applicable, add screenshots to help explain your problem.
+#### A log from your command with the `-vv` flag  
+<!-- Any output must use 3 backticks for readability.  Or use a service such as https://pastebin.com or https://gist.github.com/   -->
 
-**Desktop (please complete the following information):**
- - OS: [e.g. iOS]
- - Browser [e.g. chrome, safari]
- - Version [e.g. 22]
-
-**Smartphone (please complete the following information):**
- - Device: [e.g. iPhone6]
- - OS: [e.g. iOS8.1]
- - Browser [e.g. stock browser, safari]
- - Version [e.g. 22]
-
-**Additional context**
-Add any other context about the problem here.
+```
+Paste log here
+```
