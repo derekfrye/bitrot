@@ -1,3 +1,12 @@
+---
+name: Bug report
+about: Bug report template
+title: Bug report template
+labels: ''
+assignees: ''
+
+---
+
 <!-- **STOP and  READ** **USE THIS TEMPLATE** **NO EXCEPTIONS**:
 Be specific with your issue, people are volunteering to help you! Low effort issues are not going to get good answers!   **DO NOT REDACT** any information except passwords/keys/personal info.  You should use 3 backticks to begin and end code or output for readability.  Or use a service such as https://pastebin.com or https://gist.github.com/   -->
 
