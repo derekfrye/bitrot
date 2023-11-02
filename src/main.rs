@@ -49,11 +49,9 @@ fn main() -> Result<()> {
     // idea from https://stackoverflow.com/questions/58062887/filtering-files-or-directories-discovered-with-fsread-dir
     // let data_files: Arc<Mutex<Vec<_>>> = Arc::new(Mutex::new(fs
     let data_filest: Vec<PathBuf> = fs::read_dir(&args.path_to_data)?
-        .into_iter()
         .filter(|z| z.is_ok())
         .map(|r| r.unwrap().path())
         .filter(|z| z.is_file())
-        .into_iter()
         .filter(|ab| re.is_match(&ab.file_name().unwrap().to_string_lossy()))
         .collect();
 
@@ -63,8 +61,10 @@ fn main() -> Result<()> {
     //     args.path_to_cksums
     // );
     if args.mode == Mode::Create {
-        let mut x: ProgressMessage = Default::default();
-        x.status_code = ProgressStatus::WriteFileHeader;
+        let x: ProgressMessage = ProgressMessage {
+            status_code: ProgressStatus::WriteFileHeader,
+            ..Default::default()
+        };
 
         progress::write_to_output("", "", &args, x, false);
     }
@@ -89,14 +89,14 @@ fn main_scheduler(data_files: Vec<PathBuf>, args: ArgsClean) -> Result<()> {
         Receiver<progress::ProgressMessage>,
     ) = channel();
 
-    let mut status_bar_line_entry = 0;
-    for x in zz {
+    // let mut status_bar_line_entry = 0;
+    for (status_bar_line_entry, x) in zz.into_iter().enumerate() {
         let tx1 = tx.clone();
         let kjdfj = args.clone();
         thread::spawn(move || {
-            let _ = check::do_work_main(x, kjdfj, status_bar_line_entry, tx1);
+            check::do_work_main(&x, kjdfj, status_bar_line_entry, tx1);
         });
-        status_bar_line_entry += 1;
+        // status_bar_line_entry += 1;
     }
     drop(tx);
 
@@ -105,17 +105,14 @@ fn main_scheduler(data_files: Vec<PathBuf>, args: ArgsClean) -> Result<()> {
         let mut filenm = String::from("");
         let mut filenm_full = String::from("");
 
-        match tb
+        if let Some(bx) = tb
             .iter()
             .find(|x| x.iter().any(|x| x.file_number == received.file_number))
         {
-            Some(bx) => {
-                let px = &bx.iter().find(|x| x.file_number == received.file_number);
-                let tx = px.unwrap().file_name.file_name().unwrap().to_string_lossy();
-                filenm = tx.to_string();
-                filenm_full = px.unwrap().file_name.to_string_lossy().to_string();
-            }
-            None => {}
+            let px = &bx.iter().find(|x| x.file_number == received.file_number);
+            let tx = px.unwrap().file_name.file_name().unwrap().to_string_lossy();
+            filenm = tx.to_string();
+            filenm_full = px.unwrap().file_name.to_string_lossy().to_string();
         }
 
         if args.pretty_print {
@@ -155,17 +152,15 @@ fn assign_work(mut z: Vec<PathBuf>, threadcnt: u16) -> Vec<Vec<UnitOfWork>> {
     }
 
     // assign each file into the thread queues
-    let mut i = 0;
-    for ia in 0..z.len() {
+    for (i, ia) in z.iter().enumerate() {
         let t = UnitOfWork {
-            file_name: z[ia].to_owned(),
+            file_name: ia.to_path_buf(),
             file_number: i,
         };
-        x[ia % (threadcnt as usize)].push(t);
-        i += 1;
+        x[i % (threadcnt as usize)].push(t);
     }
 
-    return x;
+    x
 }
 
 fn alternate_scheduler(data_filest: Vec<PathBuf>, args: ArgsClean) -> Result<()> {
@@ -173,16 +168,14 @@ fn alternate_scheduler(data_filest: Vec<PathBuf>, args: ArgsClean) -> Result<()>
 
     let mut data_files: Vec<UnitOfWork> = vec![];
     let mut data_files_stable: Vec<UnitOfWork> = vec![];
-    let mut cntre = 0;
-    for i in data_filest {
+    for (i, item) in data_filest.iter().enumerate() {
         let u = UnitOfWork {
-            file_name: i,
-            file_number: cntre,
+            file_name: item.to_path_buf(),
+            file_number: i,
         };
         let ub = u.clone();
         data_files.push(u);
         data_files_stable.push(ub);
-        cntre += 1;
     }
 
     // let _jkdfjd= data_files[0];

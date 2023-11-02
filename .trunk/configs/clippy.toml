@@ -1,0 +1,22 @@
+msrv = "1.73.0"
+
+
+
+disallowed-methods = [
+    { path = "std::option::Option::map_or", reason = "prefer `map(..).unwrap_or(..)` for legibility" },
+    { path = "std::option::Option::map_or_else", reason = "prefer `map(..).unwrap_or_else(..)` for legibility" },
+    { path = "std::result::Result::map_or", reason = "prefer `map(..).unwrap_or(..)` for legibility" },
+    { path = "std::result::Result::map_or_else", reason = "prefer `map(..).unwrap_or_else(..)` for legibility" },
+    { path = "std::iter::Iterator::for_each", reason = "prefer `for` for side-effects" },
+    { path = "std::iter::Iterator::try_for_each", reason = "prefer `for` for side-effects" },
+    { path = "md5::Context::new", reason = "prefer `for` for side-effects" },
+]
+disallowed-macros = [
+    { path = "std::dbg", reason = "it is okay to use during development, but please do not include it in main branch" },
+    { path = "core::Clone", reason = "it is okay to use during development, but please do not include it in main branch" },
+    { path = "std::println", reason = "it is okay to use during development, but please do not include it in main branch" },
+     'std::eprint',
+   'std::eprintln',
+   'std::print',
+   'std::println',
+]
