@@ -239,8 +239,8 @@ fn alternate_scheduler(data_filest: Vec<PathBuf>, args: ArgsClean) -> Result<()>
             }
 
             match status_update.progress_msg.status_code {
-                ProgressStatus::DoingNothin | ProgressStatus::ThreadError => {
-                    abc[hndl].thread_status = ProgressStatus::DoingNothin;
+                ProgressStatus::DoingNothing | ProgressStatus::ThreadError => {
+                    abc[hndl].thread_status = ProgressStatus::DoingNothing;
                     //  handles.last().unwrap().join_handle.join().unwrap();
                 }
                 // ProgressStatus::ThreadCompleted => {
@@ -263,7 +263,7 @@ fn alternate_scheduler(data_filest: Vec<PathBuf>, args: ArgsClean) -> Result<()>
 
         if abc
             .iter()
-            .all(|axe: &WorkerThread| axe.thread_status == ProgressStatus::DoingNothin)
+            .all(|axe: &WorkerThread| axe.thread_status == ProgressStatus::DoingNothing)
         {
             let _ = 1 + 1;
             break;

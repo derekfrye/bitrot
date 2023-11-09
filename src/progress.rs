@@ -1,12 +1,13 @@
-use crate::args::{ ArgsClean, Mode };
+use crate::args::{ArgsClean, Mode};
 
-use std::fs;
+use std::fs::{self, File};
 use std::io::Write;
 use std::time::Duration;
 
-use fs2::FileExt;
-use indicatif::{ MultiProgress, ProgressBar, ProgressStyle };
+use anyhow::{Ok, Result};
 use derivative::Derivative;
+use fs2::FileExt;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum ProgressStatus {
@@ -16,7 +17,7 @@ pub enum ProgressStatus {
     MovieError,
     ParFileError,
     Requesting,
-    DoingNothin,
+    DoingNothing,
     ThreadError,
     WriteFileHeader,
 }
@@ -26,8 +27,7 @@ pub struct Bars {
     // prettyprint: bool
 }
 
-#[derive(Copy, Clone)]
-#[derive(Derivative)]
+#[derive(Copy, Clone, Derivative)]
 #[derivative(Debug, Default)]
 pub struct ProgressMessage {
     #[derivative(Default(value = "0"))]
@@ -55,11 +55,10 @@ pub fn build_progress_bar_export(total_messages: usize, threadcnt: u16, prettypr
             let pb = m.add(ProgressBar::new(total_messages.try_into().unwrap()));
             // z.append(pb);
 
-            let spinner_style = ProgressStyle::with_template(
-                "{prefix:.bold.dim} {spinner} {wide_msg}"
-            )
-                .unwrap()
-                .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ");
+            let spinner_style =
+                ProgressStyle::with_template("{prefix:.bold.dim} {spinner} {wide_msg}")
+                    .unwrap()
+                    .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ");
 
             pb.set_style(spinner_style.clone());
 
@@ -75,7 +74,7 @@ pub fn build_progress_bar_export(total_messages: usize, threadcnt: u16, prettypr
             ProgressStyle::default_bar()
                 .template("{spinner:.green} [{elapsed}] [{bar:.blue}] {pos}/{len} (ETA: {eta})")
                 .unwrap()
-                .progress_chars("#>-")
+                .progress_chars("#>-"),
         );
 
         pb1.set_position(0);
@@ -84,28 +83,26 @@ pub fn build_progress_bar_export(total_messages: usize, threadcnt: u16, prettypr
         // z.insert(threadcnt.into(), pb1);
         b.bars.insert(threadcnt.into(), pb1);
     }
-    return b;
+    b
 }
 
 fn increment_progress_bar(b: usize, z: &Bars) {
-    if z.bars.len() >= b + 1 {
+    if z.bars.len() > b {
         z.bars[b].inc(1);
     }
 }
 
 pub fn finish_progress_bar(b: usize, z: &Bars) {
-    if z.bars.len() >= b + 1 {
+    if z.bars.len() > b {
         z.bars[b].finish_and_clear();
     }
 }
 
 fn set_message(b: usize, s: &str, z: &Bars) {
-    if z.bars.len() >= b + 1 {
-        z.bars[b].set_message(format!("{s}"));
+    if z.bars.len() > b {
+        z.bars[b].set_message(s.to_string());
     }
 }
-
-
 
 pub fn advance_progress_bars(
     file_name: &str,
@@ -118,17 +115,17 @@ pub fn advance_progress_bars(
     match received.status_code {
         ProgressStatus::Started => {
             // let fssn = file_name;
-            if fssn != "" {
-                set_message(received.bar_number, &fssn.to_owned().to_string(), &pb);
+            if !fssn.is_empty() {
+                set_message(received.bar_number, &fssn.to_owned().to_string(), pb);
             }
         }
-        | ProgressStatus::MovieCompleted
+        ProgressStatus::MovieCompleted
         | ProgressStatus::ParFileError
         | ProgressStatus::MovieError => {
-            increment_progress_bar(args.thread_count as usize, &pb);
+            increment_progress_bar(args.thread_count as usize, pb);
         }
-        ProgressStatus::DoingNothin => {
-            set_message(received.bar_number, "Thread done.", &pb);
+        ProgressStatus::DoingNothing => {
+            set_message(received.bar_number, "Thread done.", pb);
         }
         _ => {}
     }
@@ -143,8 +140,8 @@ pub fn write_to_output(
     file_full_name: &str,
     args: &ArgsClean,
     received: ProgressMessage,
-    append: bool
-) {
+    append: bool,
+) -> Result<()> {
     let mut opts = fs::OpenOptions::new();
     if append {
         opts.write(true).create(true).append(true);
@@ -158,41 +155,58 @@ pub fn write_to_output(
 
     match received.status_code {
         ProgressStatus::ParFileError => {
-            fil.lock_exclusive().unwrap();
-            fil.write(format!("No md5 on disk found for {}\n", file_name).as_bytes()).unwrap();
+            // fil.write(format!("No md5 on disk found for {}\n", file_name).as_bytes()).unwrap();
+            let data = format!("No md5 on disk found for {}\n", file_name);
+            let db = data.as_bytes();
+            let _ = write_to_fil(db, &fil);
         }
         ProgressStatus::MovieError => {
-            fil.lock_exclusive().unwrap();
-            fil.write(
-                format!(
-                    "Error: {}, on-disk checksum: {}, our checksum: {}\n",
-                    file_name,
-                    format!("{}", get_a_str(received.ondisk_digest)),
-                    format!("{:?}", get_a_str(received.computed_digest))
-                ).as_bytes()
-            ).unwrap();
+            let data = format!(
+                "Error: {}, on-disk checksum: {}, our checksum: {:?}\n",
+                file_name,
+                get_a_str(received.ondisk_digest),
+                get_a_str(received.computed_digest)
+            );
+            let db = data.as_bytes();
+            let _ = write_to_fil(db, &fil);
         }
         ProgressStatus::MovieCompleted => {
             if args.mode == Mode::Create {
-                fil.write(
-                    format!(
-                        "{},{},{}\n",
-                        received.file_size,
-                        get_a_str(received.computed_digest),
-                        file_full_name,
-                    ).as_bytes()
-                ).unwrap();
+                let data = format!(
+                    "%%%% HASHDEEP-1.0\n%%%% size,md5,filename\n{},{},{}\n",
+                    received.file_size,
+                    get_a_str(received.computed_digest),
+                    file_full_name
+                );
+                let db = data.as_bytes();
+                let _ = write_to_fil(db, &fil);
             }
         }
         ProgressStatus::WriteFileHeader => {
-            fil.write(format!("%%%% HASHDEEP-1.0\n").as_bytes()).unwrap();
-            fil.write(format!("%%%% size,md5,filename\n").as_bytes()).unwrap();
+            let data = "%%%% HASHDEEP-1.0\n%%%% size,md5,filename\n".to_string();
+            let db = data.as_bytes();
+            let _ = write_to_fil(db, &fil);
         }
         _ => {}
     }
 
     let _ = fil.flush();
-    fil.unlock().unwrap()
+    fil.unlock().unwrap();
+
+    Ok(())
+}
+
+fn write_to_fil(byt: &[u8], mut fil: &File) -> Result<()> {
+    match fil.lock_exclusive() {
+        std::result::Result::Ok(_) => match fil.write(byt) {
+            std::result::Result::Ok(n) if n < byt.len() => {
+                Err(anyhow::anyhow!("Failed to write full buffer."))
+            }
+            std::result::Result::Ok(_) => Ok(()),
+            Err(_) => Err(anyhow::anyhow!("Failed to write to file.")),
+        },
+        Err(_) => Err(anyhow::anyhow!("Failed to lock the file exclusively.")),
+    }
 }
 
 fn get_a_str(ch: [char; 32]) -> String {
@@ -200,5 +214,5 @@ fn get_a_str(ch: [char; 32]) -> String {
     for ab in ch {
         x.push(ab);
     }
-    return x;
+    x
 }

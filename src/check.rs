@@ -29,7 +29,7 @@ pub fn do_work(
             }
             Ok(None) | Err(_) => {
                 // No more files to process
-                sbar.status_code = progress::ProgressStatus::DoingNothin;
+                sbar.status_code = progress::ProgressStatus::DoingNothing;
                 tx_back_to_main.send(sbar).unwrap_or_default();
                 break;
             }
