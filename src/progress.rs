@@ -1,12 +1,12 @@
-use crate::args::{ ArgsClean, Mode };
+use crate::args::{ArgsClean, Mode};
 
 use std::fs;
 use std::io::Write;
 use std::time::Duration;
 
-use fs2::FileExt;
-use indicatif::{ MultiProgress, ProgressBar, ProgressStyle };
 use derivative::Derivative;
+use fs2::FileExt;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum ProgressStatus {
@@ -26,8 +26,7 @@ pub struct Bars {
     // prettyprint: bool
 }
 
-#[derive(Copy, Clone)]
-#[derive(Derivative)]
+#[derive(Copy, Clone, Derivative)]
 #[derivative(Debug, Default)]
 pub struct ProgressMessage {
     #[derivative(Default(value = "0"))]
@@ -55,11 +54,10 @@ pub fn build_progress_bar_export(total_messages: usize, threadcnt: u16, prettypr
             let pb = m.add(ProgressBar::new(total_messages.try_into().unwrap()));
             // z.append(pb);
 
-            let spinner_style = ProgressStyle::with_template(
-                "{prefix:.bold.dim} {spinner} {wide_msg}"
-            )
-                .unwrap()
-                .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ");
+            let spinner_style =
+                ProgressStyle::with_template("{prefix:.bold.dim} {spinner} {wide_msg}")
+                    .unwrap()
+                    .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ");
 
             pb.set_style(spinner_style.clone());
 
@@ -75,7 +73,7 @@ pub fn build_progress_bar_export(total_messages: usize, threadcnt: u16, prettypr
             ProgressStyle::default_bar()
                 .template("{spinner:.green} [{elapsed}] [{bar:.blue}] {pos}/{len} (ETA: {eta})")
                 .unwrap()
-                .progress_chars("#>-")
+                .progress_chars("#>-"),
         );
 
         pb1.set_position(0);
@@ -105,8 +103,6 @@ fn set_message(b: usize, s: &str, z: &Bars) {
     }
 }
 
-
-
 pub fn advance_progress_bars(
     file_name: &str,
     received: ProgressMessage,
@@ -122,7 +118,7 @@ pub fn advance_progress_bars(
                 set_message(received.bar_number, &fssn.to_owned().to_string(), &pb);
             }
         }
-        | ProgressStatus::MovieCompleted
+        ProgressStatus::MovieCompleted
         | ProgressStatus::ParFileError
         | ProgressStatus::MovieError => {
             increment_progress_bar(args.thread_count as usize, &pb);
@@ -143,7 +139,7 @@ pub fn write_to_output(
     file_full_name: &str,
     args: &ArgsClean,
     received: ProgressMessage,
-    append: bool
+    append: bool,
 ) {
     let mut opts = fs::OpenOptions::new();
     if append {
@@ -159,7 +155,8 @@ pub fn write_to_output(
     match received.status_code {
         ProgressStatus::ParFileError => {
             fil.lock_exclusive().unwrap();
-            fil.write(format!("No md5 on disk found for {}\n", file_name).as_bytes()).unwrap();
+            fil.write(format!("No md5 on disk found for {}\n", file_name).as_bytes())
+                .unwrap();
         }
         ProgressStatus::MovieError => {
             fil.lock_exclusive().unwrap();
@@ -169,8 +166,10 @@ pub fn write_to_output(
                     file_name,
                     format!("{}", get_a_str(received.ondisk_digest)),
                     format!("{:?}", get_a_str(received.computed_digest))
-                ).as_bytes()
-            ).unwrap();
+                )
+                .as_bytes(),
+            )
+            .unwrap();
         }
         ProgressStatus::MovieCompleted => {
             if args.mode == Mode::Create {
@@ -180,13 +179,17 @@ pub fn write_to_output(
                         received.file_size,
                         get_a_str(received.computed_digest),
                         file_full_name,
-                    ).as_bytes()
-                ).unwrap();
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
             }
         }
         ProgressStatus::WriteFileHeader => {
-            fil.write(format!("%%%% HASHDEEP-1.0\n").as_bytes()).unwrap();
-            fil.write(format!("%%%% size,md5,filename\n").as_bytes()).unwrap();
+            fil.write(format!("%%%% HASHDEEP-1.0\n").as_bytes())
+                .unwrap();
+            fil.write(format!("%%%% size,md5,filename\n").as_bytes())
+                .unwrap();
         }
         _ => {}
     }

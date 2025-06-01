@@ -1,6 +1,6 @@
 use clap::Parser;
 
-use std::io::{ self, Write };
+use std::io::{self, Write};
 // use std::io::stdout;
 
 pub fn args_checks() -> ArgsClean {
@@ -47,7 +47,9 @@ pub fn args_checks() -> ArgsClean {
             let _ = io::stdout().flush();
             let mut input = String::new();
 
-            io::stdin().read_line(&mut input).expect("failed to read from stdin");
+            io::stdin()
+                .read_line(&mut input)
+                .expect("failed to read from stdin");
 
             let trimmed = input.trim();
             match trimmed.parse::<u32>() {

@@ -1,27 +1,27 @@
 use crate::args::Mode;
-use crate::{ progress, UnitOfWork, args::ArgsClean };
+use crate::{args::ArgsClean, progress, UnitOfWork};
 
 // use clap::Arg;
 // use anyhow::Ok;
 // use async_std::fs;
 use md5::Digest;
 // use core::slice::SlicePattern;
+use std::fs;
 use std::io;
 use std::io::BufRead;
-use std::fs;
 use std::path::Path;
-use std::sync::mpsc::{ Receiver, Sender };
 use std::str;
+use std::sync::mpsc::{Receiver, Sender};
 
 pub fn do_work(
     statusbar: usize,
     a: ArgsClean,
     tx_back_to_main: Sender<progress::ProgressMessage>,
-    rx_from_main_to_me: Receiver<Option<UnitOfWork>>
+    rx_from_main_to_me: Receiver<Option<UnitOfWork>>,
 ) {
     let mut sbar: progress::ProgressMessage = Default::default();
     sbar.status_code = progress::ProgressStatus::Requesting;
-    
+
     loop {
         // Ask the main thread for the next item
         tx_back_to_main.send(sbar).unwrap();
@@ -45,7 +45,7 @@ pub fn do_work_main(
     pathbufs: Vec<UnitOfWork>,
     a: ArgsClean,
     statusbar: u16,
-    tx_back_to_main: Sender<progress::ProgressMessage>
+    tx_back_to_main: Sender<progress::ProgressMessage>,
 ) {
     for x in pathbufs {
         validate_ondisk_md5(x, &a, statusbar.into(), &tx_back_to_main);
@@ -56,12 +56,12 @@ fn validate_ondisk_md5(
     xx: UnitOfWork,
     a: &ArgsClean,
     statusbar: usize,
-    transmission_channel: &Sender<progress::ProgressMessage>
+    transmission_channel: &Sender<progress::ProgressMessage>,
 ) {
     let md5ending = ".md5.txt";
-    let mut sbar:progress::ProgressMessage  = Default::default();
+    let mut sbar: progress::ProgressMessage = Default::default();
     sbar.bar_number = statusbar;
-    
+
     let full_filename_as_str = xx.file_name.to_string_lossy();
     let file_basename = xx.file_name.file_name().unwrap().to_string_lossy();
     sbar.file_size = fs::metadata(xx.file_name.as_path()).unwrap().len();
@@ -98,9 +98,8 @@ fn validate_ondisk_md5(
         // on https://stackoverflow.com/questions/75442962/how-to-do-partial-read-and-calculate-md5sum-of-a-large-file-in-rust
         // reads just the first entries in teh file, before any spaces or newllines
         // if par_as_path.metadata().unwrap().len() > 0 {
-        let md5_ondisk: String = std::fs
-            ::read_to_string(par_as_path)
-            .unwrap_or_else(|_| String::from("default"));
+        let md5_ondisk: String =
+            std::fs::read_to_string(par_as_path).unwrap_or_else(|_| String::from("default"));
 
         if "default" == md5_ondisk {
             // sbar.err = format!("No md5 on disk found for {}\n", &movie_basename.trim());
