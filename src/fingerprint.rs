@@ -108,6 +108,7 @@ pub struct SourceFingerprint {
     pub chunk_size: ChunkSize,
     pub source_digest: Digest,
     pub data_chunk_digests: Vec<Digest>,
+    pub full_chunk_rolling: Vec<u64>,
 }
 
 #[derive(Debug)]
@@ -156,6 +157,7 @@ pub fn source<R: Read>(reader: &mut R, chunk_size: ChunkSize) -> Result<SourceFi
     let mut source_hasher = blake3::Hasher::new_derive_key(SOURCE_DIGEST_CONTEXT);
     let mut source_len = 0_u64;
     let mut data_chunk_digests = Vec::new();
+    let mut full_chunk_rolling = Vec::new();
 
     loop {
         let mut filled = 0_usize;
@@ -179,6 +181,9 @@ pub fn source<R: Read>(reader: &mut R, chunk_size: ChunkSize) -> Result<SourceFi
         }
 
         data_chunk_digests.push(hash(DATA_CHUNK_DIGEST_CONTEXT, &buffer[..filled]));
+        if filled == buffer.len() {
+            full_chunk_rolling.push(crate::rolling::crc64_iso(&buffer));
+        }
         if filled < buffer.len() {
             break;
         }
@@ -189,12 +194,20 @@ pub fn source<R: Read>(reader: &mut R, chunk_size: ChunkSize) -> Result<SourceFi
         chunk_size,
         source_digest: source_hasher.finalize().into(),
         data_chunk_digests,
+        full_chunk_rolling,
     })
 }
 
 fn hash(context: &str, bytes: &[u8]) -> Digest {
     let mut hasher = blake3::Hasher::new_derive_key(context);
     hasher.update(bytes);
+    hasher.finalize().into()
+}
+
+pub(crate) fn data_chunk_digest_slices(first: &[u8], second: &[u8]) -> Digest {
+    let mut hasher = blake3::Hasher::new_derive_key(DATA_CHUNK_DIGEST_CONTEXT);
+    hasher.update(first);
+    hasher.update(second);
     hasher.finalize().into()
 }
 
@@ -245,6 +258,7 @@ mod tests {
 
         assert_eq!(actual.source_len, 0);
         assert!(actual.data_chunk_digests.is_empty());
+        assert!(actual.full_chunk_rolling.is_empty());
         assert_eq!(actual.source_digest, hash(SOURCE_DIGEST_CONTEXT, b""));
     }
 
@@ -261,6 +275,11 @@ mod tests {
 
         assert_eq!(actual.source_len, data.len() as u64);
         assert_eq!(actual.data_chunk_digests.len(), 3);
+        assert_eq!(actual.full_chunk_rolling.len(), 2);
+        assert_eq!(
+            actual.full_chunk_rolling[0],
+            crate::rolling::crc64_iso(&data[..MIN_CHUNK_SIZE as usize])
+        );
         assert_eq!(
             actual.data_chunk_digests[0],
             hash(DATA_CHUNK_DIGEST_CONTEXT, &data[..MIN_CHUNK_SIZE as usize])
@@ -287,6 +306,7 @@ mod tests {
         let actual = source(&mut Cursor::new(&data), minimum()).unwrap();
 
         assert_eq!(actual.data_chunk_digests.len(), 2);
+        assert_eq!(actual.full_chunk_rolling.len(), 2);
     }
 
     #[test]
@@ -295,6 +315,7 @@ mod tests {
         let actual = source(&mut Cursor::new(data), minimum()).unwrap();
 
         assert_eq!(actual.data_chunk_digests.len(), 1);
+        assert!(actual.full_chunk_rolling.is_empty());
         assert_ne!(actual.source_digest, actual.data_chunk_digests[0]);
     }
 

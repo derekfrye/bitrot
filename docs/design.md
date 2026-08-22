@@ -216,11 +216,20 @@ stores a rolling fingerprint for each full-size data chunk. On demand, a scan
 uses rolling fingerprints to find candidates at unexpected offsets, then
 confirms every candidate with BLAKE3 before accepting it.
 
-The exact rolling algorithm is intentionally unresolved. It must be completely
-specified, efficiently rolling, at least 64 bits wide, and used only as a
-candidate filter. CRC64-ISO is the current leading choice because it is also
-used for this purpose in the PAR3 draft. No data is trusted based solely on the
-rolling fingerprint.
+The experimental version 1 rolling algorithm is CRC-64/GO-ISO: polynomial
+`0x000000000000001B`, reflected input and output, initial value and final XOR
+`0xFFFFFFFFFFFFFFFF`. Its reflected polynomial representation is
+`0xD800000000000000`; the check value for ASCII `123456789` is
+`0xB90956C775A41001`. These are the CRC64-ISO semantics used by PAR3's sliding
+block search.
+
+Creation stores one rolling value for every full-size data chunk, including an
+exact-size final chunk, but none for a short final chunk. A resynchronization
+scan advances the fixed-size window one byte at a time using PAR3's outgoing
+byte table and window-mask recurrence. The rolling value only selects
+candidates. Every candidate is recomputed with the full domain-separated
+BLAKE3 data-chunk digest before it is accepted. Identical expected chunks may
+share one confirmed candidate; no data is trusted based solely on CRC64.
 
 The short final chunk is located using its strong digest and known length rather
 than a full-size rolling window.
@@ -564,11 +573,12 @@ A migration command may later verify the source against its PAR2 set, create a
 `.bitrot` sidecar, verify that sidecar, and leave removal of PAR2 files as a
 separate explicit operation.
 
-## Open decisions before implementation
+## Open decisions before format freeze
 
 1. Final format name, extension, magic, and versioning convention.
 2. Exact Leopard-RS construction and Rust dependency.
-3. Exact rolling-fingerprint algorithm and resynchronization limits.
+3. Freeze CRC-64/GO-ISO compatibility fixtures and operational
+   resynchronization limits.
 4. Freeze the experimental binary record encoding using interoperability
    fixtures.
 5. Freeze the experimental default and supported chunk sizes using benchmarks
