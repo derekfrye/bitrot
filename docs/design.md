@@ -110,6 +110,11 @@ If a file has `k` data chunks and redundancy is `r`, create:
 m = ceil(k * r)
 ```
 
+Creation represents `r` as a reduced positive integer numerator and
+denominator and evaluates the ceiling with checked integer arithmetic. Binary
+floating point is not used. The actual data and recovery counts, rather than
+the policy ratio, are stored in the manifest.
+
 recovery chunks. Thus 15% redundancy means 1,000 data chunks produce 150
 recovery chunks. Any 150 unavailable chunks among the 1,150 total chunks can be
 reconstructed by an MDS code. It does not matter whether the missing data
@@ -133,6 +138,21 @@ unused parity exists in other stripes.
 Version 1 should therefore use one global coding group when supported. The
 implementation must process subranges of each shard in bounded-memory windows
 rather than loading the source file and recovery data into RAM at once.
+
+The experimental implementation targets the pure-Rust `reed-solomon-simd` 3.1
+Leopard GF(2^16) construction. One global group requires positive data and
+recovery counts, each below 65,536, and:
+
+```text
+min(next_power_of_two(data), next_power_of_two(recovery))
+    + max(data, recovery) <= 65,536
+```
+
+Creation currently rejects geometry outside that boundary. Automatic fallback
+grouping is deferred until group membership and its weaker per-group recovery
+guarantee have an exact manifest representation. The dependency does not yet
+define the archival format: coding details and independent fixtures still
+must be frozen before interoperability is claimed.
 
 If backend constraints require more than one coding group, groups must be as
 large as practical. The manifest records each group's exact data and recovery
@@ -318,6 +338,15 @@ one little-endian `u64`, followed by every full digest in order. The root is
 independent of page boundaries. Record checksums establish each physical
 page's integrity; the table root detects missing, reordered, or substituted
 pages once the complete table is assembled.
+
+Table assembly applies explicit caller-selected digest and page limits before
+allocating page slots. Pages may arrive in any physical order. Identical valid
+copies of the same logical page are accepted and collapsed. Valid copies with
+different contents are a conflict and make the table unusable. Assembly also
+requires the table kind, page indexes, first-digest indexes, page sizes, and
+final table root to agree with the core manifest. Every non-final page must
+contain 4,096 digests; every expected page must be present. Readers never pick
+one of two conflicting valid copies.
 
 ### Metadata redundancy
 

@@ -219,7 +219,257 @@ impl Table {
             pages,
         })
     }
+
+    /// Assembles validated pages, accepting identical redundant copies.
+    ///
+    /// Input order is irrelevant. Every expected page must be present, page
+    /// geometry must be canonical, and the completed table must match
+    /// `expected_root`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error before allocation if declared geometry exceeds
+    /// `limits`, or when pages are missing, conflicting, noncanonical, of the
+    /// wrong kind, or inconsistent with `expected_root`.
+    pub fn assemble<I>(
+        kind: Kind,
+        digest_count: u64,
+        expected_root: Digest,
+        pages: I,
+        limits: AssemblyLimits,
+    ) -> Result<Self, AssemblyError>
+    where
+        I: IntoIterator<Item = Page>,
+    {
+        if digest_count > limits.max_digests {
+            return Err(AssemblyError::DigestLimitExceeded {
+                actual: digest_count,
+                maximum: limits.max_digests,
+            });
+        }
+        let page_size =
+            u64::try_from(MAX_DIGESTS_PER_PAGE).map_err(|_| AssemblyError::LengthOverflow)?;
+        let page_count = if digest_count == 0 {
+            0
+        } else {
+            ((digest_count - 1) / page_size) + 1
+        };
+        if page_count > u64::from(limits.max_pages) {
+            return Err(AssemblyError::PageLimitExceeded {
+                actual: page_count,
+                maximum: limits.max_pages,
+            });
+        }
+        let page_count =
+            usize::try_from(page_count).map_err(|_| AssemblyError::PageCountUnrepresentable)?;
+        usize::try_from(digest_count).map_err(|_| AssemblyError::DigestCountUnrepresentable)?;
+
+        let mut slots = Vec::with_capacity(page_count);
+        slots.resize_with(page_count, || None);
+        for page in pages {
+            if page.kind != kind {
+                return Err(AssemblyError::WrongKind {
+                    page_index: page.page_index,
+                    expected: kind,
+                    actual: page.kind,
+                });
+            }
+            let index = usize::try_from(page.page_index)
+                .map_err(|_| AssemblyError::PageCountUnrepresentable)?;
+            let Some(slot) = slots.get_mut(index) else {
+                return Err(AssemblyError::PageIndexOutOfRange {
+                    page_index: page.page_index,
+                    page_count: u32::try_from(page_count)
+                        .map_err(|_| AssemblyError::PageCountUnrepresentable)?,
+                });
+            };
+            let expected_first = u64::from(page.page_index)
+                .checked_mul(page_size)
+                .ok_or(AssemblyError::LengthOverflow)?;
+            if page.first_digest_index != expected_first {
+                return Err(AssemblyError::FirstDigestIndexMismatch {
+                    page_index: page.page_index,
+                    actual: page.first_digest_index,
+                    expected: expected_first,
+                });
+            }
+            let remaining = digest_count
+                .checked_sub(expected_first)
+                .ok_or(AssemblyError::LengthOverflow)?;
+            let expected_count = usize::try_from(remaining.min(page_size))
+                .map_err(|_| AssemblyError::LengthOverflow)?;
+            if page.digests.len() != expected_count {
+                return Err(AssemblyError::PageDigestCountMismatch {
+                    page_index: page.page_index,
+                    actual: page.digests.len(),
+                    expected: expected_count,
+                });
+            }
+
+            if let Some(existing) = slot {
+                if existing != &page {
+                    return Err(AssemblyError::ConflictingPage(page.page_index));
+                }
+            } else {
+                *slot = Some(page);
+            }
+        }
+
+        let mut missing = Vec::new();
+        for (index, page) in slots.iter().enumerate() {
+            if page.is_none() {
+                missing.push(
+                    u32::try_from(index).map_err(|_| AssemblyError::PageCountUnrepresentable)?,
+                );
+            }
+        }
+        if !missing.is_empty() {
+            return Err(AssemblyError::MissingPages(missing));
+        }
+        let pages: Vec<Page> = slots.into_iter().flatten().collect();
+        let actual_root = table_root_iter(
+            kind,
+            digest_count,
+            pages.iter().flat_map(|page| page.digests.iter()),
+        );
+        if actual_root != expected_root {
+            return Err(AssemblyError::RootMismatch {
+                expected: expected_root,
+                actual: actual_root,
+            });
+        }
+
+        Ok(Self {
+            kind,
+            digest_count,
+            root: actual_root,
+            pages,
+        })
+    }
+
+    pub fn digests(&self) -> impl Iterator<Item = &Digest> {
+        self.pages.iter().flat_map(|page| page.digests.iter())
+    }
 }
+
+/// Caller-selected limits enforced before table assembly allocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AssemblyLimits {
+    pub max_digests: u64,
+    pub max_pages: u32,
+}
+
+impl AssemblyLimits {
+    #[must_use]
+    pub const fn new(max_digests: u64, max_pages: u32) -> Self {
+        Self {
+            max_digests,
+            max_pages,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AssemblyError {
+    DigestLimitExceeded {
+        actual: u64,
+        maximum: u64,
+    },
+    PageLimitExceeded {
+        actual: u64,
+        maximum: u32,
+    },
+    DigestCountUnrepresentable,
+    PageCountUnrepresentable,
+    LengthOverflow,
+    WrongKind {
+        page_index: u32,
+        expected: Kind,
+        actual: Kind,
+    },
+    PageIndexOutOfRange {
+        page_index: u32,
+        page_count: u32,
+    },
+    FirstDigestIndexMismatch {
+        page_index: u32,
+        actual: u64,
+        expected: u64,
+    },
+    PageDigestCountMismatch {
+        page_index: u32,
+        actual: usize,
+        expected: usize,
+    },
+    ConflictingPage(u32),
+    MissingPages(Vec<u32>),
+    RootMismatch {
+        expected: Digest,
+        actual: Digest,
+    },
+}
+
+impl fmt::Display for AssemblyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DigestLimitExceeded { actual, maximum } => write!(
+                formatter,
+                "digest count {actual} exceeds assembly limit {maximum}"
+            ),
+            Self::PageLimitExceeded { actual, maximum } => {
+                write!(
+                    formatter,
+                    "page count {actual} exceeds assembly limit {maximum}"
+                )
+            }
+            Self::DigestCountUnrepresentable => {
+                formatter.write_str("digest count cannot be represented on this platform")
+            }
+            Self::PageCountUnrepresentable => {
+                formatter.write_str("page count cannot be represented on this platform")
+            }
+            Self::LengthOverflow => formatter.write_str("digest-table geometry overflows"),
+            Self::WrongKind {
+                page_index,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "page {page_index} has kind {actual:?}, expected {expected:?}"
+            ),
+            Self::PageIndexOutOfRange {
+                page_index,
+                page_count,
+            } => write!(
+                formatter,
+                "page index {page_index} is outside table page count {page_count}"
+            ),
+            Self::FirstDigestIndexMismatch {
+                page_index,
+                actual,
+                expected,
+            } => write!(
+                formatter,
+                "page {page_index} starts at digest {actual}, expected {expected}"
+            ),
+            Self::PageDigestCountMismatch {
+                page_index,
+                actual,
+                expected,
+            } => write!(
+                formatter,
+                "page {page_index} contains {actual} digests, expected {expected}"
+            ),
+            Self::ConflictingPage(page_index) => {
+                write!(formatter, "valid copies of page {page_index} conflict")
+            }
+            Self::MissingPages(pages) => write!(formatter, "missing digest-table pages {pages:?}"),
+            Self::RootMismatch { .. } => formatter.write_str("digest-table root does not match"),
+        }
+    }
+}
+
+impl std::error::Error for AssemblyError {}
 
 /// Hashes a canonical ordered digest table independently of page boundaries.
 ///
@@ -228,12 +478,19 @@ impl Table {
 /// Returns an error if the digest count cannot be represented as `u64`.
 pub fn table_root(kind: Kind, digests: &[Digest]) -> Result<Digest, Error> {
     let count = u64::try_from(digests.len()).map_err(|_| Error::LengthOverflow)?;
+    Ok(table_root_iter(kind, count, digests))
+}
+
+fn table_root_iter<'a, I>(kind: Kind, count: u64, digests: I) -> Digest
+where
+    I: IntoIterator<Item = &'a Digest>,
+{
     let mut hasher = blake3::Hasher::new_derive_key(kind.root_context());
     hasher.update(&count.to_le_bytes());
     for digest in digests {
         hasher.update(digest.as_bytes());
     }
-    Ok(hasher.finalize().into())
+    hasher.finalize().into()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -365,6 +622,15 @@ mod tests {
         Page::new(Kind::Data, 3, 12_288, vec![digest(1), digest(2)]).unwrap()
     }
 
+    fn two_page_table() -> Table {
+        let last_digest = u64::try_from(MAX_DIGESTS_PER_PAGE).unwrap();
+        Table::new(Kind::Data, (0..=last_digest).map(digest).collect()).unwrap()
+    }
+
+    fn assembly_limits() -> AssemblyLimits {
+        AssemblyLimits::new(10_000, 10)
+    }
+
     #[test]
     fn builds_canonical_pages() {
         let last_digest = u64::try_from(MAX_DIGESTS_PER_PAGE).unwrap();
@@ -390,6 +656,189 @@ mod tests {
         assert_eq!(table.digest_count, 0);
         assert!(table.pages.is_empty());
         assert_eq!(table.root, table_root(Kind::Recovery, &[]).unwrap());
+    }
+
+    #[test]
+    fn assembles_out_of_order_pages_and_collapses_identical_copies() {
+        let expected = two_page_table();
+        let pages = vec![
+            expected.pages[1].clone(),
+            expected.pages[0].clone(),
+            expected.pages[0].clone(),
+        ];
+
+        let actual = Table::assemble(
+            expected.kind,
+            expected.digest_count,
+            expected.root,
+            pages,
+            assembly_limits(),
+        )
+        .unwrap();
+
+        assert_eq!(actual, expected);
+        assert_eq!(
+            actual.digests().count(),
+            usize::try_from(expected.digest_count).unwrap()
+        );
+    }
+
+    #[test]
+    fn assembly_rejects_missing_and_conflicting_pages() {
+        let expected = two_page_table();
+        assert_eq!(
+            Table::assemble(
+                expected.kind,
+                expected.digest_count,
+                expected.root,
+                vec![expected.pages[0].clone()],
+                assembly_limits(),
+            )
+            .unwrap_err(),
+            AssemblyError::MissingPages(vec![1])
+        );
+
+        let mut conflict = expected.pages[0].clone();
+        conflict.digests[0] = digest(999);
+        assert_eq!(
+            Table::assemble(
+                expected.kind,
+                expected.digest_count,
+                expected.root,
+                vec![
+                    expected.pages[0].clone(),
+                    conflict,
+                    expected.pages[1].clone()
+                ],
+                assembly_limits(),
+            )
+            .unwrap_err(),
+            AssemblyError::ConflictingPage(0)
+        );
+    }
+
+    #[test]
+    fn assembly_rejects_noncanonical_page_geometry() {
+        let expected = two_page_table();
+
+        let mut wrong_kind = expected.pages[0].clone();
+        wrong_kind.kind = Kind::Recovery;
+        assert!(matches!(
+            Table::assemble(
+                expected.kind,
+                expected.digest_count,
+                expected.root,
+                vec![wrong_kind],
+                assembly_limits(),
+            ),
+            Err(AssemblyError::WrongKind { .. })
+        ));
+
+        let mut wrong_start = expected.pages[0].clone();
+        wrong_start.first_digest_index = 1;
+        assert!(matches!(
+            Table::assemble(
+                expected.kind,
+                expected.digest_count,
+                expected.root,
+                vec![wrong_start],
+                assembly_limits(),
+            ),
+            Err(AssemblyError::FirstDigestIndexMismatch { .. })
+        ));
+
+        let mut wrong_count = expected.pages[0].clone();
+        wrong_count.digests.pop();
+        assert!(matches!(
+            Table::assemble(
+                expected.kind,
+                expected.digest_count,
+                expected.root,
+                vec![wrong_count],
+                assembly_limits(),
+            ),
+            Err(AssemblyError::PageDigestCountMismatch { .. })
+        ));
+
+        let out_of_range = Page::new(
+            Kind::Data,
+            2,
+            u64::try_from(MAX_DIGESTS_PER_PAGE * 2).unwrap(),
+            vec![digest(0)],
+        )
+        .unwrap();
+        assert!(matches!(
+            Table::assemble(
+                expected.kind,
+                expected.digest_count,
+                expected.root,
+                vec![out_of_range],
+                assembly_limits(),
+            ),
+            Err(AssemblyError::PageIndexOutOfRange { .. })
+        ));
+    }
+
+    #[test]
+    fn assembly_enforces_limits_before_page_slots_are_allocated() {
+        let expected = two_page_table();
+        assert!(matches!(
+            Table::assemble(
+                expected.kind,
+                expected.digest_count,
+                expected.root,
+                Vec::new(),
+                AssemblyLimits::new(expected.digest_count - 1, 10),
+            ),
+            Err(AssemblyError::DigestLimitExceeded { .. })
+        ));
+        assert!(matches!(
+            Table::assemble(
+                expected.kind,
+                expected.digest_count,
+                expected.root,
+                Vec::new(),
+                AssemblyLimits::new(expected.digest_count, 1),
+            ),
+            Err(AssemblyError::PageLimitExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn assembly_verifies_root_and_handles_an_empty_table() {
+        let expected = two_page_table();
+        assert!(matches!(
+            Table::assemble(
+                expected.kind,
+                expected.digest_count,
+                digest(999),
+                expected.pages,
+                assembly_limits(),
+            ),
+            Err(AssemblyError::RootMismatch { .. })
+        ));
+
+        let empty_root = table_root(Kind::Recovery, &[]).unwrap();
+        let empty = Table::assemble(
+            Kind::Recovery,
+            0,
+            empty_root,
+            Vec::new(),
+            AssemblyLimits::new(0, 0),
+        )
+        .unwrap();
+        assert!(empty.pages.is_empty());
+
+        assert!(matches!(
+            Table::assemble(
+                Kind::Recovery,
+                0,
+                empty_root,
+                vec![Page::new(Kind::Recovery, 0, 0, vec![digest(0)]).unwrap()],
+                AssemblyLimits::new(1, 1),
+            ),
+            Err(AssemblyError::PageIndexOutOfRange { .. })
+        ));
     }
 
     #[test]
