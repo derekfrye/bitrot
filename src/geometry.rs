@@ -109,13 +109,6 @@ impl Geometry {
         let chunk_bytes = u64::from(chunk_size.bytes());
         let data_chunks = ((source_len - 1) / chunk_bytes) + 1;
         let recovery_chunks = redundancy.recovery_chunks(data_chunks)?;
-        if !leopard_supports(data_chunks, recovery_chunks) {
-            return Err(GeometryError::UnsupportedShardCounts {
-                data_chunks,
-                recovery_chunks,
-            });
-        }
-
         let remainder = source_len % chunk_bytes;
         let final_data_chunk_len = if remainder == 0 {
             chunk_size.bytes()
@@ -123,21 +116,74 @@ impl Geometry {
             u32::try_from(remainder).map_err(|_| GeometryError::LengthOverflow)?
         };
 
+        let data_chunks =
+            u32::try_from(data_chunks).map_err(|_| GeometryError::UnsupportedShardCounts {
+                data_chunks,
+                recovery_chunks,
+            })?;
+        let recovery_chunks =
+            u32::try_from(recovery_chunks).map_err(|_| GeometryError::UnsupportedShardCounts {
+                data_chunks: u64::from(data_chunks),
+                recovery_chunks,
+            })?;
+        Self::from_stored(
+            source_len,
+            chunk_size,
+            data_chunks,
+            recovery_chunks,
+            final_data_chunk_len,
+        )
+    }
+
+    /// Validates geometry decoded from a manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stored counts or final chunk length disagree
+    /// with the source length and chunk size, or the backend cannot support
+    /// the shard counts.
+    pub fn from_stored(
+        source_len: u64,
+        chunk_size: ChunkSize,
+        data_chunks: u32,
+        recovery_chunks: u32,
+        final_data_chunk_len: u32,
+    ) -> Result<Self, GeometryError> {
+        if source_len == 0 {
+            return Err(GeometryError::EmptySource);
+        }
+        let chunk_bytes = u64::from(chunk_size.bytes());
+        let expected_data_chunks = ((source_len - 1) / chunk_bytes) + 1;
+        if u64::from(data_chunks) != expected_data_chunks {
+            return Err(GeometryError::DataChunkCountMismatch {
+                actual: data_chunks,
+                expected: expected_data_chunks,
+            });
+        }
+        let remainder = source_len % chunk_bytes;
+        let expected_final_len = if remainder == 0 {
+            chunk_size.bytes()
+        } else {
+            u32::try_from(remainder).map_err(|_| GeometryError::LengthOverflow)?
+        };
+        if final_data_chunk_len != expected_final_len {
+            return Err(GeometryError::FinalDataChunkLengthMismatch {
+                actual: final_data_chunk_len,
+                expected: expected_final_len,
+            });
+        }
+        if !leopard_supports(u64::from(data_chunks), u64::from(recovery_chunks)) {
+            return Err(GeometryError::UnsupportedShardCounts {
+                data_chunks: u64::from(data_chunks),
+                recovery_chunks: u64::from(recovery_chunks),
+            });
+        }
+
         Ok(Self {
             source_len,
             chunk_size,
-            data_chunks: u32::try_from(data_chunks).map_err(|_| {
-                GeometryError::UnsupportedShardCounts {
-                    data_chunks,
-                    recovery_chunks,
-                }
-            })?,
-            recovery_chunks: u32::try_from(recovery_chunks).map_err(|_| {
-                GeometryError::UnsupportedShardCounts {
-                    data_chunks,
-                    recovery_chunks,
-                }
-            })?,
+            data_chunks,
+            recovery_chunks,
             final_data_chunk_len,
         })
     }
@@ -166,6 +212,14 @@ pub enum GeometryError {
         data_chunks: u64,
         recovery_chunks: u64,
     },
+    DataChunkCountMismatch {
+        actual: u32,
+        expected: u64,
+    },
+    FinalDataChunkLengthMismatch {
+        actual: u32,
+        expected: u32,
+    },
     LengthOverflow,
 }
 
@@ -182,6 +236,14 @@ impl fmt::Display for GeometryError {
             } => write!(
                 formatter,
                 "Leopard backend does not support {data_chunks} data and {recovery_chunks} recovery shards"
+            ),
+            Self::DataChunkCountMismatch { actual, expected } => write!(
+                formatter,
+                "stored data chunk count {actual} does not match expected count {expected}"
+            ),
+            Self::FinalDataChunkLengthMismatch { actual, expected } => write!(
+                formatter,
+                "stored final data chunk length {actual} does not match expected length {expected}"
             ),
             Self::LengthOverflow => formatter.write_str("coding geometry length overflows"),
         }
@@ -339,5 +401,23 @@ mod tests {
                 recovery_chunks: 5_000
             })
         ));
+    }
+
+    #[test]
+    fn stored_geometry_must_be_canonical() {
+        let chunk_size = chunks(MIN_CHUNK_SIZE);
+        let source_len = u64::from(MIN_CHUNK_SIZE) + 7;
+        assert!(matches!(
+            Geometry::from_stored(source_len, chunk_size, 3, 1, 7),
+            Err(GeometryError::DataChunkCountMismatch { .. })
+        ));
+        assert!(matches!(
+            Geometry::from_stored(source_len, chunk_size, 2, 1, 8),
+            Err(GeometryError::FinalDataChunkLengthMismatch { .. })
+        ));
+        assert_eq!(
+            Geometry::from_stored(source_len, chunk_size, 2, 1, 7).unwrap(),
+            Geometry::new(source_len, chunk_size, fifteen_percent()).unwrap()
+        );
     }
 }

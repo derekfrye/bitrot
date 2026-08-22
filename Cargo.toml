@@ -8,9 +8,8 @@ description = "A resilient file corruption detection and recovery format"
 
 [dependencies]
 blake3 = "1.8.7"
-
-[dev-dependencies]
 crc = "3.4.0"
+reed-solomon-simd = "=3.1.0"
 
 [[bench]]
 name = "crc_compare"
@@ -21,4 +20,4 @@ unsafe_code = "forbid"
 
 [lints.clippy]
 all = "warn"
-pedantic = "warn"
+pedantic = "deny"

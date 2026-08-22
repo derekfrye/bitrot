@@ -24,7 +24,7 @@ fn main() {
         let iterations = (CHECKSUM_BYTES_PER_ROUND / size).max(1);
 
         println!("  {}:", display_size(size));
-        measure_bytes("bitrot arithmetic", &data, iterations, || crc64_iso(&data));
+        measure_bytes("bitrot table<16>", &data, iterations, || crc64_iso(&data));
         measure_bytes("crc table<1>", &data, iterations, || {
             CRC_TABLE_1.checksum(&data)
         });
@@ -35,7 +35,7 @@ fn main() {
 
     println!("rolling raw transition latency:");
     let arithmetic = measure_transitions("bitrot arithmetic", arithmetic_transition);
-    let table = measure_transitions("crc table<1>", table_transition);
+    let table = measure_transitions("crc table<16>[0]", table_transition);
     assert_eq!(arithmetic, table);
 }
 
@@ -95,7 +95,7 @@ fn arithmetic_transition(state: u64, byte: u8) -> u64 {
 
 fn table_transition(state: u64, byte: u8) -> u64 {
     let index = usize::from((state ^ u64::from(byte)).to_le_bytes()[0]);
-    CRC_TABLE_1.table()[0][index] ^ (state >> 8)
+    CRC_TABLE_16.table()[0][index] ^ (state >> 8)
 }
 
 fn median(samples: &mut [Duration]) -> Duration {

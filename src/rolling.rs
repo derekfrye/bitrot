@@ -1,6 +1,7 @@
 //! CRC-64/GO-ISO rolling candidates with mandatory BLAKE3 confirmation.
 
 use crate::fingerprint::{self, ChunkSize, Digest};
+use crc::{CRC_64_GO_ISO, Crc, Table};
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, BufReader, Read};
@@ -9,14 +10,12 @@ use std::ops::ControlFlow;
 /// Reflected representation of the CRC-64/GO-ISO polynomial.
 pub const CRC64_ISO_POLYNOMIAL: u64 = 0xd800_0000_0000_0000;
 
+const CRC64_ISO: Crc<u64, Table<16>> = Crc::<u64, Table<16>>::new(&CRC_64_GO_ISO);
+
 /// Computes CRC-64/GO-ISO with all-one initialization and final XOR.
 #[must_use]
 pub fn crc64_iso(bytes: &[u8]) -> u64 {
-    let mut state = u64::MAX;
-    for byte in bytes {
-        state = update_raw(state, *byte);
-    }
-    !state
+    CRC64_ISO.checksum(bytes)
 }
 
 /// Precomputed state for one fixed-size rolling window.
@@ -278,8 +277,8 @@ impl From<io::Error> for Error {
 }
 
 fn update_raw(state: u64, byte: u8) -> u64 {
-    let value = (state ^ u64::from(byte)) << 56;
-    (state >> 8) ^ value ^ (value >> 1) ^ (value >> 3) ^ (value >> 4)
+    let index = usize::from((state ^ u64::from(byte)).to_le_bytes()[0]);
+    CRC64_ISO.table()[0][index] ^ (state >> 8)
 }
 
 struct ZeroAdvance {

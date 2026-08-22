@@ -139,6 +139,14 @@ Version 1 should therefore use one global coding group when supported. The
 implementation must process subranges of each shard in bounded-memory windows
 rather than loading the source file and recovery data into RAM at once.
 
+The experimental implementation divides every chunk into equal, positive,
+even-sized coding windows. The window size must divide the chunk size exactly.
+Windows at the same byte offset in every data chunk are coded together, and
+the short final data chunk is zero-padded by the source encoder. Concatenating
+the recovery windows in offset order produces the same recovery chunks as
+coding complete chunks at once; the window size is therefore an implementation
+resource choice rather than a stored format parameter.
+
 The experimental implementation targets the pure-Rust `reed-solomon-simd` 3.1
 Leopard GF(2^16) construction. One global group requires positive data and
 recovery counts, each below 65,536, and:
@@ -316,6 +324,42 @@ Required logical record types are:
 Optional records may include comments and original path metadata. Readers skip
 unknown optional record types. Unknown required feature bits cause a clean
 failure.
+
+### Experimental core manifest
+
+Record type 2 is the required core manifest. Its logical identifier is zero,
+and version 1 has no record-header extension. Its fixed 152-byte payload is:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 2 | Payload version, currently 1 |
+| 2 | 2 | Required feature bits, currently zero |
+| 4 | 2 | Coding algorithm: 1 = Leopard GF(2^16) |
+| 6 | 2 | Strong hash: 1 = full BLAKE3 derive-key digest |
+| 8 | 2 | Rolling algorithm: 1 = CRC-64/GO-ISO |
+| 10 | 2 | Reserved; must be zero |
+| 12 | 4 | Data chunk size |
+| 16 | 8 | Unpadded source length |
+| 24 | 4 | Data chunk count |
+| 28 | 4 | Recovery chunk count |
+| 32 | 4 | Unpadded final data chunk length |
+| 36 | 4 | Reserved; must be zero |
+| 40 | 32 | Full source digest |
+| 72 | 8 | Data digest count; must equal data chunk count |
+| 80 | 32 | Data digest-table root |
+| 112 | 8 | Recovery digest count; must equal recovery chunk count |
+| 120 | 32 | Recovery digest-table root |
+
+The protection-set identifier uses BLAKE3 derive-key mode with context
+`bitrot format v1 protection set identifier`. In order, its input is the
+payload version; coding, strong-hash, and rolling algorithm identifiers; chunk
+size; source length; data and recovery counts; final data-chunk length; source
+digest; data digest count; and data digest-table root, all using the widths and
+little-endian encoding above. The recovery root is deliberately excluded: the
+set identity describes the source and immutable coding request, while recovery
+records and their committed digest table are validated content within that
+set. Readers recompute this identifier and require it to match the record
+header.
 
 ### Experimental digest-table pages
 
