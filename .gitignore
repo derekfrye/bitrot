@@ -1,7 +1,1 @@
-/a
-target/
-Cargo.lock
-tmp/
-tmp2/
-__pycache__
-/output.txt
+/target/

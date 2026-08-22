@@ -1,29 +1,17 @@
 [package]
 name = "bitrot"
 version = "0.1.0"
-edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "A resilient file corruption detection and recovery format"
 
 [dependencies]
-md5 = "0.7.0"
-regex = "1"
-#thiserror = "1"
-anyhow = "1"
-clap = { version = "4", features = ["derive"] }
-#chrono = "0.4"
-indicatif = "0.17.5"
-#console = "0.15.7"
-fs2 = "0.4.3"
-num_cpus = "1.16.0"
-# async-std = "1.12.0"
-# hex = "0.4.3"
-# crossbeam-channel = "0.5.8"
-derivative = "2.2.0"
+blake3 = "1.8.7"
 
-[profile.release]
-#opt-level = 'z'     # Optimize for size
-lto = true          # Enable link-time optimization
-codegen-units = 1   # Reduce number of codegen units to increase optimizations
-#panic = 'abort'     # Abort on panic
-strip = true        # Strip symbols from binary*
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
