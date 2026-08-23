@@ -893,7 +893,7 @@ mod tests {
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .arg("--exact")
-            .arg("create::filesystem::tests::filesystem_process_child")
+            .arg("create::publish::tests::filesystem_process_child")
             .arg("--ignored")
             .env(PROCESS_SCENARIO_ENV, scenario)
             .env(PROCESS_SOURCE_ENV, source)

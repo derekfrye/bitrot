@@ -3,8 +3,9 @@
 This document records a structural review of the repository as of August 2026.
 The initial review most likely described commit `4be11eb`; the document was not
 tracked at the time, so that baseline is inferred from its filesystem creation
-time. It has been refreshed through commit `396b20a`. The review focuses on
-physical file organization, module and type naming, placement of
+time. The recommendations were refreshed against the repository after commit
+`396b20a` and are maintained as the reorganization proceeds. The review focuses
+on physical file organization, module and type naming, placement of
 responsibilities, and likely future split points. It is not a proposal for a
 wholesale rewrite.
 
@@ -26,9 +27,9 @@ The highest-value candidates are:
 | Current file | Approximate production lines | Recommendation |
 | --- | ---: | --- |
 | `src/sidecar.rs` | 790 | Split reading, writing/layout, and logical assembly |
-| `src/create/filesystem.rs` | 767 | Rename to `publish.rs`; extract canonical streaming |
+| `src/create/publish.rs` | 767 | Extract canonical streaming |
 | `src/verify.rs` | 810 | Separate ordinary verification from displaced-chunk location |
-| `src/repair/filesystem.rs` | 717 | Rename to `publish.rs`; otherwise keep mostly cohesive |
+| `src/repair/publish.rs` | 717 | Keep mostly cohesive |
 | `src/repair/replace.rs` | 743 | Extract platform-specific exchange and directory machinery |
 | `src/filesystem.rs` | 805 | Consider a lower-priority internal split behind a facade |
 
@@ -62,15 +63,16 @@ src/sidecar/record_policy.rs
 The existing `sidecar::*` paths can be retained. Splitting the implementation
 does not require exposing all of the child modules.
 
-### Name publication workflows as publication workflows
+### Publication workflows use publication names
 
-There are currently three files named `filesystem.rs` with different scopes:
+The operation-specific publication modules have been renamed, leaving the
+shared filesystem primitives with the unqualified filesystem name:
 
 - `src/filesystem.rs` contains shared filesystem primitives;
-- `src/create/filesystem.rs` implements sidecar publication;
-- `src/repair/filesystem.rs` implements repaired-file publication.
+- `src/create/publish.rs` implements sidecar publication;
+- `src/repair/publish.rs` implements repaired-file publication.
 
-The operation-specific files would be clearer as:
+The resulting layout is:
 
 ```text
 src/create/publish.rs
@@ -78,8 +80,8 @@ src/repair/publish.rs
 src/filesystem.rs
 ```
 
-The public `create::publish` and `repair::publish` functions can continue to be
-re-exported from their existing locations.
+The public `create::publish` and `repair::publish` functions remain re-exported
+from their existing locations.
 
 Create publication also contains a distinct canonical-record streaming
 responsibility, centered on `CanonicalPlan` and its record sequencing and
@@ -87,7 +89,7 @@ verification helpers. That code is a good candidate for
 `src/create/canonical_writer.rs` or `src/create/stream.rs`.
 
 Repair publication is more cohesive after the shared filesystem extraction.
-Renaming its file may be sufficient unless a new responsibility develops.
+No further split is currently warranted unless a new responsibility develops.
 
 ### Separate verification from displaced-chunk location
 
@@ -256,14 +258,13 @@ Integration tests should complement rather than replace focused unit tests.
 
 ## Suggested order of work
 
-1. Rename the two operation-specific `filesystem.rs` files.
-2. Split `sidecar.rs` behind its existing public facade.
-3. Split `verify.rs` into source verification and displaced-location logic.
-4. Extract replacement platform machinery.
-5. Split the shared filesystem implementation behind its private facade if the
+1. Split `sidecar.rs` behind its existing public facade.
+2. Split `verify.rs` into source verification and displaced-location logic.
+3. Extract replacement platform machinery.
+4. Split the shared filesystem implementation behind its private facade if the
    operation-level moves confirm the proposed internal seams.
-6. Decide the pre-1.0 public module hierarchy and `creator` terminology.
-7. Organize core integration tests and repository documentation.
+5. Decide the pre-1.0 public module hierarchy and `creator` terminology.
+6. Organize core integration tests and repository documentation.
 
 Each step should be a behavior-preserving change with tests kept green. Avoid
 combining public API redesign with internal file movement in the same change;

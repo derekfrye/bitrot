@@ -1,9 +1,9 @@
 //! Bounded-window reconstruction into a fresh seekable destination.
 
-mod filesystem;
+mod publish;
 mod replace;
 
-pub use filesystem::{
+pub use publish::{
     OutputVerificationError, PublishError, PublishOptions, PublishOutcome, PublishSummary,
     PublishedVerificationError, publish,
 };

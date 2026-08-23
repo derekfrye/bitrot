@@ -1,9 +1,9 @@
 //! Construction of a complete protection set from a seekable source.
 
-mod filesystem;
+mod publish;
 mod spool;
 
-pub use filesystem::{
+pub use publish::{
     ExistingSidecar, PublishError, PublishOutcome, PublishedVerificationError, publish,
 };
 
