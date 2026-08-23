@@ -185,10 +185,42 @@ pub fn publish(
 }
 
 fn verify_intact(file: &mut File, sidecar: &Sidecar) -> Result<(), OutputVerificationError> {
+    verify_intact_with_snapshot_hook(file, sidecar, || {})
+}
+
+#[cfg(test)]
+fn verify_intact_after_snapshot(
+    file: &mut File,
+    sidecar: &Sidecar,
+    after_snapshot: impl FnOnce(),
+) -> Result<(), OutputVerificationError> {
+    verify_intact_with_snapshot_hook(file, sidecar, after_snapshot)
+}
+
+fn verify_intact_with_snapshot_hook(
+    file: &mut File,
+    sidecar: &Sidecar,
+    after_snapshot: impl FnOnce(),
+) -> Result<(), OutputVerificationError> {
     file.seek(SeekFrom::Start(0))
         .map_err(verify::Error::SourceSeek)
         .map_err(OutputVerificationError::Verify)?;
-    let report = verify::source_file(file, sidecar).map_err(OutputVerificationError::Verify)?;
+    // Output publication intentionally removes an extra hard link. That can
+    // change ctime during verification without changing the file itself, so
+    // guard the content-bearing metadata rather than the Unix status time.
+    let before = FileIdentity::capture(file)
+        .map_err(verify::Error::SourceMetadata)
+        .map_err(OutputVerificationError::Verify)?;
+    after_snapshot();
+    let report = verify::source(file, sidecar).map_err(OutputVerificationError::Verify)?;
+    let after = FileIdentity::capture(file)
+        .map_err(verify::Error::SourceMetadata)
+        .map_err(OutputVerificationError::Verify)?;
+    if before != after {
+        return Err(OutputVerificationError::Verify(
+            verify::Error::SourceMetadataChanged,
+        ));
+    }
     if report.state == SourceState::Intact
         && report.source_digest == SourceDigestState::Match
         && report.unavailable_data_chunks == 0
@@ -1095,8 +1127,22 @@ mod tests {
                 .count(),
             PUBLISHERS - 1
         );
-        assert_eq!(fs::read(destination_path).unwrap(), original);
+        assert_eq!(fs::read(&destination_path).unwrap(), original);
         assert!(!directory.has_partial());
+
+        // A losing publisher can begin verifying the destination before the
+        // winner removes its temporary hard link. Removing that link changes
+        // ctime on Unix, but it does not change the published contents.
+        let cleanup_link = directory.join("winner-temporary-link");
+        fs::hard_link(&destination_path, &cleanup_link).unwrap();
+        let sidecar = Sidecar::read(File::open(&sidecar_path).unwrap(), limits)
+            .unwrap()
+            .sidecar;
+        let mut destination = File::open(&destination_path).unwrap();
+        verify_intact_after_snapshot(&mut destination, &sidecar, || {
+            fs::remove_file(cleanup_link).unwrap();
+        })
+        .unwrap();
     }
 
     #[cfg(unix)]
