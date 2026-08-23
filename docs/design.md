@@ -607,6 +607,11 @@ The creator must write to a uniquely named temporary file in the destination
 directory, flush it, verify its records, and atomically install it. Default
 no-clobber publication may link the completed temporary inode into place and
 then remove its temporary name; explicit replacement uses an atomic rename.
+After installation, creation reopens the destination without following links,
+requires it to identify the still-open verified temporary inode, and parses the
+complete canonical sidecar again. A failed check is reported as a publication
+failure and, when the destination can be reopened, triggers identity-safe
+removal of that exact inode; an inability to roll back is reported separately.
 A successful install always triggers a destination-directory sync attempt,
 even if removing the no-clobber temporary link fails. Errors after installation
 state that the sidecar was published while cleanup or durability confirmation
@@ -615,7 +620,9 @@ The destination directory is opened once before creation, and every later
 lookup, temporary-file operation, inspection, publication, cleanup, and sync is
 resolved relative to that pinned directory handle. Renaming an ancestor during
 creation therefore cannot redirect publication into a replacement directory at
-the original pathname.
+the original pathname. Identity checks use device and inode on Unix and require
+an available matching volume serial and file index on Windows; length and
+timestamps are not treated as Windows file identity.
 A filesystem without the required atomic primitive fails safely rather than
 falling back to a racy existence check. Creation must never publish a partial
 sidecar. Recovery spools and unpublished sidecars use recognizable partial-file
@@ -624,9 +631,11 @@ old partial only after acquiring its lock and confirming that the pathname still
 identifies the opened inode. On supported Unix platforms, cleanup first moves a
 candidate to a unique no-clobber quarantine name, verifies that moved entry
 against the locked descriptor, and only then removes it. A pathname replacement
-that wins the race is restored rather than deleted. Verification reads the
-still-open temporary file, not a pathname that could have been substituted
-between close and reopen.
+that wins the race is restored rather than deleted. Normal temporary cleanup
+uses the same quarantine protocol after success and on error, closing the
+identity-check-then-unlink window there as well. Verification reads the still-open
+temporary file, not a pathname that could have been substituted between close
+and reopen.
 
 ## Operations
 

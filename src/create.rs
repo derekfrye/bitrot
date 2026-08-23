@@ -3,7 +3,9 @@
 mod filesystem;
 mod spool;
 
-pub use filesystem::{ExistingSidecar, PublishError, PublishOutcome, publish};
+pub use filesystem::{
+    ExistingSidecar, PublishError, PublishOutcome, PublishedVerificationError, publish,
+};
 
 use crate::coding::{self, CodingWindow};
 use crate::creator::Creator;

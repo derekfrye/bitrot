@@ -10,9 +10,11 @@ use crate::sidecar::{CanonicalLayout, ReadLimits, Sidecar, WriteSummary};
 #[cfg(windows)]
 use cap_std::ambient_authority;
 #[cfg(any(unix, windows))]
-use cap_std::fs::{Dir, OpenOptions as DirectoryOpenOptions};
+use cap_std::fs::MetadataExt as CapMetadataExt;
 #[cfg(unix)]
-use cap_std::fs::{MetadataExt as CapMetadataExt, OpenOptionsExt as CapOpenOptionsExt};
+use cap_std::fs::OpenOptionsExt as CapOpenOptionsExt;
+#[cfg(any(unix, windows))]
+use cap_std::fs::{Dir, OpenOptions as DirectoryOpenOptions};
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File, Metadata, OpenOptions, TryLockError};
@@ -137,6 +139,8 @@ pub fn publish(
         &directory,
         destination_name,
         &generated,
+        &plan,
+        summary,
         existing,
     )?;
     if published {
@@ -154,12 +158,18 @@ struct SourceSnapshot {
     device: u64,
     #[cfg(unix)]
     inode: u64,
+    #[cfg(windows)]
+    volume_serial_number: Option<u32>,
+    #[cfg(windows)]
+    file_index: Option<u64>,
 }
 
 impl SourceSnapshot {
     fn from_metadata(metadata: &Metadata) -> Self {
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt;
+        #[cfg(windows)]
+        use std::os::windows::fs::MetadataExt as _;
 
         Self {
             len: metadata.len(),
@@ -168,19 +178,34 @@ impl SourceSnapshot {
             device: metadata.dev(),
             #[cfg(unix)]
             inode: metadata.ino(),
+            #[cfg(windows)]
+            volume_serial_number: metadata.volume_serial_number(),
+            #[cfg(windows)]
+            file_index: metadata.file_index(),
         }
     }
 
     fn same_file(&self, metadata: &Metadata) -> bool {
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt;
+        #[cfg(windows)]
+        use std::os::windows::fs::MetadataExt as _;
 
         self.len == metadata.len() && self.modified == metadata.modified().ok() && {
             #[cfg(unix)]
             {
                 self.device == metadata.dev() && self.inode == metadata.ino()
             }
-            #[cfg(not(unix))]
+            #[cfg(windows)]
+            {
+                same_windows_file_id(
+                    self.volume_serial_number,
+                    self.file_index,
+                    metadata.volume_serial_number(),
+                    metadata.file_index(),
+                )
+            }
+            #[cfg(not(any(unix, windows)))]
             {
                 true
             }
@@ -215,7 +240,16 @@ fn destination_is_source(
     {
         Ok(snapshot.device == metadata.device && snapshot.inode == metadata.inode)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        Ok(same_windows_file_id(
+            snapshot.volume_serial_number,
+            snapshot.file_index,
+            metadata.volume_serial_number,
+            metadata.file_index,
+        ))
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (metadata, snapshot);
         Ok(false)
@@ -574,13 +608,18 @@ impl DestinationDirectory {
 struct EntryMetadata {
     is_file: bool,
     is_symlink: bool,
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     len: u64,
+    #[cfg(not(windows))]
     modified: Option<SystemTime>,
     #[cfg(unix)]
     device: u64,
     #[cfg(unix)]
     inode: u64,
+    #[cfg(windows)]
+    volume_serial_number: Option<u32>,
+    #[cfg(windows)]
+    file_index: Option<u64>,
 }
 
 impl EntryMetadata {
@@ -589,8 +628,9 @@ impl EntryMetadata {
         Self {
             is_file: metadata.is_file(),
             is_symlink: metadata.file_type().is_symlink(),
-            #[cfg(not(unix))]
+            #[cfg(not(any(unix, windows)))]
             len: metadata.len(),
+            #[cfg(not(windows))]
             modified: metadata
                 .modified()
                 .ok()
@@ -599,6 +639,10 @@ impl EntryMetadata {
             device: metadata.dev(),
             #[cfg(unix)]
             inode: metadata.ino(),
+            #[cfg(windows)]
+            volume_serial_number: metadata.volume_serial_number(),
+            #[cfg(windows)]
+            file_index: metadata.file_index(),
         }
     }
 
@@ -666,7 +710,12 @@ fn create_temporary<'directory>(
                     TryLockError::Error(error) => PublishError::LockTemporary(error),
                     TryLockError::WouldBlock => PublishError::TemporaryLockContended,
                 })?;
-                return Ok(TemporaryFile::new(directory, temporary_name, file));
+                return Ok(TemporaryFile::new(
+                    directory,
+                    destination_name.to_owned(),
+                    temporary_name,
+                    file,
+                ));
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(PublishError::CreateTemporary(error)),
@@ -733,7 +782,7 @@ fn cleanup_stale_temporaries(
                 return Err(PublishError::CleanupTemporaries(error));
             }
         }
-        removed |= quarantine_and_remove_stale(directory, destination_name, &name, &file)
+        removed |= quarantine_and_remove(directory, destination_name, &name, &file)
             .map_err(PublishError::CleanupTemporaries)?;
     }
 
@@ -744,7 +793,7 @@ fn cleanup_stale_temporaries(
 }
 
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-fn quarantine_and_remove_stale(
+fn quarantine_and_remove(
     directory: &DestinationDirectory,
     destination_name: &std::ffi::OsStr,
     original_name: &std::ffi::OsStr,
@@ -772,7 +821,7 @@ fn quarantine_and_remove_stale(
     let Some(quarantine_name) = quarantine_name else {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
-            "cannot reserve a stale-temporary quarantine name",
+            "cannot reserve a temporary-file quarantine name",
         ));
     };
 
@@ -785,14 +834,14 @@ fn quarantine_and_remove_stale(
 
     match directory.rename_no_replace(&quarantine_name, original_name) {
         Ok(()) => Err(io::Error::other(
-            "stale temporary pathname changed during cleanup; replacement was restored",
+            "temporary pathname changed during cleanup; replacement was restored",
         )),
         Err(restore_error) => {
             let quarantine_name = Path::new(&quarantine_name).display();
             Err(io::Error::new(
                 restore_error.kind(),
                 format!(
-                    "stale temporary pathname changed during cleanup; replacement remains at {quarantine_name}: {restore_error}"
+                    "temporary pathname changed during cleanup; replacement remains at {quarantine_name}: {restore_error}"
                 ),
             ))
         }
@@ -863,11 +912,20 @@ fn publish_temporary(
     directory: &DestinationDirectory,
     destination: &std::ffi::OsStr,
     expected: &ProtectionMetadata,
+    plan: &CanonicalPlan,
+    summary: WriteSummary,
     existing: ExistingSidecar,
 ) -> Result<bool, PublishError> {
     match existing {
         ExistingSidecar::Preserve => match directory.hard_link(temporary.name(), destination) {
-            Ok(()) => finish_publication(|| temporary.remove(), || directory.sync())?,
+            Ok(()) => {
+                if let Err(failure) =
+                    verify_published(directory, destination, &temporary.file, plan, summary)
+                {
+                    return Err(rollback_failed_publication(directory, destination, failure));
+                }
+                finish_publication(|| temporary.remove(), || directory.sync())?;
+            }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 if inspect_existing(directory, destination, expected)? == Some(true) {
                     return Ok(false);
@@ -881,12 +939,119 @@ fn publish_temporary(
                 .rename(temporary.name(), destination)
                 .map_err(PublishError::Publish)?;
             temporary.disarm();
+            if let Err(failure) =
+                verify_published(directory, destination, &temporary.file, plan, summary)
+            {
+                return Err(rollback_failed_publication(directory, destination, failure));
+            }
             directory
                 .sync()
                 .map_err(PublishError::PublishedButSyncFailed)?;
         }
     }
     Ok(true)
+}
+
+struct FailedPublishedVerification {
+    error: PublishedVerificationError,
+    published: Option<File>,
+}
+
+fn verify_published(
+    directory: &DestinationDirectory,
+    destination: &std::ffi::OsStr,
+    temporary: &File,
+    plan: &CanonicalPlan,
+    summary: WriteSummary,
+) -> Result<(), FailedPublishedVerification> {
+    let mut published = directory
+        .open_read_no_follow(destination)
+        .map_err(|error| FailedPublishedVerification {
+            error: PublishedVerificationError::Open(error),
+            published: None,
+        })?;
+    let expected = match temporary.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return Err(FailedPublishedVerification {
+                error: PublishedVerificationError::Metadata(error),
+                published: Some(published),
+            });
+        }
+    };
+    let actual = match published.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return Err(FailedPublishedVerification {
+                error: PublishedVerificationError::Metadata(error),
+                published: Some(published),
+            });
+        }
+    };
+    if !same_std_file_identity(&expected, &actual) {
+        return Err(FailedPublishedVerification {
+            error: PublishedVerificationError::IdentityChanged,
+            published: Some(published),
+        });
+    }
+    if let Err(error) = verify_temporary(&mut published, plan, summary) {
+        return Err(FailedPublishedVerification {
+            error: PublishedVerificationError::Content(Box::new(error)),
+            published: Some(published),
+        });
+    }
+    Ok(())
+}
+
+fn rollback_failed_publication(
+    directory: &DestinationDirectory,
+    destination: &std::ffi::OsStr,
+    failure: FailedPublishedVerification,
+) -> PublishError {
+    let rollback = match failure.published {
+        Some(published) => remove_published_file(directory, destination, &published),
+        None => Err(io::Error::other(
+            "published sidecar could not be opened for identity-safe rollback",
+        )),
+    };
+    match rollback {
+        Ok(()) => PublishError::PublishedVerificationFailed(failure.error),
+        Err(rollback) => PublishError::PublishedVerificationAndRollbackFailed {
+            verification: failure.error,
+            rollback,
+        },
+    }
+}
+
+fn remove_published_file(
+    directory: &DestinationDirectory,
+    destination: &std::ffi::OsStr,
+    published: &File,
+) -> io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    let removed = quarantine_and_remove(directory, destination, destination, published)?;
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    let removed = {
+        let expected = published.metadata()?;
+        let actual = match directory.symlink_metadata(destination) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(error),
+            Err(error) => return Err(error),
+        };
+        if actual.is_file() && same_entry_identity(&expected, &actual) {
+            directory.remove_file(destination)?;
+            true
+        } else {
+            false
+        }
+    };
+    if removed {
+        directory.sync()
+    } else {
+        Err(io::Error::other(
+            "published sidecar disappeared before rollback",
+        ))
+    }
 }
 
 fn finish_publication(
@@ -908,15 +1073,26 @@ fn finish_publication(
 
 struct TemporaryFile<'directory> {
     directory: &'directory DestinationDirectory,
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    destination_name: OsString,
     name: OsString,
     file: File,
     armed: bool,
 }
 
 impl<'directory> TemporaryFile<'directory> {
-    fn new(directory: &'directory DestinationDirectory, name: OsString, file: File) -> Self {
+    fn new(
+        directory: &'directory DestinationDirectory,
+        destination_name: OsString,
+        name: OsString,
+        file: File,
+    ) -> Self {
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+        let _ = destination_name;
         Self {
             directory,
+            #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+            destination_name,
             name,
             file,
             armed: true,
@@ -928,15 +1104,35 @@ impl<'directory> TemporaryFile<'directory> {
     }
 
     fn remove(&mut self) -> io::Result<()> {
-        if !self.path_still_names_file()? {
+        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        {
+            let result = quarantine_and_remove(
+                self.directory,
+                &self.destination_name,
+                &self.name,
+                &self.file,
+            );
             self.armed = false;
-            return Err(io::Error::other(
-                "temporary path no longer names the file created by this process",
-            ));
+            match result {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(io::Error::other(
+                    "temporary path no longer names the file created by this process",
+                )),
+                Err(error) => Err(error),
+            }
         }
-        self.directory.remove_file(&self.name)?;
-        self.armed = false;
-        Ok(())
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+        {
+            if !self.path_still_names_file()? {
+                self.armed = false;
+                return Err(io::Error::other(
+                    "temporary path no longer names the file created by this process",
+                ));
+            }
+            self.directory.remove_file(&self.name)?;
+            self.armed = false;
+            Ok(())
+        }
     }
 
     fn verify_path_identity(&self) -> Result<(), PublishError> {
@@ -966,7 +1162,20 @@ impl<'directory> TemporaryFile<'directory> {
 
 impl Drop for TemporaryFile<'_> {
     fn drop(&mut self) {
-        if self.armed && self.path_still_names_file().unwrap_or(false) {
+        if !self.armed {
+            return;
+        }
+        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        {
+            let _ = quarantine_and_remove(
+                self.directory,
+                &self.destination_name,
+                &self.name,
+                &self.file,
+            );
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+        if self.path_still_names_file().unwrap_or(false) {
             let _ = self.directory.remove_file(&self.name);
         }
     }
@@ -979,9 +1188,94 @@ fn same_entry_identity(left: &Metadata, right: &EntryMetadata) -> bool {
 
         left.dev() == right.device && left.ino() == right.inode
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+
+        same_windows_file_id(
+            left.volume_serial_number(),
+            left.file_index(),
+            right.volume_serial_number,
+            right.file_index,
+        )
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         left.len() == right.len && left.modified().ok() == right.modified
+    }
+}
+
+fn same_std_file_identity(left: &Metadata, right: &Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        left.dev() == right.dev() && left.ino() == right.ino()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+
+        same_windows_file_id(
+            left.volume_serial_number(),
+            left.file_index(),
+            right.volume_serial_number(),
+            right.file_index(),
+        )
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        left.len() == right.len() && left.modified().ok() == right.modified().ok()
+    }
+}
+
+#[cfg(any(windows, test))]
+const fn same_windows_file_id(
+    left_volume: Option<u32>,
+    left_index: Option<u64>,
+    right_volume: Option<u32>,
+    right_index: Option<u64>,
+) -> bool {
+    matches!(
+        (left_volume, left_index, right_volume, right_index),
+        (Some(left_volume), Some(left_index), Some(right_volume), Some(right_index))
+            if left_volume == right_volume && left_index == right_index
+    )
+}
+
+/// A published sidecar did not preserve the verified temporary inode and
+/// content.
+#[derive(Debug)]
+pub enum PublishedVerificationError {
+    Open(io::Error),
+    Metadata(io::Error),
+    IdentityChanged,
+    Content(Box<PublishError>),
+}
+
+impl fmt::Display for PublishedVerificationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Open(error) => write!(formatter, "cannot reopen published sidecar: {error}"),
+            Self::Metadata(error) => {
+                write!(formatter, "cannot inspect published sidecar: {error}")
+            }
+            Self::IdentityChanged => formatter
+                .write_str("published pathname does not identify the verified sidecar inode"),
+            Self::Content(error) => {
+                write!(formatter, "published sidecar content is invalid: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PublishedVerificationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Open(error) | Self::Metadata(error) => Some(error),
+            Self::Content(error) => Some(error),
+            Self::IdentityChanged => None,
+        }
     }
 }
 
@@ -999,7 +1293,10 @@ pub enum PublishError {
     LimitOverflow,
     VerificationMismatch,
     RecoveryDigestMismatch(u32),
-    WrittenLengthMismatch { actual: u64, expected: u64 },
+    WrittenLengthMismatch {
+        actual: u64,
+        expected: u64,
+    },
     OpenDirectory(io::Error),
     OpenSource(io::Error),
     SourceMetadata(io::Error),
@@ -1020,9 +1317,17 @@ pub enum PublishError {
     VerifyRecord(record::Error),
     VerifyRecovery(recovery_chunk::Error),
     Publish(io::Error),
+    PublishedVerificationFailed(PublishedVerificationError),
+    PublishedVerificationAndRollbackFailed {
+        verification: PublishedVerificationError,
+        rollback: io::Error,
+    },
     PublishedButCleanupFailed(io::Error),
     PublishedButSyncFailed(io::Error),
-    PublishedButCleanupAndSyncFailed { cleanup: io::Error, sync: io::Error },
+    PublishedButCleanupAndSyncFailed {
+        cleanup: io::Error,
+        sync: io::Error,
+    },
 }
 
 impl fmt::Display for PublishError {
@@ -1107,6 +1412,13 @@ impl fmt::Display for PublishError {
                 write!(formatter, "temporary recovery record is invalid: {error}")
             }
             Self::Publish(error) => write!(formatter, "cannot publish sidecar: {error}"),
+            Self::PublishedVerificationFailed(error) => {
+                fmt_published_verification(formatter, error, None)
+            }
+            Self::PublishedVerificationAndRollbackFailed {
+                verification,
+                rollback,
+            } => fmt_published_verification(formatter, verification, Some(rollback)),
             Self::PublishedButCleanupFailed(error) => write!(
                 formatter,
                 "sidecar was published but its temporary link could not be removed: {error}"
@@ -1120,6 +1432,24 @@ impl fmt::Display for PublishError {
                 "sidecar was published but its temporary link could not be removed ({cleanup}) and its destination directory could not be synchronized ({sync})"
             ),
         }
+    }
+}
+
+fn fmt_published_verification(
+    formatter: &mut fmt::Formatter<'_>,
+    verification: &PublishedVerificationError,
+    rollback: Option<&io::Error>,
+) -> fmt::Result {
+    if let Some(rollback) = rollback {
+        write!(
+            formatter,
+            "published sidecar failed verification ({verification}) and could not be rolled back: {rollback}"
+        )
+    } else {
+        write!(
+            formatter,
+            "published sidecar failed verification and was rolled back: {verification}"
+        )
     }
 }
 
@@ -1142,6 +1472,8 @@ impl std::error::Error for PublishError {
             | Self::PublishedButCleanupFailed(error)
             | Self::PublishedButSyncFailed(error) => Some(error),
             Self::PublishedButCleanupAndSyncFailed { cleanup, .. } => Some(cleanup),
+            Self::PublishedVerificationAndRollbackFailed { verification, .. } => Some(verification),
+            Self::PublishedVerificationFailed(error) => Some(error),
             Self::Build(error) => Some(error),
             Self::CanonicalLayout(error) => Some(error),
             Self::ReadLimits(error) => Some(error),
@@ -1252,6 +1584,92 @@ mod tests {
         publish(&source, &destination, &options(), ExistingSidecar::Preserve).unwrap();
         assert_eq!(fs::read(destination).unwrap(), expected);
         assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 2);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn rejects_a_substituted_temporary_during_publication() {
+        let directory = TestDirectory::new();
+        let destination = directory.join("source.bin.bitrot");
+        let anchored = DestinationDirectory::open(&directory.0).unwrap();
+        let mut temporary = create_temporary(
+            &anchored,
+            destination.file_name().unwrap(),
+            TemporaryKind::Sidecar,
+        )
+        .unwrap();
+        let opts = options();
+        let sidecar = super::super::build(&mut Cursor::new(source_bytes()), &opts).unwrap();
+        let plan = CanonicalPlan::new(&sidecar.metadata, &opts.creator).unwrap();
+        let mut canonical = Vec::new();
+        let summary = sidecar.write_canonical(&mut canonical).unwrap();
+        temporary.file.write_all(&canonical).unwrap();
+        temporary.file.sync_all().unwrap();
+
+        let temporary_path = directory.0.join(temporary.name());
+        let moved_temporary = directory.join("moved-verified-sidecar");
+        fs::rename(&temporary_path, &moved_temporary).unwrap();
+        fs::write(&temporary_path, b"substituted sidecar").unwrap();
+
+        let result = publish_temporary(
+            &mut temporary,
+            &anchored,
+            destination.file_name().unwrap(),
+            &sidecar.metadata,
+            &plan,
+            summary,
+            ExistingSidecar::Preserve,
+        );
+
+        assert!(matches!(
+            result,
+            Err(PublishError::PublishedVerificationFailed(
+                PublishedVerificationError::IdentityChanged
+            ))
+        ));
+        assert!(!destination.exists());
+        drop(temporary);
+        assert_eq!(fs::read(&temporary_path).unwrap(), b"substituted sidecar");
+        assert_eq!(fs::read(&moved_temporary).unwrap(), canonical);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn rolls_back_published_content_that_no_longer_verifies() {
+        let directory = TestDirectory::new();
+        let destination = directory.join("source.bin.bitrot");
+        let anchored = DestinationDirectory::open(&directory.0).unwrap();
+        let mut temporary = create_temporary(
+            &anchored,
+            destination.file_name().unwrap(),
+            TemporaryKind::Sidecar,
+        )
+        .unwrap();
+        let opts = options();
+        let sidecar = super::super::build(&mut Cursor::new(source_bytes()), &opts).unwrap();
+        let plan = CanonicalPlan::new(&sidecar.metadata, &opts.creator).unwrap();
+        let mut canonical = Vec::new();
+        let summary = sidecar.write_canonical(&mut canonical).unwrap();
+        temporary.file.write_all(b"invalid sidecar").unwrap();
+        temporary.file.sync_all().unwrap();
+
+        let result = publish_temporary(
+            &mut temporary,
+            &anchored,
+            destination.file_name().unwrap(),
+            &sidecar.metadata,
+            &plan,
+            summary,
+            ExistingSidecar::Preserve,
+        );
+
+        assert!(matches!(
+            result,
+            Err(PublishError::PublishedVerificationFailed(
+                PublishedVerificationError::Content(_)
+            ))
+        ));
+        assert!(!destination.exists());
     }
 
     #[test]
@@ -1422,9 +1840,8 @@ mod tests {
         fs::write(&stale_path, b"replacement that must survive").unwrap();
         let anchored = DestinationDirectory::open(&directory.0).unwrap();
 
-        let error =
-            quarantine_and_remove_stale(&anchored, destination_name, stale_name, &stale_file)
-                .unwrap_err();
+        let error = quarantine_and_remove(&anchored, destination_name, stale_name, &stale_file)
+            .unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::Other);
         assert_eq!(
@@ -1457,6 +1874,37 @@ mod tests {
         drop(temporary);
         assert_eq!(fs::read(&temporary_path).unwrap(), b"not ours");
         assert!(moved.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn explicit_cleanup_restores_a_replacement_at_the_temporary_path() {
+        let directory = TestDirectory::new();
+        let destination = directory.join("source.bin.bitrot");
+        let anchored = DestinationDirectory::open(&directory.0).unwrap();
+        let mut temporary = create_temporary(
+            &anchored,
+            destination.file_name().unwrap(),
+            TemporaryKind::Sidecar,
+        )
+        .unwrap();
+        let temporary_path = directory.0.join(temporary.name());
+        let moved = directory.join("moved-partial");
+        fs::rename(&temporary_path, &moved).unwrap();
+        fs::write(&temporary_path, b"not ours").unwrap();
+
+        assert!(temporary.remove().is_err());
+        assert_eq!(fs::read(&temporary_path).unwrap(), b"not ours");
+        assert!(moved.exists());
+    }
+
+    #[test]
+    fn windows_file_identity_requires_matching_available_ids() {
+        assert!(same_windows_file_id(Some(7), Some(11), Some(7), Some(11)));
+        assert!(!same_windows_file_id(Some(7), Some(11), Some(8), Some(11)));
+        assert!(!same_windows_file_id(Some(7), Some(11), Some(7), Some(12)));
+        assert!(!same_windows_file_id(None, None, None, None));
+        assert!(!same_windows_file_id(Some(7), None, Some(7), None));
     }
 
     #[test]
