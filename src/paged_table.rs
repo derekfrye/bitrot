@@ -13,6 +13,57 @@ pub(crate) trait Page: Eq {
 }
 
 #[derive(Debug)]
+pub(crate) struct BuiltPages<P> {
+    pub(crate) item_count: u64,
+    pub(crate) pages: Vec<P>,
+}
+
+#[derive(Debug)]
+pub(crate) enum BuildError<E> {
+    InvalidItemsPerPage,
+    ItemCountUnrepresentable,
+    PageCountUnrepresentable,
+    ItemIndexOverflow,
+    InvalidPage(E),
+}
+
+pub(crate) fn build_pages<T, P, E, F>(
+    items: Vec<T>,
+    items_per_page: usize,
+    mut build_page: F,
+) -> Result<BuiltPages<P>, BuildError<E>>
+where
+    F: FnMut(u32, u64, Vec<T>) -> Result<P, E>,
+{
+    if items_per_page == 0 {
+        return Err(BuildError::InvalidItemsPerPage);
+    }
+    let item_count =
+        u64::try_from(items.len()).map_err(|_| BuildError::ItemCountUnrepresentable)?;
+    let page_capacity = items.len().div_ceil(items_per_page);
+    let page_count =
+        u32::try_from(page_capacity).map_err(|_| BuildError::PageCountUnrepresentable)?;
+
+    let mut pages = Vec::with_capacity(page_capacity);
+    let mut items = items.into_iter();
+    let mut first_item_index = 0_u64;
+    for page_index in 0..page_count {
+        let page_items = items.by_ref().take(items_per_page).collect::<Vec<_>>();
+        let page_item_count =
+            u64::try_from(page_items.len()).map_err(|_| BuildError::ItemCountUnrepresentable)?;
+        pages.push(
+            build_page(page_index, first_item_index, page_items)
+                .map_err(BuildError::InvalidPage)?,
+        );
+        first_item_index = first_item_index
+            .checked_add(page_item_count)
+            .ok_or(BuildError::ItemIndexOverflow)?;
+    }
+
+    Ok(BuiltPages { item_count, pages })
+}
+
+#[derive(Debug)]
 pub(crate) enum Error<E> {
     ItemLimitExceeded {
         actual: u64,
@@ -134,4 +185,32 @@ where
         return Err(Error::MissingPages(missing));
     }
     Ok(slots.into_iter().flatten().collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::convert::Infallible;
+
+    #[test]
+    fn builds_canonical_page_geometry() {
+        let built = build_pages(vec![0, 1, 2, 3, 4], 2, |page, first, items| {
+            Ok::<_, Infallible>((page, first, items))
+        })
+        .unwrap();
+
+        assert_eq!(built.item_count, 5);
+        assert_eq!(
+            built.pages,
+            vec![(0, 0, vec![0, 1]), (1, 2, vec![2, 3]), (2, 4, vec![4])]
+        );
+    }
+
+    #[test]
+    fn rejects_a_zero_page_size() {
+        assert!(matches!(
+            build_pages(Vec::<u8>::new(), 0, |_, _, _| Ok::<_, Infallible>(())),
+            Err(BuildError::InvalidItemsPerPage)
+        ));
+    }
 }

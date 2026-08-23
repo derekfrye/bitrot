@@ -168,30 +168,19 @@ impl Table {
     ///
     /// Returns an error if the table has too many values or pages.
     pub fn new(values: Vec<u64>) -> Result<Self, Error> {
-        let value_count = u64::try_from(values.len()).map_err(|_| Error::LengthOverflow)?;
         let root = table_root(&values)?;
-        let page_count = values.len().div_ceil(MAX_VALUES_PER_PAGE);
-        u32::try_from(page_count).map_err(|_| Error::TooManyPages)?;
-
-        let mut pages = Vec::with_capacity(page_count);
-        let mut values = values.into_iter();
-        let mut first_value_index = 0_u64;
-        for page_index in 0..page_count {
-            let page_values: Vec<_> = values.by_ref().take(MAX_VALUES_PER_PAGE).collect();
-            let count = u64::try_from(page_values.len()).map_err(|_| Error::LengthOverflow)?;
-            pages.push(Page::new(
-                u32::try_from(page_index).map_err(|_| Error::TooManyPages)?,
-                first_value_index,
-                page_values,
-            )?);
-            first_value_index = first_value_index
-                .checked_add(count)
-                .ok_or(Error::ValueIndexOverflow)?;
-        }
+        let built = paged_table::build_pages(
+            values,
+            MAX_VALUES_PER_PAGE,
+            |page_index, first_value_index, page_values| {
+                Page::new(page_index, first_value_index, page_values)
+            },
+        )
+        .map_err(map_build_error)?;
         Ok(Self {
-            value_count,
+            value_count: built.item_count,
             root,
-            pages,
+            pages: built.pages,
         })
     }
 
@@ -242,6 +231,16 @@ impl Table {
         self.pages
             .iter()
             .flat_map(|page| page.values.iter().copied())
+    }
+}
+
+fn map_build_error(error: paged_table::BuildError<Error>) -> Error {
+    match error {
+        paged_table::BuildError::InvalidItemsPerPage
+        | paged_table::BuildError::ItemCountUnrepresentable => Error::LengthOverflow,
+        paged_table::BuildError::PageCountUnrepresentable => Error::TooManyPages,
+        paged_table::BuildError::ItemIndexOverflow => Error::ValueIndexOverflow,
+        paged_table::BuildError::InvalidPage(error) => error,
     }
 }
 

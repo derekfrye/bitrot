@@ -210,33 +210,21 @@ impl Table {
     /// Returns an error if the digest or page count cannot be represented by
     /// the format.
     pub fn new(kind: Kind, digests: Vec<Digest>) -> Result<Self, Error> {
-        let digest_count = u64::try_from(digests.len()).map_err(|_| Error::LengthOverflow)?;
         let root = table_root(kind, &digests)?;
-        let page_count = digests.len().div_ceil(MAX_DIGESTS_PER_PAGE);
-        u32::try_from(page_count).map_err(|_| Error::TooManyPages)?;
-
-        let mut pages = Vec::with_capacity(page_count);
-        let mut digests = digests.into_iter();
-        let mut first_digest_index = 0_u64;
-        for page_index in 0..page_count {
-            let page_digests: Vec<_> = digests.by_ref().take(MAX_DIGESTS_PER_PAGE).collect();
-            let count = u64::try_from(page_digests.len()).map_err(|_| Error::LengthOverflow)?;
-            pages.push(Page::new(
-                kind,
-                u32::try_from(page_index).map_err(|_| Error::TooManyPages)?,
-                first_digest_index,
-                page_digests,
-            )?);
-            first_digest_index = first_digest_index
-                .checked_add(count)
-                .ok_or(Error::DigestIndexOverflow)?;
-        }
+        let built = paged_table::build_pages(
+            digests,
+            MAX_DIGESTS_PER_PAGE,
+            |page_index, first_digest_index, page_digests| {
+                Page::new(kind, page_index, first_digest_index, page_digests)
+            },
+        )
+        .map_err(map_build_error)?;
 
         Ok(Self {
             kind,
-            digest_count,
+            digest_count: built.item_count,
             root,
-            pages,
+            pages: built.pages,
         })
     }
 
@@ -304,6 +292,16 @@ impl Table {
 
     pub fn digests(&self) -> impl Iterator<Item = &Digest> {
         self.pages.iter().flat_map(|page| page.digests.iter())
+    }
+}
+
+fn map_build_error(error: paged_table::BuildError<Error>) -> Error {
+    match error {
+        paged_table::BuildError::InvalidItemsPerPage
+        | paged_table::BuildError::ItemCountUnrepresentable => Error::LengthOverflow,
+        paged_table::BuildError::PageCountUnrepresentable => Error::TooManyPages,
+        paged_table::BuildError::ItemIndexOverflow => Error::DigestIndexOverflow,
+        paged_table::BuildError::InvalidPage(error) => error,
     }
 }
 
