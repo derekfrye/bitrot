@@ -26,7 +26,8 @@ The highest-value candidates are:
 
 | Current file | Approximate production lines | Recommendation |
 | --- | ---: | --- |
-| `src/sidecar.rs` | 210 | Extract logical assembly behind the facade |
+| `src/sidecar.rs` | 36 | Keep as the whole-sidecar public facade |
+| `src/sidecar/assemble.rs` | 186 | Keep logical assembly and its errors together |
 | `src/sidecar/read.rs` | 262 | Keep physical reading and read limits together |
 | `src/sidecar/write.rs` | 346 | Keep canonical writing and layout together for now |
 | `src/create/publish.rs` | 767 | Extract canonical streaming |
@@ -41,7 +42,7 @@ whether a split remains worthwhile.
 
 ## Recommended structural changes
 
-### Continue splitting whole-sidecar processing
+### Whole-sidecar processing is split by responsibility
 
 Whole-sidecar processing originally owned four distinct concerns:
 
@@ -50,15 +51,15 @@ Whole-sidecar processing originally owned four distinct concerns:
 - writing the canonical sidecar representation;
 - calculating the canonical physical layout.
 
-Canonical writing and physical-layout calculation now live together in
-`src/sidecar/write.rs`. Physical scanning, canonical read-limit derivation,
-damage diagnostics, and read errors live in `src/sidecar/read.rs`. Each group
-shares its internal policy and error handling closely enough that further
-splits are not currently useful. Their existing public paths remain unchanged
-through the facade.
+Logical reconciliation, assembly limits, and assembly errors now live in
+`src/sidecar/assemble.rs`. Canonical writing and physical-layout calculation
+live together in `src/sidecar/write.rs`. Physical scanning, canonical
+read-limit derivation, damage diagnostics, and read errors live in
+`src/sidecar/read.rs`. Each group shares its internal policy and error handling
+closely enough that further splits are not currently useful.
 
-The remaining production code in `sidecar.rs` owns the core public types,
-logical assembly, and the assembly error model. Finish the split toward:
+The facade in `sidecar.rs` owns the core `Sidecar` type and re-exports the
+public implementation types from this completed layout:
 
 ```text
 src/sidecar.rs
@@ -68,8 +69,8 @@ src/sidecar/write.rs
 src/sidecar/record_policy.rs
 ```
 
-The existing `sidecar::*` paths can be retained. Splitting the implementation
-does not require exposing all of the child modules.
+The existing `sidecar::*` paths have been retained without exposing the child
+modules.
 
 ### Publication workflows use publication names
 
@@ -266,13 +267,12 @@ Integration tests should complement rather than replace focused unit tests.
 
 ## Suggested order of work
 
-1. Extract logical sidecar assembly behind the existing public facade.
-2. Split `verify.rs` into source verification and displaced-location logic.
-3. Extract replacement platform machinery.
-4. Split the shared filesystem implementation behind its private facade if the
+1. Split `verify.rs` into source verification and displaced-location logic.
+2. Extract replacement platform machinery.
+3. Split the shared filesystem implementation behind its private facade if the
    operation-level moves confirm the proposed internal seams.
-5. Decide the pre-1.0 public module hierarchy and `creator` terminology.
-6. Organize core integration tests and repository documentation.
+4. Decide the pre-1.0 public module hierarchy and `creator` terminology.
+5. Organize core integration tests and repository documentation.
 
 Each step should be a behavior-preserving change with tests kept green. Avoid
 combining public API redesign with internal file movement in the same change;
