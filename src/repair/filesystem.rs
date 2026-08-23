@@ -5,8 +5,10 @@ use super::{Error as ReconstructionError, Options as ReconstructionOptions, Summ
 use crate::filesystem::temporary_name;
 use crate::filesystem::{
     CreateTemporaryError, Directory as DestinationDirectory, FileIdentity, FinishError,
-    TemporaryFile, TemporaryKind, cleanup_stale_temporaries as cleanup_stale, destination_parent,
-    finish_publication as finish_filesystem_publication, remove_file_if_same,
+    PublishedFileError, PublishedIdentityCheck, TemporaryFile, TemporaryKind,
+    cleanup_stale_temporaries as cleanup_stale, destination_parent,
+    finish_publication as finish_filesystem_publication, rollback_published_file,
+    verify_published_file,
 };
 use crate::sidecar::{ReadError as SidecarReadError, ReadLimits, Sidecar};
 use crate::verify::{self, LocateOptions, LocationSummary, SourceDigestState, SourceState};
@@ -238,16 +240,19 @@ fn verify_published(
     temporary: &File,
     sidecar: &Sidecar,
 ) -> Result<(), PublishedVerificationError> {
-    let mut published = directory
-        .open_read_no_follow(destination)
-        .map_err(PublishedVerificationError::Open)?;
-    let expected =
-        FileIdentity::capture(temporary).map_err(PublishedVerificationError::Metadata)?;
-    let actual = FileIdentity::capture(&published).map_err(PublishedVerificationError::Metadata)?;
-    if expected != actual {
-        return Err(PublishedVerificationError::IdentityChanged);
-    }
-    verify_intact(&mut published, sidecar).map_err(PublishedVerificationError::Verify)
+    verify_published_file(
+        directory,
+        destination,
+        temporary,
+        PublishedIdentityCheck::ExactSnapshot,
+        |published| verify_intact(published, sidecar),
+    )
+    .map_err(|error| match error {
+        PublishedFileError::Open(error) => PublishedVerificationError::Open(error),
+        PublishedFileError::Metadata(error) => PublishedVerificationError::Metadata(error),
+        PublishedFileError::IdentityChanged => PublishedVerificationError::IdentityChanged,
+        PublishedFileError::Content(error) => PublishedVerificationError::Verify(error),
+    })
 }
 
 fn rollback_failed_publication(
@@ -256,16 +261,8 @@ fn rollback_failed_publication(
     temporary: &File,
     verification: PublishedVerificationError,
 ) -> PublishError {
-    let rollback = remove_file_if_same(directory, destination, temporary, TemporaryKind::Repair)
-        .and_then(|removed| {
-            if removed {
-                directory.sync()
-            } else {
-                Err(io::Error::other(
-                    "published destination changed before rollback",
-                ))
-            }
-        });
+    let rollback =
+        rollback_published_file(directory, destination, temporary, TemporaryKind::Repair);
     match rollback {
         Ok(()) => PublishError::PublishedVerificationFailed(verification),
         Err(rollback) => PublishError::PublishedVerificationAndRollbackFailed {

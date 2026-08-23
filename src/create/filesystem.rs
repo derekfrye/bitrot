@@ -5,8 +5,10 @@ use super::{Error as BuildError, Options, analyze, build_metadata, encode_and_co
 use crate::creator::Creator;
 use crate::filesystem::{
     CreateTemporaryError, Directory as DestinationDirectory, FileIdentity, FinishError,
-    TemporaryFile, TemporaryKind, cleanup_stale_temporaries as cleanup_stale, destination_parent,
-    finish_publication as finish_filesystem_publication, remove_file_if_same,
+    PublishedFileError, PublishedIdentityCheck, TemporaryFile, TemporaryKind,
+    cleanup_stale_temporaries as cleanup_stale, destination_parent,
+    finish_publication as finish_filesystem_publication, rollback_published_file,
+    verify_published_file,
 };
 use crate::metadata::Metadata as ProtectionMetadata;
 use crate::record::{self, DecodeLimits, Record};
@@ -406,7 +408,12 @@ fn publish_temporary(
                 if let Err(failure) =
                     verify_published(directory, destination, &temporary.file, plan, summary)
                 {
-                    return Err(rollback_failed_publication(directory, destination, failure));
+                    return Err(rollback_failed_publication(
+                        directory,
+                        destination,
+                        &temporary.file,
+                        failure,
+                    ));
                 }
                 finish_publication(|| temporary.remove(), || directory.sync())?;
             }
@@ -426,7 +433,12 @@ fn publish_temporary(
             if let Err(failure) =
                 verify_published(directory, destination, &temporary.file, plan, summary)
             {
-                return Err(rollback_failed_publication(directory, destination, failure));
+                return Err(rollback_failed_publication(
+                    directory,
+                    destination,
+                    &temporary.file,
+                    failure,
+                ));
             }
             directory
                 .sync()
@@ -436,88 +448,42 @@ fn publish_temporary(
     Ok(true)
 }
 
-struct FailedPublishedVerification {
-    error: PublishedVerificationError,
-    published: Option<File>,
-}
-
 fn verify_published(
     directory: &DestinationDirectory,
     destination: &std::ffi::OsStr,
     temporary: &File,
     plan: &CanonicalPlan,
     summary: WriteSummary,
-) -> Result<(), FailedPublishedVerification> {
-    let mut published = directory
-        .open_read_no_follow(destination)
-        .map_err(|error| FailedPublishedVerification {
-            error: PublishedVerificationError::Open(error),
-            published: None,
-        })?;
-    let expected = match FileIdentity::capture(temporary) {
-        Ok(identity) => identity,
-        Err(error) => {
-            return Err(FailedPublishedVerification {
-                error: PublishedVerificationError::Metadata(error),
-                published: Some(published),
-            });
-        }
-    };
-    let actual = match FileIdentity::capture(&published) {
-        Ok(identity) => identity,
-        Err(error) => {
-            return Err(FailedPublishedVerification {
-                error: PublishedVerificationError::Metadata(error),
-                published: Some(published),
-            });
-        }
-    };
-    if !expected.same_entry(&actual) {
-        return Err(FailedPublishedVerification {
-            error: PublishedVerificationError::IdentityChanged,
-            published: Some(published),
-        });
-    }
-    if let Err(error) = verify_temporary(&mut published, plan, summary) {
-        return Err(FailedPublishedVerification {
-            error: PublishedVerificationError::Content(Box::new(error)),
-            published: Some(published),
-        });
-    }
-    Ok(())
+) -> Result<(), PublishedVerificationError> {
+    verify_published_file(
+        directory,
+        destination,
+        temporary,
+        PublishedIdentityCheck::SameEntry,
+        |published| verify_temporary(published, plan, summary),
+    )
+    .map_err(|error| match error {
+        PublishedFileError::Open(error) => PublishedVerificationError::Open(error),
+        PublishedFileError::Metadata(error) => PublishedVerificationError::Metadata(error),
+        PublishedFileError::IdentityChanged => PublishedVerificationError::IdentityChanged,
+        PublishedFileError::Content(error) => PublishedVerificationError::Content(Box::new(error)),
+    })
 }
 
 fn rollback_failed_publication(
     directory: &DestinationDirectory,
     destination: &std::ffi::OsStr,
-    failure: FailedPublishedVerification,
+    temporary: &File,
+    verification: PublishedVerificationError,
 ) -> PublishError {
-    let rollback = match failure.published {
-        Some(published) => remove_published_file(directory, destination, &published),
-        None => Err(io::Error::other(
-            "published sidecar could not be opened for identity-safe rollback",
-        )),
-    };
+    let rollback =
+        rollback_published_file(directory, destination, temporary, TemporaryKind::Sidecar);
     match rollback {
-        Ok(()) => PublishError::PublishedVerificationFailed(failure.error),
+        Ok(()) => PublishError::PublishedVerificationFailed(verification),
         Err(rollback) => PublishError::PublishedVerificationAndRollbackFailed {
-            verification: failure.error,
+            verification,
             rollback,
         },
-    }
-}
-
-fn remove_published_file(
-    directory: &DestinationDirectory,
-    destination: &std::ffi::OsStr,
-    published: &File,
-) -> io::Result<()> {
-    if remove_file_if_same(directory, destination, published, TemporaryKind::Sidecar)? {
-        directory.sync()
-    } else {
-        Err(io::Error::other(
-            "published sidecar disappeared before rollback",
-        ))
     }
 }
 
@@ -808,8 +774,70 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Barrier};
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox",
+        target_vendor = "apple"
+    ))]
+    use std::{
+        ffi::OsStr,
+        fs::FileTimes,
+        path::Path,
+        process::{Child, Command, Output, Stdio},
+        time::{Duration, Instant, UNIX_EPOCH},
+    };
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox",
+        target_vendor = "apple"
+    ))]
+    const PROCESS_SCENARIO_ENV: &str = "BITROT_TEST_PROCESS_SCENARIO";
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox",
+        target_vendor = "apple"
+    ))]
+    const PROCESS_SOURCE_ENV: &str = "BITROT_TEST_PROCESS_SOURCE";
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox",
+        target_vendor = "apple"
+    ))]
+    const PROCESS_DESTINATION_ENV: &str = "BITROT_TEST_PROCESS_DESTINATION";
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox",
+        target_vendor = "apple"
+    ))]
+    const PROCESS_START_ENV: &str = "BITROT_TEST_PROCESS_START";
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox",
+        target_vendor = "apple"
+    ))]
+    const PUBLISHED_EXIT: i32 = 40;
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox",
+        target_vendor = "apple"
+    ))]
+    const ALREADY_CURRENT_EXIT: i32 = 41;
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox",
+        target_vendor = "apple"
+    ))]
+    const ABRUPT_EXIT: i32 = 42;
 
     struct TestDirectory(PathBuf);
 
@@ -848,6 +876,135 @@ mod tests {
         (0..usize::try_from(MIN_CHUNK_SIZE).unwrap() + 173)
             .map(|index| index.wrapping_mul(37).to_le_bytes()[0])
             .collect()
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox",
+        target_vendor = "apple"
+    ))]
+    fn spawn_process_child(
+        scenario: &str,
+        source: &Path,
+        destination: &Path,
+        start: Option<&Path>,
+    ) -> Child {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg("create::filesystem::tests::filesystem_process_child")
+            .arg("--ignored")
+            .env(PROCESS_SCENARIO_ENV, scenario)
+            .env(PROCESS_SOURCE_ENV, source)
+            .env(PROCESS_DESTINATION_ENV, destination)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(start) = start {
+            command.env(PROCESS_START_ENV, start);
+        }
+        command.spawn().unwrap()
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox",
+        target_vendor = "apple"
+    ))]
+    fn wait_for_child(child: Child) -> Output {
+        child.wait_with_output().unwrap()
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox",
+        target_vendor = "apple"
+    ))]
+    fn assert_child_exit(output: &Output, expected: i32) {
+        assert_eq!(
+            output.status.code(),
+            Some(expected),
+            "unexpected child result; stdout: {}; stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox",
+        target_vendor = "apple"
+    ))]
+    fn partial_paths(directory: &Path) -> Vec<PathBuf> {
+        fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|name| name.contains(".bitrot-partial-"))
+            })
+            .collect()
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox",
+        target_vendor = "apple"
+    ))]
+    #[test]
+    #[ignore = "helper re-executed by process-boundary tests"]
+    fn filesystem_process_child() {
+        let Some(scenario) = std::env::var_os(PROCESS_SCENARIO_ENV) else {
+            return;
+        };
+        let source = PathBuf::from(std::env::var_os(PROCESS_SOURCE_ENV).unwrap());
+        let destination = PathBuf::from(std::env::var_os(PROCESS_DESTINATION_ENV).unwrap());
+
+        if scenario == "publish" {
+            let start = PathBuf::from(std::env::var_os(PROCESS_START_ENV).unwrap());
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !start.exists() {
+                assert!(Instant::now() < deadline, "process start barrier timed out");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let outcome =
+                publish(&source, &destination, &options(), ExistingSidecar::Preserve).unwrap();
+            std::process::exit(match outcome {
+                PublishOutcome::Published(_) => PUBLISHED_EXIT,
+                PublishOutcome::AlreadyCurrent => ALREADY_CURRENT_EXIT,
+            });
+        }
+
+        let bytes = fs::read(&source).unwrap();
+        let sidecar = super::super::build(&mut Cursor::new(bytes), &options()).unwrap();
+        let mut canonical = Vec::new();
+        sidecar.write_canonical(&mut canonical).unwrap();
+        let directory = DestinationDirectory::open(destination.parent().unwrap()).unwrap();
+        let destination_name = destination.file_name().unwrap();
+        let mut temporary =
+            create_temporary(&directory, destination_name, TemporaryKind::Sidecar).unwrap();
+        temporary.file.write_all(&canonical).unwrap();
+        temporary.file.flush().unwrap();
+        temporary.file.sync_all().unwrap();
+
+        // `exit` deliberately skips `TemporaryFile::drop`, modeling abrupt
+        // process death without relying on platform-specific signals.
+        match scenario.to_str().unwrap() {
+            "exit-before-publication" => std::process::exit(ABRUPT_EXIT),
+            "exit-after-publication" => {
+                directory
+                    .hard_link(temporary.name(), destination_name)
+                    .unwrap();
+                directory.sync().unwrap();
+                std::process::exit(ABRUPT_EXIT);
+            }
+            unexpected => panic!("unexpected process scenario: {unexpected}"),
+        }
     }
 
     #[test]
@@ -968,11 +1125,12 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(PublishError::PublishedVerificationFailed(
-                PublishedVerificationError::IdentityChanged
-            ))
+            Err(PublishError::PublishedVerificationAndRollbackFailed {
+                verification: PublishedVerificationError::IdentityChanged,
+                ..
+            })
         ));
-        assert!(!destination.exists());
+        assert_eq!(fs::read(&destination).unwrap(), b"substituted sidecar");
         drop(temporary);
         assert_eq!(fs::read(&temporary_path).unwrap(), b"substituted sidecar");
         assert_eq!(fs::read(&moved_temporary).unwrap(), canonical);
@@ -1098,6 +1256,97 @@ mod tests {
         assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 2);
     }
 
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox",
+        target_vendor = "apple"
+    ))]
+    #[test]
+    fn separate_process_publishers_install_exactly_once() {
+        const PUBLISHERS: usize = 4;
+
+        let directory = TestDirectory::new();
+        let source = directory.join("source.bin");
+        let destination = directory.join("source.bin.bitrot");
+        let start = directory.join("start-process-publishers");
+        fs::write(&source, source_bytes()).unwrap();
+        let children = (0..PUBLISHERS)
+            .map(|_| spawn_process_child("publish", &source, &destination, Some(&start)))
+            .collect::<Vec<_>>();
+        fs::write(&start, []).unwrap();
+
+        let outputs = children.into_iter().map(wait_for_child).collect::<Vec<_>>();
+        for output in &outputs {
+            assert!(
+                matches!(
+                    output.status.code(),
+                    Some(PUBLISHED_EXIT | ALREADY_CURRENT_EXIT)
+                ),
+                "publisher failed; stdout: {}; stderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert_eq!(
+            outputs
+                .iter()
+                .filter(|output| output.status.code() == Some(PUBLISHED_EXIT))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outputs
+                .iter()
+                .filter(|output| output.status.code() == Some(ALREADY_CURRENT_EXIT))
+                .count(),
+            PUBLISHERS - 1
+        );
+        fs::remove_file(start).unwrap();
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 2);
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox",
+        target_vendor = "apple"
+    ))]
+    #[test]
+    fn restart_recovers_from_process_exit_before_and_after_publication() {
+        for (scenario, should_publish) in [
+            ("exit-before-publication", true),
+            ("exit-after-publication", false),
+        ] {
+            let directory = TestDirectory::new();
+            let source = directory.join("source.bin");
+            let destination = directory.join("source.bin.bitrot");
+            fs::write(&source, source_bytes()).unwrap();
+
+            let output = wait_for_child(spawn_process_child(scenario, &source, &destination, None));
+            assert_child_exit(&output, ABRUPT_EXIT);
+            let partials = partial_paths(&directory.0);
+            assert_eq!(partials.len(), 1);
+            let partial = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&partials[0])
+                .unwrap();
+            partial
+                .set_times(FileTimes::new().set_modified(UNIX_EPOCH))
+                .unwrap();
+
+            let outcome =
+                publish(&source, &destination, &options(), ExistingSidecar::Preserve).unwrap();
+            assert_eq!(
+                matches!(outcome, PublishOutcome::Published(_)),
+                should_publish
+            );
+            assert!(partial_paths(&directory.0).is_empty());
+            assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 2);
+        }
+    }
+
     #[test]
     fn synchronizes_published_link_even_when_temporary_cleanup_fails() {
         let synchronized = Cell::new(false);
@@ -1185,8 +1434,13 @@ mod tests {
         fs::write(&stale_path, b"replacement that must survive").unwrap();
         let anchored = DestinationDirectory::open(&directory.0).unwrap();
 
-        let error = remove_file_if_same(&anchored, stale_name, &stale_file, TemporaryKind::Sidecar)
-            .unwrap_err();
+        let error = crate::filesystem::remove_file_if_same(
+            &anchored,
+            stale_name,
+            &stale_file,
+            TemporaryKind::Sidecar,
+        )
+        .unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::Other);
         assert_eq!(

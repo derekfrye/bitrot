@@ -718,6 +718,57 @@ pub(crate) fn remove_file_if_same(
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum PublishedIdentityCheck {
+    SameEntry,
+    ExactSnapshot,
+}
+
+#[derive(Debug)]
+pub(crate) enum PublishedFileError<E> {
+    Open(io::Error),
+    Metadata(io::Error),
+    IdentityChanged,
+    Content(E),
+}
+
+pub(crate) fn verify_published_file<E>(
+    directory: &Directory,
+    destination: &OsStr,
+    expected_file: &File,
+    identity_check: PublishedIdentityCheck,
+    verify_content: impl FnOnce(&mut File) -> Result<(), E>,
+) -> Result<(), PublishedFileError<E>> {
+    let mut published = directory
+        .open_read_no_follow(destination)
+        .map_err(PublishedFileError::Open)?;
+    let expected = FileIdentity::capture(expected_file).map_err(PublishedFileError::Metadata)?;
+    let actual = FileIdentity::capture(&published).map_err(PublishedFileError::Metadata)?;
+    let identity_matches = match identity_check {
+        PublishedIdentityCheck::SameEntry => expected.same_entry(&actual),
+        PublishedIdentityCheck::ExactSnapshot => expected == actual,
+    };
+    if !identity_matches {
+        return Err(PublishedFileError::IdentityChanged);
+    }
+    verify_content(&mut published).map_err(PublishedFileError::Content)
+}
+
+pub(crate) fn rollback_published_file(
+    directory: &Directory,
+    destination: &OsStr,
+    published_file: &File,
+    quarantine_kind: TemporaryKind,
+) -> io::Result<()> {
+    if remove_file_if_same(directory, destination, published_file, quarantine_kind)? {
+        directory.sync()
+    } else {
+        Err(io::Error::other(
+            "published destination changed before rollback",
+        ))
+    }
+}
+
 #[cfg(any(windows, test))]
 const fn same_windows_file_id(
     left_volume: Option<u32>,
