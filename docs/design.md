@@ -766,10 +766,28 @@ that it still identifies the verified inode, verifies the complete source again,
 removes the temporary name, and synchronizes the directory. A previously or
 concurrently published intact output is an idempotent success; every other
 existing object is preserved as a conflict. This operation never replaces or
-removes the damaged source. Transactional replacement with damaged-original
-retention remains a subsequent layer. Interrupted repair files use recognizable
-locked names; later repairs reclaim only old unlocked entries after moving them
-to a unique no-clobber quarantine name and confirming the moved inode.
+removes the damaged source.
+
+Transactional replacement is an explicit operation layered over safe
+repair-to-new-file publication. It prepares a verified sibling named
+`<source>.bitrot-replacement`, locks both source and repair inodes, rechecks
+their pathname identities, and atomically exchanges their names. The source
+pathname therefore always names either the damaged or repaired inode. After
+post-exchange identity and complete-content verification, the damaged inode is
+moved without replacement to `<source>.bitrot-damaged`; an existing backup is
+never overwritten. The containing directory is synchronized after the
+exchange and again after backup publication. Errors distinguish failures before
+replacement from failures after the repaired source was installed.
+
+The deterministic staging name is also a recovery marker. If interruption
+leaves an intact source and the damaged inode at the staging name, a later
+replacement invocation acquires both locks, verifies the state against the
+authenticated sidecar, and finishes the no-clobber backup move. An active
+transaction retains its inode locks and is not mistaken for abandoned work.
+Platforms or filesystems without atomic exchange fail before changing the
+source. Other interrupted repair files use recognizable locked names; later
+repairs reclaim only old unlocked entries after moving them to a unique
+no-clobber quarantine name and confirming the moved inode.
 
 ### Inspect and scrub
 

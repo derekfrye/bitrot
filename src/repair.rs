@@ -1,11 +1,13 @@
 //! Bounded-window reconstruction into a fresh seekable destination.
 
 mod filesystem;
+mod replace;
 
 pub use filesystem::{
     OutputVerificationError, PublishError, PublishOptions, PublishOutcome, PublishSummary,
     PublishedVerificationError, publish,
 };
+pub use replace::{ReplaceError, ReplaceOutcome, ReplaceSummary, damaged_backup_path, replace};
 
 use crate::coding::{self, CodingWindow, WindowDecoder};
 use crate::geometry::Geometry;
