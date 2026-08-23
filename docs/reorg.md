@@ -31,7 +31,8 @@ The highest-value candidates are:
 | `src/sidecar/read.rs` | 262 | Keep physical reading and read limits together |
 | `src/sidecar/write.rs` | 346 | Keep canonical writing and layout together for now |
 | `src/create/publish.rs` | 767 | Extract canonical streaming |
-| `src/verify.rs` | 810 | Separate ordinary verification from displaced-chunk location |
+| `src/verify.rs` | 641 | Extract source verification behind the facade |
+| `src/verify/locate.rs` | 181 | Keep displaced-chunk location together |
 | `src/repair/publish.rs` | 717 | Keep mostly cohesive |
 | `src/repair/replace.rs` | 743 | Extract platform-specific exchange and directory machinery |
 | `src/filesystem.rs` | 805 | Consider a lower-priority internal split behind a facade |
@@ -100,17 +101,22 @@ verification helpers. That code is a good candidate for
 Repair publication is more cohesive after the shared filesystem extraction.
 No further split is currently warranted unless a new responsibility develops.
 
-### Separate verification from displaced-chunk location
+### Continue separating verification workflows
 
-`src/verify.rs` contains two related but independently understandable
+Verification originally contained two related but independently understandable
 workflows:
 
 - verification of chunks at their canonical offsets;
 - rolling scans that locate intact chunks at unexpected offsets and refine an
   existing report.
 
-The second workflow has its own targeting, scanning, and report-update logic.
-A possible layout is:
+The displaced-chunk workflow, including its targeting, rolling scan, and
+report-update logic, now lives in `src/verify/locate.rs`. Its existing public
+API remains re-exported from the `verify` facade.
+
+The remaining `verify.rs` code owns the public report types and shared report
+validation, ordinary source verification, file stability checks, and the
+shared error model. Continue toward:
 
 ```text
 src/verify.rs
@@ -119,9 +125,9 @@ src/verify/locate.rs
 src/verify/file.rs
 ```
 
-`file.rs` would be an optional home for file snapshot and stability checks.
-If those checks remain small and tightly coupled to source verification, they
-can instead stay in `source.rs`. The existing `verify::*` API should remain a
+The file snapshot and stability checks serve both source verification and
+displaced location. Keep them in the facade unless extraction of `source.rs`
+reveals a narrower shared home. The existing `verify::*` API should remain a
 facade over these implementation modules.
 
 ### Isolate replacement platform machinery
@@ -267,7 +273,7 @@ Integration tests should complement rather than replace focused unit tests.
 
 ## Suggested order of work
 
-1. Split `verify.rs` into source verification and displaced-location logic.
+1. Extract source verification behind the existing `verify` facade.
 2. Extract replacement platform machinery.
 3. Split the shared filesystem implementation behind its private facade if the
    operation-level moves confirm the proposed internal seams.
