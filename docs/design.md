@@ -635,7 +635,11 @@ that wins the race is restored rather than deleted. Normal temporary cleanup
 uses the same quarantine protocol after success and on error, closing the
 identity-check-then-unlink window there as well. Verification reads the still-open
 temporary file, not a pathname that could have been substituted between close
-and reopen.
+and reopen. Linux, Android, Apple platforms, and Redox use native atomic
+no-replace rename for this protocol. Other targets fail cleanup explicitly
+rather than performing a racy unlink. Directory synchronization failures and
+platforms without a supported directory durability primitive are likewise
+reported after installation instead of being treated as durable success.
 
 ## Operations
 
@@ -667,8 +671,10 @@ fingerprint tables, and a constant number of chunks rather than the total
 redundancy size. Scratch data is removed after publication or error.
 
 An existing valid sidecar is not overwritten unless explicitly requested. A
-matching sidecar makes creation a successful no-op. A conflicting sidecar is
-reported and preserved. Concurrent default publishers are first-writer-wins;
+matching sidecar makes creation a successful no-op only when every authenticated
+recovery chunk is present; an incomplete set is a conflict. A conflicting
+sidecar is reported and preserved. Concurrent default publishers are
+first-writer-wins;
 concurrent explicit replacements are deliberately last-writer-wins.
 
 ### Verify
@@ -766,7 +772,10 @@ that it still identifies the verified inode, verifies the complete source again,
 removes the temporary name, and synchronizes the directory. A previously or
 concurrently published intact output is an idempotent success; every other
 existing object is preserved as a conflict. This operation never replaces or
-removes the damaged source.
+removes the damaged source. If post-publication verification fails, rollback
+first moves the destination to a unique no-clobber quarantine name, confirms
+the moved inode, and only then removes it; repair temporary cleanup uses the
+same protocol.
 
 Transactional replacement is an explicit operation layered over safe
 repair-to-new-file publication. It prepares a verified sibling named

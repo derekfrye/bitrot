@@ -17,11 +17,21 @@ use std::path::Path;
 #[cfg(not(any(unix, windows)))]
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox",
+    target_vendor = "apple"
+))]
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox",
+    target_vendor = "apple"
+))]
 const STALE_TEMPORARY_AGE: Duration = Duration::from_hours(24);
 const TEMPORARY_NAME_ATTEMPTS: u32 = 128;
 static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
@@ -161,7 +171,12 @@ impl Directory {
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox",
+        target_vendor = "apple"
+    ))]
     fn rename_no_replace(&self, source: &OsStr, destination: &OsStr) -> io::Result<()> {
         rustix::fs::renameat_with(
             &self.directory,
@@ -191,7 +206,10 @@ impl Directory {
         }
         #[cfg(not(unix))]
         {
-            Ok(())
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "destination-directory durability synchronization is unsupported on this platform",
+            ))
         }
     }
 }
@@ -254,7 +272,7 @@ impl FileIdentity {
         }
     }
 
-    pub(crate) const fn same_entry(&self, other: &Self) -> bool {
+    pub(crate) fn same_entry(&self, other: &Self) -> bool {
         #[cfg(unix)]
         {
             self.device == other.device && self.inode == other.inode
@@ -341,7 +359,12 @@ impl TemporaryKind {
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox",
+        target_vendor = "apple"
+    ))]
     const fn bytes(self) -> &'static [u8] {
         self.name().as_bytes()
     }
@@ -404,7 +427,12 @@ impl<'directory> TemporaryFile<'directory> {
     }
 
     pub(crate) fn remove(&mut self) -> io::Result<()> {
-        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "redox",
+            target_vendor = "apple"
+        ))]
         let result = quarantine_and_remove(
             self.directory,
             &self.destination_name,
@@ -412,12 +440,16 @@ impl<'directory> TemporaryFile<'directory> {
             &self.name,
             &self.file,
         );
-        #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-        let result = if path_names_file(self.directory, &self.name, &self.file)? {
-            self.directory.remove_file(&self.name).map(|()| true)
-        } else {
-            Ok(false)
-        };
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "redox",
+            target_vendor = "apple"
+        )))]
+        let result = Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "identity-safe temporary cleanup is unsupported on this platform",
+        ));
         self.armed = false;
         match result {
             Ok(true) => Ok(()),
@@ -438,7 +470,12 @@ impl Drop for TemporaryFile<'_> {
         if !self.armed {
             return;
         }
-        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "redox",
+            target_vendor = "apple"
+        ))]
         let _ = quarantine_and_remove(
             self.directory,
             &self.destination_name,
@@ -446,10 +483,13 @@ impl Drop for TemporaryFile<'_> {
             &self.name,
             &self.file,
         );
-        #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-        if path_names_file(self.directory, &self.name, &self.file).unwrap_or(false) {
-            let _ = self.directory.remove_file(&self.name);
-        }
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "redox",
+            target_vendor = "apple"
+        )))]
+        let _ = self;
     }
 }
 
@@ -461,7 +501,12 @@ pub(crate) fn cleanup_stale_temporaries(
     let Some(&quarantine_kind) = kinds.first() else {
         return Ok(());
     };
-    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox",
+        target_vendor = "apple"
+    ))]
     {
         use std::os::unix::ffi::OsStrExt as _;
 
@@ -500,12 +545,22 @@ pub(crate) fn cleanup_stale_temporaries(
             directory.sync()?;
         }
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox",
+        target_vendor = "apple"
+    )))]
     let _ = (directory, destination, quarantine_kind);
     Ok(())
 }
 
-#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox",
+    target_vendor = "apple"
+))]
 fn quarantine_and_remove(
     directory: &Directory,
     destination: &OsStr,
@@ -553,7 +608,12 @@ fn quarantine_and_remove(
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox",
+    target_vendor = "apple"
+))]
 fn is_temporary_name_for(candidate: &[u8], destination: &[u8], kinds: &[TemporaryKind]) -> bool {
     let Some(fields) = candidate
         .strip_prefix(destination)
@@ -575,7 +635,12 @@ fn is_temporary_name_for(candidate: &[u8], destination: &[u8], kinds: &[Temporar
         && is_lower_hex(nonce)
 }
 
-#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox",
+    target_vendor = "apple"
+))]
 fn is_lower_hex(value: &[u8]) -> bool {
     !value.is_empty()
         && value
@@ -629,18 +694,27 @@ pub(crate) fn remove_file_if_same(
     file: &File,
     quarantine_kind: TemporaryKind,
 ) -> io::Result<bool> {
-    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox",
+        target_vendor = "apple"
+    ))]
     {
         quarantine_and_remove(directory, name, quarantine_kind, name, file)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox",
+        target_vendor = "apple"
+    )))]
     {
-        let _ = quarantine_kind;
-        if !path_names_file(directory, name, file)? {
-            return Ok(false);
-        }
-        directory.remove_file(name)?;
-        Ok(true)
+        let _ = (directory, name, file, quarantine_kind);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "identity-safe file removal is unsupported on this platform",
+        ))
     }
 }
 

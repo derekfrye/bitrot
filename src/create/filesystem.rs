@@ -336,8 +336,17 @@ fn inspect_existing(
     let Ok(read) = Sidecar::read(file, limits) else {
         return Ok(Some(false));
     };
+    let recovery_is_complete = read
+        .sidecar
+        .recovery
+        .validate_complete(
+            read.sidecar.metadata.manifest,
+            read.sidecar.metadata.recovery_digests.digests().copied(),
+        )
+        .is_ok();
     Ok(Some(
         read.damage.is_empty()
+            && recovery_is_complete
             && read.sidecar.metadata.manifest.protection_set_id()
                 == expected.manifest.protection_set_id(),
     ))
@@ -860,6 +869,49 @@ mod tests {
         let second = publish(&source, &destination, &options(), ExistingSidecar::Preserve).unwrap();
         assert_eq!(second, PublishOutcome::AlreadyCurrent);
         assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn matching_but_incomplete_sidecar_is_a_conflict_not_a_no_op() {
+        let directory = TestDirectory::new();
+        let source = directory.join("movie.bin");
+        let destination = directory.join("movie.bin.bitrot");
+        let bytes = source_bytes();
+        fs::write(&source, &bytes).unwrap();
+        let opts = options();
+        let sidecar = super::super::build(&mut Cursor::new(bytes), &opts).unwrap();
+        let limits = ReadLimits::for_canonical_metadata(&sidecar.metadata).unwrap();
+        let mut canonical = Vec::new();
+        sidecar.write_canonical(&mut canonical).unwrap();
+        let mut reader = Cursor::new(canonical);
+        let mut incomplete = Vec::new();
+        let mut removed_recovery = false;
+        while let Some(record) = record::read(&mut reader, limits.record).unwrap() {
+            if record.record_type == recovery_chunk::RECORD_TYPE && !removed_recovery {
+                removed_recovery = true;
+                continue;
+            }
+            record::write(&mut incomplete, &record).unwrap();
+        }
+        assert!(removed_recovery);
+        let parsed = Sidecar::read(Cursor::new(&incomplete), limits).unwrap();
+        assert!(parsed.damage.is_empty());
+        assert_eq!(parsed.sidecar.recovery.missing_indexes().count(), 1);
+        fs::write(&destination, &incomplete).unwrap();
+
+        assert!(matches!(
+            publish(&source, &destination, &opts, ExistingSidecar::Preserve),
+            Err(PublishError::ExistingConflict)
+        ));
+        assert_eq!(fs::read(&destination).unwrap(), incomplete);
+
+        assert!(matches!(
+            publish(&source, &destination, &opts, ExistingSidecar::Replace).unwrap(),
+            PublishOutcome::Published(_)
+        ));
+        let repaired = Sidecar::read(File::open(&destination).unwrap(), limits).unwrap();
+        assert!(repaired.damage.is_empty());
+        assert_eq!(repaired.sidecar.recovery.missing_indexes().count(), 0);
     }
 
     #[test]

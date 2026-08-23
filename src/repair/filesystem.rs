@@ -6,7 +6,7 @@ use crate::filesystem::temporary_name;
 use crate::filesystem::{
     CreateTemporaryError, Directory as DestinationDirectory, FileIdentity, FinishError,
     TemporaryFile, TemporaryKind, cleanup_stale_temporaries as cleanup_stale, destination_parent,
-    finish_publication as finish_filesystem_publication, path_names_file,
+    finish_publication as finish_filesystem_publication, remove_file_if_same,
 };
 use crate::sidecar::{ReadError as SidecarReadError, ReadLimits, Sidecar};
 use crate::verify::{self, LocateOptions, LocationSummary, SourceDigestState, SourceState};
@@ -227,17 +227,16 @@ fn rollback_failed_publication(
     temporary: &File,
     verification: PublishedVerificationError,
 ) -> PublishError {
-    let rollback = path_names_file(directory, destination, temporary).and_then(|same| {
-        if same {
-            directory
-                .remove_file(destination)
-                .and_then(|()| directory.sync())
-        } else {
-            Err(io::Error::other(
-                "published destination changed before rollback",
-            ))
-        }
-    });
+    let rollback = remove_file_if_same(directory, destination, temporary, TemporaryKind::Repair)
+        .and_then(|removed| {
+            if removed {
+                directory.sync()
+            } else {
+                Err(io::Error::other(
+                    "published destination changed before rollback",
+                ))
+            }
+        });
     match rollback {
         Ok(()) => PublishError::PublishedVerificationFailed(verification),
         Err(rollback) => PublishError::PublishedVerificationAndRollbackFailed {
@@ -695,7 +694,7 @@ mod tests {
     use crate::create::{self, Options as CreateOptions};
     use crate::creator::Creator;
     use crate::geometry::{ChunkSize, MIN_CHUNK_SIZE, Redundancy};
-    use std::io::Cursor;
+    use std::io::{Cursor, Write as _};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Barrier};
@@ -946,6 +945,104 @@ mod tests {
         assert!(!destination_path.exists());
         assert!(!directory.has_partial());
         assert_eq!(directory.entry_count(), 2);
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox",
+        target_vendor = "apple"
+    ))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox",
+        target_vendor = "apple"
+    ))]
+    #[test]
+    fn rollback_preserves_a_substituted_destination() {
+        let directory = TestDirectory::new();
+        let destination = OsStr::new("movie.bin.repaired");
+        let anchored = DestinationDirectory::open(&directory.0).unwrap();
+        let mut temporary = create_temporary(&anchored, destination).unwrap();
+        temporary.file.write_all(b"verified repair").unwrap();
+        temporary.file.sync_all().unwrap();
+        anchored.hard_link(temporary.name(), destination).unwrap();
+        let moved_published = directory.join("moved-published-repair");
+        fs::rename(directory.0.join(destination), &moved_published).unwrap();
+        fs::write(
+            directory.0.join(destination),
+            b"replacement that must survive",
+        )
+        .unwrap();
+
+        let error = rollback_failed_publication(
+            &anchored,
+            destination,
+            &temporary.file,
+            PublishedVerificationError::IdentityChanged,
+        );
+
+        assert!(matches!(
+            error,
+            PublishError::PublishedVerificationAndRollbackFailed { .. }
+        ));
+        assert_eq!(
+            fs::read(directory.0.join(destination)).unwrap(),
+            b"replacement that must survive"
+        );
+        assert_eq!(fs::read(moved_published).unwrap(), b"verified repair");
+    }
+
+    #[test]
+    fn rollback_removes_the_exact_published_repair() {
+        let directory = TestDirectory::new();
+        let destination = OsStr::new("movie.bin.repaired");
+        let anchored = DestinationDirectory::open(&directory.0).unwrap();
+        let mut temporary = create_temporary(&anchored, destination).unwrap();
+        temporary.file.write_all(b"verified repair").unwrap();
+        temporary.file.sync_all().unwrap();
+        anchored.hard_link(temporary.name(), destination).unwrap();
+
+        let error = rollback_failed_publication(
+            &anchored,
+            destination,
+            &temporary.file,
+            PublishedVerificationError::IdentityChanged,
+        );
+
+        assert!(matches!(
+            error,
+            PublishError::PublishedVerificationFailed(PublishedVerificationError::IdentityChanged)
+        ));
+        assert!(!directory.0.join(destination).exists());
+        assert!(directory.0.join(temporary.name()).exists());
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox",
+        target_vendor = "apple"
+    ))]
+    #[test]
+    fn repair_temporary_cleanup_preserves_a_substituted_path() {
+        let directory = TestDirectory::new();
+        let destination = OsStr::new("movie.bin.repaired");
+        let anchored = DestinationDirectory::open(&directory.0).unwrap();
+        let mut temporary = create_temporary(&anchored, destination).unwrap();
+        temporary.file.write_all(b"repair temporary").unwrap();
+        let temporary_path = directory.0.join(temporary.name());
+        let moved_temporary = directory.join("moved-repair-temporary");
+        fs::rename(&temporary_path, &moved_temporary).unwrap();
+        fs::write(&temporary_path, b"replacement that must survive").unwrap();
+
+        assert!(temporary.remove().is_err());
+        assert_eq!(
+            fs::read(temporary_path).unwrap(),
+            b"replacement that must survive"
+        );
+        assert_eq!(fs::read(moved_temporary).unwrap(), b"repair temporary");
     }
 
     #[test]
