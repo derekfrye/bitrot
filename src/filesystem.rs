@@ -24,6 +24,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
     target_vendor = "apple"
 ))]
 use std::time::Duration;
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox",
+    target_vendor = "apple"
+))]
+use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(any(
@@ -33,6 +40,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
     target_vendor = "apple"
 ))]
 const STALE_TEMPORARY_AGE: Duration = Duration::from_hours(24);
+// Advisory locks follow an open file description across `fork`. A close-on-exec
+// descriptor can therefore remain locked briefly after its parent releases it.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox",
+    target_vendor = "apple"
+))]
+const STALE_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(1);
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox",
+    target_vendor = "apple"
+))]
+const STALE_LOCK_RETRY_TIMEOUT: Duration = Duration::from_millis(100);
 const TEMPORARY_NAME_ATTEMPTS: u32 = 128;
 static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
 
@@ -498,6 +521,15 @@ pub(crate) fn cleanup_stale_temporaries(
     destination: &OsStr,
     kinds: &[TemporaryKind],
 ) -> io::Result<()> {
+    cleanup_stale_temporaries_with_contention_hook(directory, destination, kinds, || {})
+}
+
+fn cleanup_stale_temporaries_with_contention_hook(
+    directory: &Directory,
+    destination: &OsStr,
+    kinds: &[TemporaryKind],
+    mut on_lock_contention: impl FnMut(),
+) -> io::Result<()> {
     let Some(&quarantine_kind) = kinds.first() else {
         return Ok(());
     };
@@ -511,35 +543,57 @@ pub(crate) fn cleanup_stale_temporaries(
         use std::os::unix::ffi::OsStrExt as _;
 
         let now = SystemTime::now();
+        let retry_deadline = Instant::now() + STALE_LOCK_RETRY_TIMEOUT;
         let mut removed = false;
-        for entry in directory.directory.entries()? {
-            let entry = entry?;
-            let name = entry.file_name();
-            if !is_temporary_name_for(name.as_bytes(), destination.as_bytes(), kinds) {
-                continue;
+        // Share one deadline across every contended entry so a genuinely active
+        // old producer cannot make cleanup wait without bound.
+        loop {
+            let mut contended = false;
+            for entry in directory.directory.entries()? {
+                let entry = entry?;
+                let name = entry.file_name();
+                if !is_temporary_name_for(name.as_bytes(), destination.as_bytes(), kinds) {
+                    continue;
+                }
+                let metadata = match directory.symlink_metadata(&name) {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error),
+                };
+                if !metadata.is_file()
+                    || metadata
+                        .identity
+                        .modified
+                        .and_then(|modified| now.duration_since(modified).ok())
+                        .is_none_or(|age| age < STALE_TEMPORARY_AGE)
+                {
+                    continue;
+                }
+                let file = match directory.open_read_write_no_follow(&name) {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error),
+                };
+                match file.try_lock() {
+                    Ok(()) => {}
+                    Err(TryLockError::WouldBlock) => {
+                        on_lock_contention();
+                        contended = true;
+                        continue;
+                    }
+                    Err(TryLockError::Error(error)) => return Err(error),
+                }
+                removed |=
+                    quarantine_and_remove(directory, destination, quarantine_kind, &name, &file)?;
             }
-            let metadata = directory.symlink_metadata(&name)?;
-            if !metadata.is_file()
-                || metadata
-                    .identity
-                    .modified
-                    .and_then(|modified| now.duration_since(modified).ok())
-                    .is_none_or(|age| age < STALE_TEMPORARY_AGE)
-            {
-                continue;
+            if !contended {
+                break;
             }
-            let file = match directory.open_read_write_no_follow(&name) {
-                Ok(file) => file,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
-            };
-            match file.try_lock() {
-                Ok(()) => {}
-                Err(TryLockError::WouldBlock) => continue,
-                Err(TryLockError::Error(error)) => return Err(error),
+            let instant = Instant::now();
+            if instant >= retry_deadline {
+                break;
             }
-            removed |=
-                quarantine_and_remove(directory, destination, quarantine_kind, &name, &file)?;
+            std::thread::sleep(STALE_LOCK_RETRY_INTERVAL.min(retry_deadline - instant));
         }
         if removed {
             directory.sync()?;
@@ -551,7 +605,7 @@ pub(crate) fn cleanup_stale_temporaries(
         target_os = "redox",
         target_vendor = "apple"
     )))]
-    let _ = (directory, destination, quarantine_kind);
+    let _ = (directory, destination, quarantine_kind, on_lock_contention);
     Ok(())
 }
 
@@ -805,6 +859,113 @@ pub(crate) fn finish_publication(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox",
+        target_vendor = "apple"
+    ))]
+    const INHERITED_LOCK_CHILD: &str = "filesystem::tests::inherited_lock_process_child";
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox",
+        target_vendor = "apple"
+    ))]
+    #[test]
+    #[ignore = "helper re-executed by the inherited-lock lifecycle test"]
+    fn inherited_lock_process_child() {
+        use std::io::Write as _;
+
+        let mut stdout = io::stdout().lock();
+        writeln!(stdout, "ready").unwrap();
+        stdout.flush().unwrap();
+        drop(stdout);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox",
+        target_vendor = "apple"
+    ))]
+    #[test]
+    fn stale_cleanup_handles_a_released_lock_inherited_during_process_spawn() {
+        use std::fs::{self, FileTimes, OpenOptions};
+        use std::io::BufRead as _;
+        use std::process::{Command, Stdio};
+
+        struct TestDirectory(std::path::PathBuf);
+
+        impl Drop for TestDirectory {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "bitrot-inherited-lock-test-{}-{}",
+            std::process::id(),
+            next_nonce()
+        ));
+        fs::create_dir(&path).unwrap();
+        let directory = TestDirectory(path);
+        let anchored = Directory::open(&directory.0).unwrap();
+        let destination = OsStr::new("output.bitrot");
+        let old = FileTimes::new().set_modified(UNIX_EPOCH);
+        let active_name = temporary_name(destination, TemporaryKind::Sidecar, 0, next_nonce());
+        let active_path = directory.0.join(&active_name);
+        let active_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&active_path)
+            .unwrap();
+        active_file.set_times(old).unwrap();
+        active_file.try_lock().unwrap();
+
+        // Passing a duplicate as standard input deterministically retains the
+        // same locked open file description in the child. The readiness message
+        // confirms that the parent releases its copy while the child holds one.
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(INHERITED_LOCK_CHILD)
+            .arg("--ignored")
+            .arg("--nocapture")
+            .stdin(Stdio::from(active_file.try_clone().unwrap()))
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut child_stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut readiness = String::new();
+        loop {
+            assert_ne!(child_stdout.read_line(&mut readiness).unwrap(), 0);
+            if readiness.contains("ready") {
+                break;
+            }
+            readiness.clear();
+        }
+
+        drop(active_file);
+        let mut observed_inherited_lock = false;
+        cleanup_stale_temporaries_with_contention_hook(
+            &anchored,
+            destination,
+            &[TemporaryKind::Sidecar],
+            || observed_inherited_lock = true,
+        )
+        .unwrap();
+        assert!(!active_path.exists());
+        assert!(
+            observed_inherited_lock,
+            "child process did not retain the inherited lock"
+        );
+        std::io::copy(&mut child_stdout, &mut io::sink()).unwrap();
+        assert!(child.wait().unwrap().success());
+    }
 
     #[cfg(unix)]
     #[test]
