@@ -221,10 +221,7 @@ fn verify_intact_with_snapshot_hook(
             verify::Error::SourceMetadataChanged,
         ));
     }
-    if report.state == SourceState::Intact
-        && report.source_digest == SourceDigestState::Match
-        && report.unavailable_data_chunks == 0
-    {
+    if report.is_intact() {
         Ok(())
     } else {
         Err(OutputVerificationError::Mismatch {

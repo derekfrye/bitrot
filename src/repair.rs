@@ -112,10 +112,7 @@ where
         .seek(SeekFrom::Start(0))
         .map_err(Error::DestinationSeek)?;
     let verified = verify::source(destination, sidecar).map_err(Error::OutputVerification)?;
-    if verified.state != SourceState::Intact
-        || verified.source_digest != SourceDigestState::Match
-        || verified.unavailable_data_chunks != 0
-    {
+    if !verified.is_intact() {
         return Err(Error::OutputMismatch {
             state: verified.state,
             source_digest: verified.source_digest,
@@ -206,13 +203,16 @@ where
         .try_reserve_exact(capacity)
         .map_err(Error::WorkspaceAllocation)?;
     for chunk in &report.chunks {
+        let layout = geometry
+            .data_chunk_layout(chunk.index)
+            .ok_or(Error::Report(verify::Error::ReportStructureMismatch))?;
         let base = match chunk.state {
-            ChunkState::Good => chunk_offset(chunk.index, geometry)?,
+            ChunkState::Good => layout.offset,
             ChunkState::UnexpectedlyLocated { offset } => offset,
             ChunkState::Corrupt | ChunkState::Missing | ChunkState::Unreadable(_) => continue,
         };
         let mut bytes = vec![0_u8; window_bytes];
-        let available = window_available(chunk.expected_len, window_offset, window_bytes)?;
+        let available = window_available(layout.len, window_offset, window_bytes)?;
         if available != 0 {
             let offset = base
                 .checked_add(u64::try_from(window_offset).map_err(|_| Error::SourceOffsetOverflow)?)
@@ -269,19 +269,20 @@ fn write_output_window<D: Write + Seek>(
 ) -> io::Result<()> {
     let index = u32::try_from(data_index)
         .map_err(|_| io::Error::other("data index is not representable"))?;
-    let expected_len = if index + 1 == geometry.data_chunks {
-        geometry.final_data_chunk_len
-    } else {
-        geometry.chunk_size.bytes()
-    };
-    let available = window_available(expected_len, window_offset, bytes.len())
+    let layout = geometry.data_chunk_layout(index).ok_or_else(|| {
+        io::Error::other(format!("data chunk index {index} is outside the geometry"))
+    })?;
+    let available = window_available(layout.len, window_offset, bytes.len())
         .map_err(|error| io::Error::other(error.to_string()))?;
     if available == 0 {
         return Ok(());
     }
-    let offset = chunk_offset(index, geometry)
-        .and_then(|base| {
-            base.checked_add(u64::try_from(window_offset).map_err(|_| Error::SourceOffsetOverflow)?)
+    let offset = u64::try_from(window_offset)
+        .map_err(|_| Error::SourceOffsetOverflow)
+        .and_then(|window_offset| {
+            layout
+                .offset
+                .checked_add(window_offset)
                 .ok_or(Error::SourceOffsetOverflow)
         })
         .map_err(|error| io::Error::other(error.to_string()))?;
@@ -296,12 +297,6 @@ fn window_available(
 ) -> Result<usize, Error> {
     let expected_len = usize::try_from(expected_len).map_err(|_| Error::LengthUnrepresentable)?;
     Ok(expected_len.saturating_sub(window_offset).min(window_bytes))
-}
-
-fn chunk_offset(index: u32, geometry: Geometry) -> Result<u64, Error> {
-    u64::from(index)
-        .checked_mul(u64::from(geometry.chunk_size.bytes()))
-        .ok_or(Error::SourceOffsetOverflow)
 }
 
 #[derive(Debug)]

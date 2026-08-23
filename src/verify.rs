@@ -101,6 +101,15 @@ pub struct LocationSummary {
 }
 
 impl Report {
+    /// Returns whether complete verification confirms the protected source
+    /// contents, including the whole-source digest.
+    #[must_use]
+    pub const fn is_intact(&self) -> bool {
+        matches!(self.state, SourceState::Intact)
+            && matches!(self.source_digest, SourceDigestState::Match)
+            && self.unavailable_data_chunks == 0
+    }
+
     #[must_use]
     pub const fn has_unexpected_length(&self) -> bool {
         self.expected_source_len != self.observed_source_len
@@ -864,6 +873,7 @@ mod tests {
         let sidecar = sidecar(&bytes);
         let report = source(&mut Cursor::new(bytes), &sidecar).unwrap();
 
+        assert!(report.is_intact());
         assert_eq!(report.state, SourceState::Intact);
         assert_eq!(report.source_digest, SourceDigestState::Match);
         assert_eq!(report.good_data_chunks, 3);
@@ -872,6 +882,16 @@ mod tests {
         assert_eq!(report.available_recovery_chunks, 1);
         assert_eq!(report.unavailable_recovery_chunks, 0);
         assert!(report.chunks.iter().all(|chunk| chunk.state.is_good()));
+
+        let mut wrong_state = report.clone();
+        wrong_state.state = SourceState::Repairable;
+        let mut wrong_digest = report.clone();
+        wrong_digest.source_digest = SourceDigestState::Mismatch;
+        let mut unavailable_chunk = report.clone();
+        unavailable_chunk.unavailable_data_chunks = 1;
+        assert!(!wrong_state.is_intact());
+        assert!(!wrong_digest.is_intact());
+        assert!(!unavailable_chunk.is_intact());
     }
 
     #[test]

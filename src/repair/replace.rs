@@ -308,10 +308,7 @@ fn require_intact(file: &mut File, sidecar: &Sidecar) -> Result<(), IntactError>
         .map_err(verify::Error::SourceSeek)
         .map_err(IntactError::Verify)?;
     let report = verify::source_file(file, sidecar).map_err(IntactError::Verify)?;
-    if report.state == SourceState::Intact
-        && report.source_digest == SourceDigestState::Match
-        && report.unavailable_data_chunks == 0
-    {
+    if report.is_intact() {
         Ok(())
     } else {
         Err(IntactError::Mismatch {

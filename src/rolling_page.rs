@@ -108,20 +108,20 @@ impl Page {
         if record.payload.len() < PAYLOAD_HEADER_LEN {
             return Err(Error::TruncatedPayload);
         }
-        let version = parse_u16(&record.payload, 0)?;
+        let payload = wire::Reader::new(&record.payload, || Error::TruncatedPayload);
+        let version = payload.u16(0)?;
         if version != PAYLOAD_VERSION {
             return Err(Error::UnsupportedPayloadVersion(version));
         }
-        if parse_u16(&record.payload, 2)? != 0 || parse_u32(&record.payload, 20)? != 0 {
+        if payload.u16(2)? != 0 || payload.u32(20)? != 0 {
             return Err(Error::ReservedField);
         }
-        let page_index = parse_u32(&record.payload, 4)?;
+        let page_index = payload.u32(4)?;
         if record.logical_id != u64::from(page_index) {
             return Err(Error::LogicalIdMismatch);
         }
-        let first_value_index = parse_u64(&record.payload, 8)?;
-        let count =
-            usize::try_from(parse_u32(&record.payload, 16)?).map_err(|_| Error::LengthOverflow)?;
+        let first_value_index = payload.u64(8)?;
+        let count = usize::try_from(payload.u32(16)?).map_err(|_| Error::LengthOverflow)?;
         validate_value_count(count)?;
         let value_bytes = count
             .checked_mul(size_of::<u64>())
@@ -493,18 +493,6 @@ fn validate_value_range(first: u64, count: usize) -> Result<(), Error> {
     let count = u64::try_from(count).map_err(|_| Error::LengthOverflow)?;
     first.checked_add(count).ok_or(Error::ValueIndexOverflow)?;
     Ok(())
-}
-
-fn parse_u16(bytes: &[u8], offset: usize) -> Result<u16, Error> {
-    wire::u16(bytes, offset).ok_or(Error::TruncatedPayload)
-}
-
-fn parse_u32(bytes: &[u8], offset: usize) -> Result<u32, Error> {
-    wire::u32(bytes, offset).ok_or(Error::TruncatedPayload)
-}
-
-fn parse_u64(bytes: &[u8], offset: usize) -> Result<u64, Error> {
-    wire::u64(bytes, offset).ok_or(Error::TruncatedPayload)
 }
 
 #[cfg(test)]

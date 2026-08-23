@@ -123,27 +123,28 @@ impl Superblock {
                 expected: PAYLOAD_LEN,
             });
         }
-        let version = parse_u16(&record.payload, 0)?;
+        let payload =
+            wire::Reader::new(&record.payload, || invalid_payload_length(&record.payload));
+        let version = payload.u16(0)?;
         if version != PAYLOAD_VERSION {
             return Err(Error::UnsupportedPayloadVersion(version));
         }
-        let required_features = parse_u16(&record.payload, 2)?;
+        let required_features = payload.u16(2)?;
         if required_features != 0 {
             return Err(Error::UnsupportedRequiredFeatures(required_features));
         }
-        if parse_u32(&record.payload, 4)? != 0 {
+        if payload.u32(4)? != 0 {
             return Err(Error::ReservedField);
         }
-        let first_manifest_offset = parse_u64(&record.payload, 8)?;
-        let second_manifest_offset = parse_u64(&record.payload, 16)?;
-        let observed_sidecar_len = parse_u64(&record.payload, 24)?;
+        let first_manifest_offset = payload.u64(8)?;
+        let second_manifest_offset = payload.u64(16)?;
+        let observed_sidecar_len = payload.u64(24)?;
         validate_hints(
             first_manifest_offset,
             second_manifest_offset,
             observed_sidecar_len,
         )?;
-        let manifest_commitment = wire::array(&record.payload, 32)
-            .ok_or_else(|| invalid_payload_length(&record.payload))?;
+        let manifest_commitment = payload.array(32)?;
         Ok(Self {
             protection_set_id: record.protection_set_id,
             first_manifest_offset,
@@ -317,18 +318,6 @@ fn manifest_commitment(manifest: Manifest) -> [u8; 32] {
     hasher.update(&record.protection_set_id);
     hasher.update(&record.payload);
     hasher.finalize().into()
-}
-
-fn parse_u16(bytes: &[u8], offset: usize) -> Result<u16, Error> {
-    wire::u16(bytes, offset).ok_or_else(|| invalid_payload_length(bytes))
-}
-
-fn parse_u32(bytes: &[u8], offset: usize) -> Result<u32, Error> {
-    wire::u32(bytes, offset).ok_or_else(|| invalid_payload_length(bytes))
-}
-
-fn parse_u64(bytes: &[u8], offset: usize) -> Result<u64, Error> {
-    wire::u64(bytes, offset).ok_or_else(|| invalid_payload_length(bytes))
 }
 
 fn invalid_payload_length(bytes: &[u8]) -> Error {

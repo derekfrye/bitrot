@@ -101,16 +101,17 @@ impl Creator {
         if record.payload.len() < PAYLOAD_HEADER_LEN {
             return Err(Error::TruncatedPayload);
         }
-        let version = parse_u16(&record.payload, 0)?;
+        let payload = wire::Reader::new(&record.payload, || Error::TruncatedPayload);
+        let version = payload.u16(0)?;
         if version != PAYLOAD_VERSION {
             return Err(Error::UnsupportedPayloadVersion(version));
         }
-        if parse_u16(&record.payload, 2)? != 0 || parse_u64(&record.payload, 8)? != 0 {
+        if payload.u16(2)? != 0 || payload.u64(8)? != 0 {
             return Err(Error::ReservedField);
         }
 
-        let implementation_len = usize::from(parse_u16(&record.payload, 4)?);
-        let version_len = usize::from(parse_u16(&record.payload, 6)?);
+        let implementation_len = usize::from(payload.u16(4)?);
+        let version_len = usize::from(payload.u16(6)?);
         let expected_len = PAYLOAD_HEADER_LEN
             .checked_add(implementation_len)
             .and_then(|len| len.checked_add(version_len))
@@ -306,14 +307,6 @@ fn validate_field(field: Field, value: &str) -> Result<(), Error> {
 
 fn parse_text(field: Field, bytes: &[u8]) -> Result<String, Error> {
     String::from_utf8(bytes.to_vec()).map_err(|_| Error::InvalidUtf8(field))
-}
-
-fn parse_u16(bytes: &[u8], offset: usize) -> Result<u16, Error> {
-    wire::u16(bytes, offset).ok_or(Error::TruncatedPayload)
-}
-
-fn parse_u64(bytes: &[u8], offset: usize) -> Result<u64, Error> {
-    wire::u64(bytes, offset).ok_or(Error::TruncatedPayload)
 }
 
 #[cfg(test)]

@@ -130,38 +130,28 @@ impl Manifest {
             });
         }
 
-        let version = parse_u16(&record.payload, 0)?;
+        let payload =
+            wire::Reader::new(&record.payload, || invalid_payload_length(&record.payload));
+        let version = payload.u16(0)?;
         if version != PAYLOAD_VERSION {
             return Err(Error::UnsupportedPayloadVersion(version));
         }
-        let required_features = parse_u16(&record.payload, 2)?;
+        let required_features = payload.u16(2)?;
         if required_features != 0 {
             return Err(Error::UnsupportedRequiredFeatures(required_features));
         }
-        validate_algorithm(
-            "coding",
-            parse_u16(&record.payload, 4)?,
-            CODING_LEOPARD_GF16,
-        )?;
-        validate_algorithm(
-            "strong hash",
-            parse_u16(&record.payload, 6)?,
-            STRONG_HASH_BLAKE3_256,
-        )?;
-        validate_algorithm(
-            "rolling",
-            parse_u16(&record.payload, 8)?,
-            ROLLING_CRC64_GO_ISO,
-        )?;
-        if parse_u16(&record.payload, 10)? != 0 || parse_u32(&record.payload, 36)? != 0 {
+        validate_algorithm("coding", payload.u16(4)?, CODING_LEOPARD_GF16)?;
+        validate_algorithm("strong hash", payload.u16(6)?, STRONG_HASH_BLAKE3_256)?;
+        validate_algorithm("rolling", payload.u16(8)?, ROLLING_CRC64_GO_ISO)?;
+        if payload.u16(10)? != 0 || payload.u32(36)? != 0 {
             return Err(Error::ReservedField);
         }
 
-        let chunk_size = ChunkSize::new(u64::from(parse_u32(&record.payload, 12)?))?;
-        let source_len = parse_u64(&record.payload, 16)?;
-        let data_chunks = parse_u32(&record.payload, 24)?;
-        let recovery_chunks = parse_u32(&record.payload, 28)?;
-        let final_data_chunk_len = parse_u32(&record.payload, 32)?;
+        let chunk_size = ChunkSize::new(u64::from(payload.u32(12)?))?;
+        let source_len = payload.u64(16)?;
+        let data_chunks = payload.u32(24)?;
+        let recovery_chunks = payload.u32(28)?;
+        let final_data_chunk_len = payload.u32(32)?;
         let geometry = Geometry::from_stored(
             source_len,
             chunk_size,
@@ -169,7 +159,7 @@ impl Manifest {
             recovery_chunks,
             final_data_chunk_len,
         )?;
-        let data_digest_count = parse_u64(&record.payload, 72)?;
+        let data_digest_count = payload.u64(72)?;
         if data_digest_count != u64::from(data_chunks) {
             return Err(Error::DigestCountMismatch {
                 kind: Kind::Data,
@@ -177,7 +167,7 @@ impl Manifest {
                 expected: u64::from(data_chunks),
             });
         }
-        let recovery_digest_count = parse_u64(&record.payload, 112)?;
+        let recovery_digest_count = payload.u64(112)?;
         if recovery_digest_count != u64::from(recovery_chunks) {
             return Err(Error::DigestCountMismatch {
                 kind: Kind::Recovery,
@@ -186,7 +176,7 @@ impl Manifest {
             });
         }
         let expected_rolling_count = geometry.full_data_chunks();
-        let rolling_count = parse_u64(&record.payload, 152)?;
+        let rolling_count = payload.u64(152)?;
         if rolling_count != expected_rolling_count {
             return Err(Error::RollingCountMismatch {
                 actual: rolling_count,
@@ -196,10 +186,10 @@ impl Manifest {
 
         let manifest = Self::from_validated_parts(
             geometry,
-            digest(&record.payload, 40)?,
-            digest(&record.payload, 80)?,
-            digest(&record.payload, 120)?,
-            digest(&record.payload, 160)?,
+            Digest::from_bytes(payload.array(40)?),
+            Digest::from_bytes(payload.array(80)?),
+            Digest::from_bytes(payload.array(120)?),
+            Digest::from_bytes(payload.array(160)?),
         );
         if record.protection_set_id != manifest.protection_set_id {
             return Err(Error::ProtectionSetIdMismatch {
@@ -294,24 +284,6 @@ fn validate_algorithm(name: &'static str, actual: u16, expected: u16) -> Result<
     } else {
         Err(Error::UnsupportedAlgorithm { name, actual })
     }
-}
-
-fn parse_u16(bytes: &[u8], offset: usize) -> Result<u16, Error> {
-    wire::u16(bytes, offset).ok_or_else(|| invalid_payload_length(bytes))
-}
-
-fn parse_u32(bytes: &[u8], offset: usize) -> Result<u32, Error> {
-    wire::u32(bytes, offset).ok_or_else(|| invalid_payload_length(bytes))
-}
-
-fn parse_u64(bytes: &[u8], offset: usize) -> Result<u64, Error> {
-    wire::u64(bytes, offset).ok_or_else(|| invalid_payload_length(bytes))
-}
-
-fn digest(bytes: &[u8], offset: usize) -> Result<Digest, Error> {
-    wire::array(bytes, offset)
-        .map(Digest::from_bytes)
-        .ok_or_else(|| invalid_payload_length(bytes))
 }
 
 fn invalid_payload_length(bytes: &[u8]) -> Error {
@@ -712,7 +684,7 @@ mod tests {
         changed_source.payload[40] ^= 1;
         changed_source.protection_set_id = set_id(
             manifest.geometry(),
-            digest(&changed_source.payload, 40).unwrap(),
+            Digest::from_bytes(wire::array(&changed_source.payload, 40).unwrap()),
             manifest.data_table_root(),
         );
         let changed_source = Manifest::from_record(&changed_source).unwrap();
@@ -726,7 +698,7 @@ mod tests {
         changed_root.protection_set_id = set_id(
             manifest.geometry(),
             manifest.source_digest(),
-            digest(&changed_root.payload, 80).unwrap(),
+            Digest::from_bytes(wire::array(&changed_root.payload, 80).unwrap()),
         );
         let changed_root = Manifest::from_record(&changed_root).unwrap();
         assert_ne!(

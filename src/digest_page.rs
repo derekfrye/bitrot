@@ -147,7 +147,8 @@ impl Page {
             return Err(Error::TruncatedPayload);
         }
 
-        let version = parse_u16(&record.payload, 0)?;
+        let payload = wire::Reader::new(&record.payload, || Error::TruncatedPayload);
+        let version = payload.u16(0)?;
         if version != PAYLOAD_VERSION {
             return Err(Error::UnsupportedPayloadVersion(version));
         }
@@ -155,11 +156,11 @@ impl Page {
         if record.payload[3] != 0 {
             return Err(Error::ReservedField);
         }
-        let page_index = parse_u32(&record.payload, 4)?;
-        let first_digest_index = parse_u64(&record.payload, 8)?;
-        let count = parse_u32(&record.payload, 16)? as usize;
+        let page_index = payload.u32(4)?;
+        let first_digest_index = payload.u64(8)?;
+        let count = payload.u32(16)? as usize;
         validate_digest_count(count)?;
-        if parse_u32(&record.payload, 20)? != 0 {
+        if payload.u32(20)? != 0 {
             return Err(Error::ReservedField);
         }
         if record.logical_id != logical_id(kind, page_index) {
@@ -574,18 +575,6 @@ fn validate_digest_range(first_digest_index: u64, count: usize) -> Result<(), Er
         .checked_add(u64::try_from(count).map_err(|_| Error::LengthOverflow)?)
         .ok_or(Error::DigestIndexOverflow)?;
     Ok(())
-}
-
-fn parse_u16(bytes: &[u8], offset: usize) -> Result<u16, Error> {
-    wire::u16(bytes, offset).ok_or(Error::TruncatedPayload)
-}
-
-fn parse_u32(bytes: &[u8], offset: usize) -> Result<u32, Error> {
-    wire::u32(bytes, offset).ok_or(Error::TruncatedPayload)
-}
-
-fn parse_u64(bytes: &[u8], offset: usize) -> Result<u64, Error> {
-    wire::u64(bytes, offset).ok_or(Error::TruncatedPayload)
 }
 
 #[cfg(test)]

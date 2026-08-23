@@ -117,43 +117,36 @@ impl RecoveryChunk {
             return Err(Error::TruncatedPayload);
         }
 
-        let version = parse_u16(&record.payload, 0)?;
+        let payload = wire::Reader::new(&record.payload, || Error::TruncatedPayload);
+        let version = payload.u16(0)?;
         if version != PAYLOAD_VERSION {
             return Err(Error::UnsupportedPayloadVersion(version));
         }
-        let coding_algorithm = parse_u16(&record.payload, 2)?;
+        let coding_algorithm = payload.u16(2)?;
         if coding_algorithm != CODING_LEOPARD_GF16 {
             return Err(Error::UnsupportedCodingAlgorithm(coding_algorithm));
         }
 
-        let recovery_index = parse_u32(&record.payload, 4)?;
+        let recovery_index = payload.u32(4)?;
         validate_index(manifest, recovery_index)?;
         if record.logical_id != u64::from(recovery_index) {
             return Err(Error::LogicalIdMismatch);
         }
 
         let geometry = manifest.geometry();
-        validate_field(
-            "data chunk count",
-            parse_u32(&record.payload, 8)?,
-            geometry.data_chunks,
-        )?;
+        validate_field("data chunk count", payload.u32(8)?, geometry.data_chunks)?;
         validate_field(
             "recovery chunk count",
-            parse_u32(&record.payload, 12)?,
+            payload.u32(12)?,
             geometry.recovery_chunks,
         )?;
-        validate_field(
-            "chunk size",
-            parse_u32(&record.payload, 16)?,
-            geometry.chunk_size.bytes(),
-        )?;
+        validate_field("chunk size", payload.u32(16)?, geometry.chunk_size.bytes())?;
         validate_field(
             "logical length",
-            parse_u32(&record.payload, 20)?,
+            payload.u32(20)?,
             geometry.chunk_size.bytes(),
         )?;
-        if parse_u64(&record.payload, 24)? != 0 {
+        if payload.u64(24)? != 0 {
             return Err(Error::ReservedField);
         }
 
@@ -282,18 +275,6 @@ fn validate_field(field: &'static str, actual: u32, expected: u32) -> Result<(),
             expected,
         })
     }
-}
-
-fn parse_u16(bytes: &[u8], offset: usize) -> Result<u16, Error> {
-    wire::u16(bytes, offset).ok_or(Error::TruncatedPayload)
-}
-
-fn parse_u32(bytes: &[u8], offset: usize) -> Result<u32, Error> {
-    wire::u32(bytes, offset).ok_or(Error::TruncatedPayload)
-}
-
-fn parse_u64(bytes: &[u8], offset: usize) -> Result<u64, Error> {
-    wire::u64(bytes, offset).ok_or(Error::TruncatedPayload)
 }
 
 #[cfg(test)]

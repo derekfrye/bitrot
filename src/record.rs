@@ -209,17 +209,18 @@ pub fn read<R: Read>(reader: &mut R, limits: DecodeLimits) -> Result<Option<Reco
 
     let mut remainder = [0_u8; BASE_HEADER_LEN as usize - MAGIC.len()];
     read_exact_record(reader, &mut remainder)?;
+    let fields = wire::Reader::new(&remainder, || Error::Truncated);
 
-    let version = parse_u16(&remainder, 0)?;
+    let version = fields.u16(0)?;
     if version != FORMAT_VERSION {
         return Err(Error::UnsupportedVersion(version));
     }
 
-    let record_type = parse_u16(&remainder, 2)?;
-    let flags = parse_u32(&remainder, 4)?;
+    let record_type = fields.u16(2)?;
+    let flags = fields.u32(4)?;
     validate_type_and_flags(record_type, flags)?;
 
-    let header_len = parse_u32(&remainder, 8)?;
+    let header_len = fields.u32(8)?;
     if header_len < BASE_HEADER_LEN {
         return Err(Error::InvalidHeaderLength(header_len));
     }
@@ -230,12 +231,12 @@ pub fn read<R: Read>(reader: &mut R, limits: DecodeLimits) -> Result<Option<Reco
         });
     }
 
-    let reserved = parse_u32(&remainder, 12)?;
+    let reserved = fields.u32(12)?;
     if reserved != 0 {
         return Err(Error::ReservedField(reserved));
     }
 
-    let payload_len = parse_u64(&remainder, 16)?;
+    let payload_len = fields.u64(16)?;
     if payload_len > limits.max_payload_len {
         return Err(Error::PayloadTooLarge {
             actual: payload_len,
@@ -245,7 +246,7 @@ pub fn read<R: Read>(reader: &mut R, limits: DecodeLimits) -> Result<Option<Reco
 
     let mut protection_set_id = [0_u8; 32];
     protection_set_id.copy_from_slice(&remainder[24..56]);
-    let logical_id = parse_u64(&remainder, 56)?;
+    let logical_id = fields.u64(56)?;
 
     let extension_len =
         usize::try_from(header_len - BASE_HEADER_LEN).map_err(|_| Error::LengthOverflow)?;
@@ -326,18 +327,6 @@ fn read_exact_record<R: Read>(reader: &mut R, buffer: &mut [u8]) -> Result<(), E
             Error::Io(error)
         }
     })
-}
-
-fn parse_u16(bytes: &[u8], offset: usize) -> Result<u16, Error> {
-    wire::u16(bytes, offset).ok_or(Error::Truncated)
-}
-
-fn parse_u32(bytes: &[u8], offset: usize) -> Result<u32, Error> {
-    wire::u32(bytes, offset).ok_or(Error::Truncated)
-}
-
-fn parse_u64(bytes: &[u8], offset: usize) -> Result<u64, Error> {
-    wire::u64(bytes, offset).ok_or(Error::Truncated)
 }
 
 #[cfg(test)]
