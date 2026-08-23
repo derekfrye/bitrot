@@ -29,6 +29,7 @@ dependencies = [
  "crc",
  "libc",
  "reed-solomon-simd",
+ "rustix",
 ]
 
 [[package]]

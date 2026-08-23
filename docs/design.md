@@ -621,8 +621,12 @@ falling back to a racy existence check. Creation must never publish a partial
 sidecar. Recovery spools and unpublished sidecars use recognizable partial-file
 names and hold advisory locks for their lifetime. A later creator may remove an
 old partial only after acquiring its lock and confirming that the pathname still
-identifies the opened inode. Verification reads the still-open temporary file,
-not a pathname that could have been substituted between close and reopen.
+identifies the opened inode. On supported Unix platforms, cleanup first moves a
+candidate to a unique no-clobber quarantine name, verifies that moved entry
+against the locked descriptor, and only then removes it. A pathname replacement
+that wins the race is restored rather than deleted. Verification reads the
+still-open temporary file, not a pathname that could have been substituted
+between close and reopen.
 
 ## Operations
 

@@ -21,11 +21,11 @@ use std::path::Path;
 #[cfg(not(any(unix, windows)))]
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 const STALE_TEMPORARY_AGE: Duration = Duration::from_hours(24);
 static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
 
@@ -460,7 +460,7 @@ impl DestinationDirectory {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     fn open_read_write_no_follow(&self, name: &std::ffi::OsStr) -> io::Result<File> {
         let mut options = DirectoryOpenOptions::new();
         options.read(true).write(true);
@@ -530,6 +530,22 @@ impl DestinationDirectory {
                 self.ambient_path.join(destination),
             )
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    fn rename_no_replace(
+        &self,
+        source: &std::ffi::OsStr,
+        destination: &std::ffi::OsStr,
+    ) -> io::Result<()> {
+        rustix::fs::renameat_with(
+            &self.directory,
+            source,
+            &self.directory,
+            destination,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .map_err(io::Error::from)
     }
 
     fn remove_file(&self, name: &std::ffi::OsStr) -> io::Result<()> {
@@ -643,12 +659,7 @@ fn create_temporary<'directory>(
         .as_nanos();
     for _ in 0_u32..128 {
         let nonce = NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed);
-        let mut temporary_name = OsString::from(destination_name);
-        temporary_name.push(format!(
-            ".bitrot-partial-{}-{}-{epoch_nonce:x}-{nonce:x}",
-            std::process::id(),
-            kind.name()
-        ));
+        let temporary_name = temporary_name(destination_name, kind, epoch_nonce, nonce);
         match directory.create_new(&temporary_name) {
             Ok(file) => {
                 file.try_lock().map_err(|error| match error {
@@ -664,7 +675,22 @@ fn create_temporary<'directory>(
     Err(PublishError::TemporaryNameExhausted)
 }
 
-#[cfg(unix)]
+fn temporary_name(
+    destination_name: &std::ffi::OsStr,
+    kind: TemporaryKind,
+    epoch_nonce: u128,
+    nonce: u64,
+) -> OsString {
+    let mut temporary_name = OsString::from(destination_name);
+    temporary_name.push(format!(
+        ".bitrot-partial-{}-{}-{epoch_nonce:x}-{nonce:x}",
+        std::process::id(),
+        kind.name()
+    ));
+    temporary_name
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 fn cleanup_stale_temporaries(
     directory: &DestinationDirectory,
     destination_name: &std::ffi::OsStr,
@@ -707,19 +733,8 @@ fn cleanup_stale_temporaries(
                 return Err(PublishError::CleanupTemporaries(error));
             }
         }
-        let open_metadata = file.metadata().map_err(PublishError::CleanupTemporaries)?;
-        let path_metadata = match directory.symlink_metadata(&name) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(PublishError::CleanupTemporaries(error)),
-        };
-        if !same_entry_identity(&open_metadata, &path_metadata) {
-            continue;
-        }
-        directory
-            .remove_file(&name)
+        removed |= quarantine_and_remove_stale(directory, destination_name, &name, &file)
             .map_err(PublishError::CleanupTemporaries)?;
-        removed = true;
     }
 
     if removed {
@@ -728,7 +743,63 @@ fn cleanup_stale_temporaries(
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn quarantine_and_remove_stale(
+    directory: &DestinationDirectory,
+    destination_name: &std::ffi::OsStr,
+    original_name: &std::ffi::OsStr,
+    opened_file: &File,
+) -> io::Result<bool> {
+    let epoch_nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut quarantine_name = None;
+    for _ in 0_u32..128 {
+        let nonce = NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed);
+        let candidate =
+            temporary_name(destination_name, TemporaryKind::Sidecar, epoch_nonce, nonce);
+        match directory.rename_no_replace(original_name, &candidate) {
+            Ok(()) => {
+                quarantine_name = Some(candidate);
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        }
+    }
+    let Some(quarantine_name) = quarantine_name else {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "cannot reserve a stale-temporary quarantine name",
+        ));
+    };
+
+    let open_metadata = opened_file.metadata()?;
+    let moved_metadata = directory.symlink_metadata(&quarantine_name)?;
+    if moved_metadata.is_file() && same_entry_identity(&open_metadata, &moved_metadata) {
+        directory.remove_file(&quarantine_name)?;
+        return Ok(true);
+    }
+
+    match directory.rename_no_replace(&quarantine_name, original_name) {
+        Ok(()) => Err(io::Error::other(
+            "stale temporary pathname changed during cleanup; replacement was restored",
+        )),
+        Err(restore_error) => {
+            let quarantine_name = Path::new(&quarantine_name).display();
+            Err(io::Error::new(
+                restore_error.kind(),
+                format!(
+                    "stale temporary pathname changed during cleanup; replacement remains at {quarantine_name}: {restore_error}"
+                ),
+            ))
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 fn is_temporary_name_for(candidate: &[u8], destination: &[u8]) -> bool {
     let Some(suffix) = candidate.strip_prefix(destination) else {
         return false;
@@ -757,7 +828,7 @@ fn is_temporary_name_for(candidate: &[u8], destination: &[u8]) -> bool {
         && is_lower_hex(nonce)
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 fn is_lower_hex(value: &[u8]) -> bool {
     !value.is_empty()
         && value
@@ -765,7 +836,7 @@ fn is_lower_hex(value: &[u8]) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
 fn cleanup_stale_temporaries(
     _directory: &DestinationDirectory,
     _destination_name: &std::ffi::OsStr,
@@ -1296,7 +1367,7 @@ mod tests {
         assert_eq!(sync.to_string(), "injected synchronization failure");
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     #[test]
     fn removes_old_unlocked_partials_but_preserves_locked_ones() {
         use std::fs::FileTimes;
@@ -1330,6 +1401,37 @@ mod tests {
         drop(active_file);
         cleanup_stale_temporaries(&anchored, destination.file_name().unwrap()).unwrap();
         assert!(!active.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn stale_cleanup_restores_a_substituted_path_instead_of_deleting_it() {
+        let directory = TestDirectory::new();
+        let destination_name = std::ffi::OsStr::new("source.bin.bitrot");
+        let stale_name =
+            std::ffi::OsStr::new("source.bin.bitrot.bitrot-partial-999999-sidecar-0-1");
+        let stale_path = directory.0.join(stale_name);
+        fs::write(&stale_path, b"stale partial").unwrap();
+        let stale_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&stale_path)
+            .unwrap();
+        let moved_stale = directory.join("moved-stale-partial");
+        fs::rename(&stale_path, &moved_stale).unwrap();
+        fs::write(&stale_path, b"replacement that must survive").unwrap();
+        let anchored = DestinationDirectory::open(&directory.0).unwrap();
+
+        let error =
+            quarantine_and_remove_stale(&anchored, destination_name, stale_name, &stale_file)
+                .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(
+            fs::read(&stale_path).unwrap(),
+            b"replacement that must survive"
+        );
+        assert_eq!(fs::read(&moved_stale).unwrap(), b"stale partial");
     }
 
     #[test]

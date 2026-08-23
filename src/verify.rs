@@ -5,8 +5,10 @@ use crate::fingerprint;
 use crate::rolling::{self, Locator, ScanSummary, Target};
 use crate::sidecar::Sidecar;
 use std::fmt;
+use std::fs::{File, Metadata};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::ops::ControlFlow;
+use std::time::SystemTime;
 
 /// Verification state of one data chunk at its expected source offset.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -178,6 +180,26 @@ pub fn source<R: Read + Seek>(reader: &mut R, sidecar: &Sidecar) -> Result<Repor
     })
 }
 
+/// Verifies an open file and rejects metadata-visible concurrent mutation.
+///
+/// In addition to the length checks performed by [`source`], this snapshots
+/// the file's identity, modification time, and (on Unix) status-change time
+/// around the complete operation. This is the preferred entry point for real
+/// files because same-length writes are otherwise invisible to a generic
+/// [`Read`] + [`Seek`] interface.
+///
+/// The check detects ordinary concurrent filesystem writers; it is not a lock
+/// and cannot provide snapshot isolation against a writer able to conceal its
+/// metadata changes.
+///
+/// # Errors
+///
+/// Returns the errors documented by [`source`], a file metadata error, or
+/// [`Error::SourceMetadataChanged`] when the file changed during verification.
+pub fn source_file(file: &mut File, sidecar: &Sidecar) -> Result<Report, Error> {
+    with_stable_file(file, |file| source(file, sidecar))
+}
+
 /// Refines an expected-offset report by finding intact full chunks elsewhere.
 ///
 /// Only chunks previously classified as [`ChunkState::Corrupt`] or
@@ -266,6 +288,95 @@ pub fn locate_displaced<R: Read + Seek>(
         located_chunks,
         scan,
     })
+}
+
+/// Locates displaced chunks in an open file while checking for concurrent
+/// metadata-visible mutation.
+///
+/// This is the file-native counterpart to [`locate_displaced`] and should be
+/// used when the source is a real file.
+///
+/// # Errors
+///
+/// Returns the errors documented by [`locate_displaced`], a file metadata
+/// error, or [`Error::SourceMetadataChanged`] when the file changes during the
+/// scan.
+pub fn locate_displaced_file(
+    file: &mut File,
+    sidecar: &Sidecar,
+    report: &mut Report,
+    options: LocateOptions,
+) -> Result<LocationSummary, Error> {
+    with_stable_file(file, |file| {
+        locate_displaced(file, sidecar, report, options)
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FileSnapshot {
+    len: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+    #[cfg(windows)]
+    volume_serial_number: Option<u32>,
+    #[cfg(windows)]
+    file_index: Option<u64>,
+    #[cfg(windows)]
+    last_write_time: u64,
+}
+
+impl FileSnapshot {
+    fn capture(file: &File) -> Result<Self, Error> {
+        file.metadata()
+            .map(|metadata| Self::from_metadata(&metadata))
+            .map_err(Error::SourceMetadata)
+    }
+
+    fn from_metadata(metadata: &Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt as _;
+        #[cfg(windows)]
+        use std::os::windows::fs::MetadataExt as _;
+
+        Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(unix)]
+            changed_seconds: metadata.ctime(),
+            #[cfg(unix)]
+            changed_nanoseconds: metadata.ctime_nsec(),
+            #[cfg(windows)]
+            volume_serial_number: metadata.volume_serial_number(),
+            #[cfg(windows)]
+            file_index: metadata.file_index(),
+            #[cfg(windows)]
+            last_write_time: metadata.last_write_time(),
+        }
+    }
+}
+
+fn with_stable_file<T>(
+    file: &mut File,
+    operation: impl FnOnce(&mut File) -> Result<T, Error>,
+) -> Result<T, Error> {
+    let before = FileSnapshot::capture(file)?;
+    let value = operation(file)?;
+    let after = FileSnapshot::capture(file)?;
+    if before != after {
+        return Err(Error::SourceMetadataChanged);
+    }
+    Ok(value)
 }
 
 pub(crate) fn validate_report(sidecar: &Sidecar, report: &Report) -> Result<(), Error> {
@@ -574,8 +685,10 @@ fn increment(value: u32) -> Result<u32, Error> {
 #[derive(Debug)]
 pub enum Error {
     SourceSeek(io::Error),
+    SourceMetadata(io::Error),
     TrailingRead(io::Error),
     SourceChanged { before: u64, after: u64 },
+    SourceMetadataChanged,
     SourceChangedDuringLocation,
     ReportProtectionSetMismatch,
     ReportStructureMismatch,
@@ -593,11 +706,17 @@ impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::SourceSeek(error) => write!(formatter, "source positioning failed: {error}"),
+            Self::SourceMetadata(error) => {
+                write!(formatter, "cannot inspect source file metadata: {error}")
+            }
             Self::TrailingRead(error) => write!(formatter, "trailing source read failed: {error}"),
             Self::SourceChanged { before, after } => write!(
                 formatter,
                 "source length changed during verification from {before} to {after} bytes"
             ),
+            Self::SourceMetadataChanged => {
+                formatter.write_str("source file metadata changed during verification")
+            }
             Self::SourceChangedDuringLocation => formatter
                 .write_str("a previously unavailable chunk now matches at its canonical offset"),
             Self::ReportProtectionSetMismatch => {
@@ -636,7 +755,9 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::SourceSeek(error) | Self::TrailingRead(error) => Some(error),
+            Self::SourceSeek(error) | Self::SourceMetadata(error) | Self::TrailingRead(error) => {
+                Some(error)
+            }
             Self::ReportAllocation(error) => Some(error),
             Self::Rolling(error) => Some(error),
             _ => None,
@@ -651,7 +772,10 @@ mod tests {
     use crate::creator::Creator;
     use crate::geometry::{ChunkSize, MIN_CHUNK_SIZE, Redundancy};
     use crate::recovery_set::{AssemblyLimits, RecoverySet};
-    use std::io::Cursor;
+    use std::fs::{self, OpenOptions};
+    use std::io::{Cursor, Write};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     const CHUNK_BYTES: usize = MIN_CHUNK_SIZE as usize;
 
@@ -672,6 +796,35 @@ mod tests {
         create::build(&mut Cursor::new(bytes), &options).unwrap()
     }
 
+    struct TestFile {
+        path: PathBuf,
+        file: File,
+    }
+
+    impl TestFile {
+        fn new(bytes: &[u8]) -> Self {
+            static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("bitrot-verify-test-{}-{id}", std::process::id()));
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(bytes).unwrap();
+            file.sync_all().unwrap();
+            Self { path, file }
+        }
+    }
+
+    impl Drop for TestFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+
     #[test]
     fn classifies_an_intact_source() {
         let bytes = original();
@@ -686,6 +839,42 @@ mod tests {
         assert_eq!(report.available_recovery_chunks, 1);
         assert_eq!(report.unavailable_recovery_chunks, 0);
         assert!(report.chunks.iter().all(|chunk| chunk.state.is_good()));
+    }
+
+    #[test]
+    fn file_verification_accepts_an_unchanged_file() {
+        let bytes = original();
+        let sidecar = sidecar(&bytes);
+        let mut source = TestFile::new(&bytes);
+
+        let report = source_file(&mut source.file, &sidecar).unwrap();
+
+        assert_eq!(report.state, SourceState::Intact);
+        assert_eq!(report.source_digest, SourceDigestState::Match);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_verification_guard_rejects_same_length_mutation() {
+        let bytes = original();
+        let mut source = TestFile::new(&bytes);
+        let before = FileSnapshot::capture(&source.file).unwrap();
+        let mut writer = OpenOptions::new().write(true).open(&source.path).unwrap();
+
+        let result = with_stable_file(&mut source.file, |_file| {
+            for value in 0_u8..=u8::MAX {
+                writer.seek(SeekFrom::Start(0)).unwrap();
+                writer.write_all(&[value]).unwrap();
+                writer.sync_data().unwrap();
+                if FileSnapshot::capture(&writer).unwrap() != before {
+                    return Ok(());
+                }
+            }
+            panic!("filesystem did not expose any metadata change");
+        });
+
+        assert!(matches!(result, Err(Error::SourceMetadataChanged)));
+        assert_eq!(source.file.metadata().unwrap().len(), bytes.len() as u64);
     }
 
     #[test]
