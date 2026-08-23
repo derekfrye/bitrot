@@ -203,10 +203,12 @@ large media files and would make the collision argument harder to audit.
 
 The experimental version 1 implementation uses BLAKE3 derive-key mode with
 the exact UTF-8 context strings `bitrot format v1 source file digest` and
-`bitrot format v1 data chunk digest`. The source digest covers exactly the
+`bitrot format v1 data chunk digest`. Recovery chunks use the context string
+`bitrot format v1 recovery chunk digest`. The source digest covers exactly the
 complete unpadded source bytes. Each data-chunk digest covers exactly that
 chunk's unpadded bytes; in particular, the short final chunk's coding padding
-is excluded. Read boundaries are not chunk boundaries.
+is excluded. A recovery digest covers exactly one complete stored parity
+chunk. Read boundaries are not chunk boundaries.
 
 The protection-set identifier is derived from immutable coding parameters,
 source length, full-file digest, and ordered data-chunk digests. The filename is
@@ -318,6 +320,7 @@ Required logical record types are:
   roots.
 - Digest-table page: a bounded portion of the ordered data or recovery digest
   table.
+- Rolling-table page: a bounded portion of the ordered full-chunk CRC table.
 - Recovery chunk: recovery index, logical length, and parity bytes.
 - Creator: implementation name and version for diagnostics.
 
@@ -328,7 +331,7 @@ failure.
 ### Experimental core manifest
 
 Record type 2 is the required core manifest. Its logical identifier is zero,
-and version 1 has no record-header extension. Its fixed 152-byte payload is:
+and version 1 has no record-header extension. Its fixed 192-byte payload is:
 
 | Offset | Size | Field |
 | ---: | ---: | --- |
@@ -349,17 +352,43 @@ and version 1 has no record-header extension. Its fixed 152-byte payload is:
 | 80 | 32 | Data digest-table root |
 | 112 | 8 | Recovery digest count; must equal recovery chunk count |
 | 120 | 32 | Recovery digest-table root |
+| 152 | 8 | Rolling value count; must equal full data chunk count |
+| 160 | 32 | Rolling fingerprint-table root |
 
 The protection-set identifier uses BLAKE3 derive-key mode with context
 `bitrot format v1 protection set identifier`. In order, its input is the
 payload version; coding, strong-hash, and rolling algorithm identifiers; chunk
 size; source length; data and recovery counts; final data-chunk length; source
 digest; data digest count; and data digest-table root, all using the widths and
-little-endian encoding above. The recovery root is deliberately excluded: the
-set identity describes the source and immutable coding request, while recovery
-records and their committed digest table are validated content within that
-set. Readers recompute this identifier and require it to match the record
-header.
+little-endian encoding above. The recovery and rolling roots are deliberately
+excluded: the set identity describes the source and immutable coding request,
+while recovery records and rolling fingerprints are committed, validated
+content within that set. Readers recompute this identifier and require it to
+match the record header.
+
+### Experimental rolling-fingerprint pages
+
+Record type 4 is a required rolling-table page. Its logical identifier is the
+page index in bits 0 through 31 with all higher bits zero. Version 1 pages have
+no record-header extension. Their payload is:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 2 | Payload version, currently 1 |
+| 2 | 2 | Reserved; must be zero |
+| 4 | 4 | Zero-based page index |
+| 8 | 8 | Zero-based index of the first rolling value |
+| 16 | 4 | Number of rolling values in this page |
+| 20 | 4 | Reserved; must be zero |
+| 24 | variable | Consecutive little-endian `u64` CRC-64/GO-ISO values |
+
+A page contains between 1 and 4,096 values. Page boundaries and redundant-copy
+assembly follow the same canonical rules as digest-table pages. An empty table
+has no pages, which occurs when the source is shorter than one data chunk. The
+table root uses BLAKE3 derive-key mode with context
+`bitrot format v1 rolling fingerprint table root`; its input is the value count
+as a little-endian `u64`, followed by every rolling value as a little-endian
+`u64` in data-chunk order. The short final chunk has no rolling value.
 
 ### Experimental digest-table pages
 
@@ -401,15 +430,45 @@ final table root to agree with the core manifest. Every non-final page must
 contain 4,096 digests; every expected page must be present. Readers never pick
 one of two conflicting valid copies.
 
+### Experimental recovery-chunk records
+
+Record type 5 is a required recovery chunk. Its logical identifier is the
+zero-based recovery index, and version 1 has no record-header extension. Its
+payload is:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 2 | Payload version, currently 1 |
+| 2 | 2 | Coding algorithm: 1 = Leopard GF(2^16) |
+| 4 | 4 | Zero-based recovery index |
+| 8 | 4 | Data chunk count |
+| 12 | 4 | Recovery chunk count |
+| 16 | 4 | Data and recovery chunk size |
+| 20 | 4 | Logical parity length; equal to chunk size in version 1 |
+| 24 | 8 | Reserved; must be zero |
+| 32 | variable | Complete parity chunk bytes |
+
+The protection-set identifier in the record frame associates the shard with a
+manifest. The duplicated index and coding geometry must agree with that
+manifest before the parity payload is used. Record framing limits are derived
+from the manifest's chunk size and applied before the generic record decoder
+allocates the payload. The payload contains exactly one full-size recovery
+chunk; unlike the final data chunk it is never short. Its domain-separated
+BLAKE3 digest must equal the digest at the same index in the assembled recovery
+digest table. Thus both the physical record checksum and the logical manifest
+commitment must pass before decoding uses a recovery shard.
+
 ### Metadata redundancy
 
-The logical manifest consists of a small core manifest and bounded digest-table
-pages. Paging prevents one damaged byte from invalidating the complete table.
+The logical manifest consists of a small core manifest plus bounded digest- and
+rolling-table pages. Paging prevents one damaged byte from invalidating a
+complete table.
 The manifest is necessary to interpret recovery data and must not be a single
 point of failure. At minimum:
 
 - Store identical, independently checksummed copies of the core manifest and
-  every digest-table page near the beginning and end of the sidecar.
+  every digest- and rolling-table page near the beginning and end of the
+  sidecar.
 - Put a compact superblock at both ends.
 - Include enough identity and coding metadata in every recovery record to
   associate it with the correct set and recovery index.

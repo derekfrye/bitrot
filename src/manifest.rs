@@ -4,11 +4,12 @@ use crate::digest_page::{Kind, Table};
 use crate::fingerprint::{ChunkSize, ChunkSizeError, Digest};
 use crate::geometry::{Geometry, GeometryError};
 use crate::record::{FLAG_REQUIRED, Record};
+use crate::rolling_page::Table as RollingTable;
 use std::fmt;
 
 pub const RECORD_TYPE: u16 = 2;
 pub const PAYLOAD_VERSION: u16 = 1;
-pub const PAYLOAD_LEN: usize = 152;
+pub const PAYLOAD_LEN: usize = 192;
 
 const CODING_ALGORITHM_LEOPARD_GF16: u16 = 1;
 const STRONG_HASH_BLAKE3_256: u16 = 1;
@@ -22,21 +23,24 @@ pub struct Manifest {
     source_digest: Digest,
     data_table_root: Digest,
     recovery_table_root: Digest,
+    rolling_table_root: Digest,
     protection_set_id: [u8; 32],
 }
 
 impl Manifest {
-    /// Constructs a manifest from validated geometry and digest tables.
+    /// Constructs a manifest from validated geometry and fingerprint tables.
     ///
     /// # Errors
     ///
-    /// Returns an error unless the supplied tables have the expected kinds and
-    /// exactly one digest per corresponding shard.
+    /// Returns an error unless the supplied tables have the expected kinds,
+    /// exactly one digest per corresponding shard, and exactly one rolling
+    /// value per full-size data chunk.
     pub fn new(
         geometry: Geometry,
         source_digest: Digest,
         data_table: &Table,
         recovery_table: &Table,
+        rolling_table: &RollingTable,
     ) -> Result<Self, Error> {
         validate_table(data_table, Kind::Data, u64::from(geometry.data_chunks))?;
         validate_table(
@@ -44,11 +48,19 @@ impl Manifest {
             Kind::Recovery,
             u64::from(geometry.recovery_chunks),
         )?;
+        let expected_rolling_count = expected_rolling_count(geometry);
+        if rolling_table.value_count != expected_rolling_count {
+            return Err(Error::RollingCountMismatch {
+                actual: rolling_table.value_count,
+                expected: expected_rolling_count,
+            });
+        }
         Ok(Self::from_validated_parts(
             geometry,
             source_digest,
             data_table.root,
             recovery_table.root,
+            rolling_table.root,
         ))
     }
 
@@ -70,6 +82,11 @@ impl Manifest {
     #[must_use]
     pub const fn recovery_table_root(self) -> Digest {
         self.recovery_table_root
+    }
+
+    #[must_use]
+    pub const fn rolling_table_root(self) -> Digest {
+        self.rolling_table_root
     }
 
     #[must_use]
@@ -169,12 +186,20 @@ impl Manifest {
                 expected: u64::from(recovery_chunks),
             });
         }
+        let expected_rolling_count = expected_rolling_count(geometry);
+        if parse_u64(&record.payload, 152) != expected_rolling_count {
+            return Err(Error::RollingCountMismatch {
+                actual: parse_u64(&record.payload, 152),
+                expected: expected_rolling_count,
+            });
+        }
 
         let manifest = Self::from_validated_parts(
             geometry,
             digest(&record.payload, 40),
             digest(&record.payload, 80),
             digest(&record.payload, 120),
+            digest(&record.payload, 160),
         );
         if record.protection_set_id != manifest.protection_set_id {
             return Err(Error::ProtectionSetIdMismatch {
@@ -190,6 +215,7 @@ impl Manifest {
         source_digest: Digest,
         data_table_root: Digest,
         recovery_table_root: Digest,
+        rolling_table_root: Digest,
     ) -> Self {
         let protection_set_id = set_id(geometry, source_digest, data_table_root);
         Self {
@@ -197,6 +223,7 @@ impl Manifest {
             source_digest,
             data_table_root,
             recovery_table_root,
+            rolling_table_root,
             protection_set_id,
         }
     }
@@ -220,9 +247,16 @@ impl Manifest {
         payload.extend_from_slice(self.data_table_root.as_bytes());
         payload.extend_from_slice(&u64::from(self.geometry.recovery_chunks).to_le_bytes());
         payload.extend_from_slice(self.recovery_table_root.as_bytes());
+        payload.extend_from_slice(&expected_rolling_count(self.geometry).to_le_bytes());
+        payload.extend_from_slice(self.rolling_table_root.as_bytes());
         debug_assert_eq!(payload.len(), PAYLOAD_LEN);
         payload
     }
+}
+
+const fn expected_rolling_count(geometry: Geometry) -> u64 {
+    let short_final = geometry.final_data_chunk_len < geometry.chunk_size.bytes();
+    geometry.data_chunks as u64 - short_final as u64
 }
 
 fn validate_table(table: &Table, expected_kind: Kind, expected_count: u64) -> Result<(), Error> {
@@ -310,6 +344,10 @@ pub enum Error {
         actual: u64,
         expected: u64,
     },
+    RollingCountMismatch {
+        actual: u64,
+        expected: u64,
+    },
     WrongRecordType(u16),
     InvalidRecordFlags(u32),
     InvalidLogicalId(u64),
@@ -349,6 +387,10 @@ impl fmt::Display for Error {
             } => write!(
                 formatter,
                 "manifest {kind:?} digest count {actual} does not match shard count {expected}"
+            ),
+            Self::RollingCountMismatch { actual, expected } => write!(
+                formatter,
+                "manifest rolling value count {actual} does not match full data chunk count {expected}"
             ),
             Self::WrongRecordType(actual) => {
                 write!(formatter, "record type {actual} is not a core manifest")
@@ -428,6 +470,7 @@ mod tests {
     use crate::fingerprint::{self, MIN_CHUNK_SIZE};
     use crate::geometry::Redundancy;
     use crate::record::{self, DecodeLimits};
+    use crate::rolling_page::Table as RollingTable;
     use std::io::Cursor;
 
     fn fixture() -> Manifest {
@@ -440,6 +483,7 @@ mod tests {
             Redundancy::new(1, 2).unwrap(),
         )
         .unwrap();
+        let rolling_table = RollingTable::new(fingerprint.full_chunk_rolling).unwrap();
         let data_table = Table::new(Kind::Data, fingerprint.data_chunk_digests).unwrap();
         let recovery_table = Table::new(
             Kind::Recovery,
@@ -451,6 +495,7 @@ mod tests {
             fingerprint.source_digest,
             &data_table,
             &recovery_table,
+            &rolling_table,
         )
         .unwrap()
     }
@@ -481,16 +526,44 @@ mod tests {
             vec![Digest::from_bytes([2; 32]); geometry.recovery_chunks as usize],
         )
         .unwrap();
+        let rolling = RollingTable::new(vec![7]).unwrap();
         assert!(matches!(
-            Manifest::new(geometry, manifest.source_digest(), &data, &recovery),
+            Manifest::new(
+                geometry,
+                manifest.source_digest(),
+                &data,
+                &recovery,
+                &rolling
+            ),
             Err(Error::DigestCountMismatch {
                 kind: Kind::Data,
                 ..
             })
         ));
         assert!(matches!(
-            Manifest::new(geometry, manifest.source_digest(), &recovery, &data),
+            Manifest::new(
+                geometry,
+                manifest.source_digest(),
+                &recovery,
+                &data,
+                &rolling
+            ),
             Err(Error::WrongTableKind { .. })
+        ));
+        let empty_rolling = RollingTable::new(Vec::new()).unwrap();
+        assert!(matches!(
+            Manifest::new(
+                geometry,
+                manifest.source_digest(),
+                &Table::new(
+                    Kind::Data,
+                    vec![Digest::from_bytes([1; 32]); geometry.data_chunks as usize]
+                )
+                .unwrap(),
+                &recovery,
+                &empty_rolling
+            ),
+            Err(Error::RollingCountMismatch { .. })
         ));
     }
 
@@ -593,6 +666,53 @@ mod tests {
             manifest.recovery_table_root()
         );
         assert_eq!(manifest.geometry(), changed.geometry());
+    }
+
+    #[test]
+    fn rolling_table_does_not_change_source_set_identity() {
+        let manifest = fixture();
+        let mut changed_record = manifest.to_record();
+        changed_record.payload[160] ^= 1;
+        let changed = Manifest::from_record(&changed_record).unwrap();
+        assert_eq!(changed.protection_set_id(), manifest.protection_set_id());
+        assert_ne!(changed.rolling_table_root(), manifest.rolling_table_root());
+    }
+
+    #[test]
+    fn exact_final_chunk_requires_its_rolling_value() {
+        let chunk_size = ChunkSize::new(u64::from(MIN_CHUNK_SIZE)).unwrap();
+        let geometry = Geometry::new(
+            u64::from(MIN_CHUNK_SIZE) * 2,
+            chunk_size,
+            Redundancy::new(1, 2).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(expected_rolling_count(geometry), 2);
+
+        let data = Table::new(
+            Kind::Data,
+            vec![Digest::from_bytes([1; 32]); geometry.data_chunks as usize],
+        )
+        .unwrap();
+        let recovery = Table::new(
+            Kind::Recovery,
+            vec![Digest::from_bytes([2; 32]); geometry.recovery_chunks as usize],
+        )
+        .unwrap();
+        let short = RollingTable::new(vec![7]).unwrap();
+        assert!(matches!(
+            Manifest::new(
+                geometry,
+                Digest::from_bytes([3; 32]),
+                &data,
+                &recovery,
+                &short
+            ),
+            Err(Error::RollingCountMismatch {
+                actual: 1,
+                expected: 2
+            })
+        ));
     }
 
     #[test]

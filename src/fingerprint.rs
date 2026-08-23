@@ -9,6 +9,7 @@ pub const MAX_CHUNK_SIZE: u32 = 64 * 1024 * 1024;
 
 const SOURCE_DIGEST_CONTEXT: &str = "bitrot format v1 source file digest";
 const DATA_CHUNK_DIGEST_CONTEXT: &str = "bitrot format v1 data chunk digest";
+const RECOVERY_CHUNK_DIGEST_CONTEXT: &str = "bitrot format v1 recovery chunk digest";
 
 /// A full 256-bit BLAKE3 digest.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -204,6 +205,12 @@ fn hash(context: &str, bytes: &[u8]) -> Digest {
     hasher.finalize().into()
 }
 
+/// Hashes one complete stored recovery chunk with the v1 recovery domain.
+#[must_use]
+pub fn recovery_chunk_digest(bytes: &[u8]) -> Digest {
+    hash(RECOVERY_CHUNK_DIGEST_CONTEXT, bytes)
+}
+
 pub(crate) fn data_chunk_digest_slices(first: &[u8], second: &[u8]) -> Digest {
     let mut hasher = blake3::Hasher::new_derive_key(DATA_CHUNK_DIGEST_CONTEXT);
     hasher.update(first);
@@ -334,6 +341,16 @@ mod tests {
             actual.data_chunk_digests[0],
             hash(DATA_CHUNK_DIGEST_CONTEXT, &padded)
         );
+    }
+
+    #[test]
+    fn recovery_digest_has_an_independent_domain() {
+        let bytes = vec![0x5a; minimum().bytes() as usize];
+        assert_ne!(
+            recovery_chunk_digest(&bytes),
+            hash(DATA_CHUNK_DIGEST_CONTEXT, &bytes)
+        );
+        assert_eq!(recovery_chunk_digest(&bytes), recovery_chunk_digest(&bytes));
     }
 
     #[test]
