@@ -16,6 +16,7 @@ mod paged_table;
 pub mod record;
 pub mod recovery_chunk;
 pub mod recovery_set;
+pub mod repair;
 pub mod rolling;
 pub mod rolling_page;
 pub mod scan;
@@ -23,4 +24,5 @@ pub mod sidecar;
 pub mod superblock;
 #[cfg(test)]
 mod test_support;
+pub mod verify;
 mod wire;

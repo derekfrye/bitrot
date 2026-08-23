@@ -120,6 +120,16 @@ pub fn recovery_chunk_digest(bytes: &[u8]) -> Digest {
     hash(RECOVERY_CHUNK_DIGEST_CONTEXT, bytes)
 }
 
+#[must_use]
+pub(crate) fn source_digest_hasher() -> blake3::Hasher {
+    blake3::Hasher::new_derive_key(SOURCE_DIGEST_CONTEXT)
+}
+
+#[must_use]
+pub(crate) fn data_chunk_digest(bytes: &[u8]) -> Digest {
+    hash(DATA_CHUNK_DIGEST_CONTEXT, bytes)
+}
+
 pub(crate) fn data_chunk_digest_slices(first: &[u8], second: &[u8]) -> Digest {
     let mut hasher = blake3::Hasher::new_derive_key(DATA_CHUNK_DIGEST_CONTEXT);
     hasher.update(first);

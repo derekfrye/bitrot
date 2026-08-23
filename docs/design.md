@@ -681,6 +681,33 @@ Fast verification may check metadata and a requested sample, but must be named
 clearly. Plain `verify` performs a complete read of both source and required
 sidecar records.
 
+The expected-offset verification core classifies each data chunk independently
+as good, corrupt, missing, or unreadable, then compares the complete observed
+source digest when every byte was readable. It reports the authenticated
+recovery chunks still available and considers source repair possible when the
+number of unavailable data chunks does not exceed that count. Unexpected
+trailing data is repairable by producing the manifest-declared source length
+even though it consumes no recovery shard. A disagreement between the complete
+source digest and otherwise entirely matching expected-length chunks is
+unrepairable because there is no identified erasure to reconstruct.
+
+Filesystem callers additionally snapshot the open source file's identity,
+length, modification time, and platform change metadata around verification.
+This rejects ordinary same-length concurrent writes that the generic seekable
+reader interface cannot observe. It is a consistency check rather than a
+mandatory lock: non-cooperating writers are not blocked, and filesystems do not
+offer snapshot isolation merely by keeping a descriptor open.
+
+An optional second pass builds a bounded rolling-fingerprint index only for
+corrupt or missing full-size chunks, scans the source, and accepts candidates
+only after BLAKE3 confirmation. Confirmed chunks become unexpectedly located
+and no longer consume recovery capacity; their physical offsets remain in the
+report for repair. Unreadable chunks are not rolling targets because a
+sequential scan cannot reliably cross their I/O failures, and the short final
+chunk remains an erasure because it has no rolling fingerprint. The pass stops
+after locating every eligible chunk and applies no partial report changes if
+the scan fails. Identical expected chunks may reuse one confirmed physical copy.
+
 ### Repair
 
 ```text
@@ -705,6 +732,17 @@ user explicitly opts out.
 
 No repair is reported successful until the full source digest matches the
 manifest.
+
+The reconstruction core consumes an authenticated sidecar and a repairable
+verification report, then writes canonical chunk order into a fresh seekable
+destination. Good chunks come from their expected offsets, unexpectedly
+located chunks come from their confirmed offsets, and only the remaining
+erasures enter bounded-window Leopard decoding. A short final chunk is padded
+only inside the coding operation and is written at its manifest length. The
+destination is flushed and completely verified through the normal verification
+path before reconstruction succeeds. This core never modifies the damaged
+source; filesystem publication, replacement, and damaged-original retention
+remain a separate operation.
 
 ### Inspect and scrub
 
