@@ -2,7 +2,9 @@
 
 use crate::agreed_copies;
 use crate::bounded_count;
+use crate::digest::Digest;
 use crate::digest_page::{self, Kind};
+use crate::geometry::Geometry;
 use crate::manifest::{self, Manifest};
 use crate::record::Record;
 use crate::rolling_page;
@@ -41,6 +43,146 @@ pub struct Metadata {
 }
 
 impl Metadata {
+    /// Constructs metadata whose manifest commits to the supplied tables.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the table kinds or counts do not agree with the
+    /// geometry.
+    pub fn new(
+        geometry: Geometry,
+        source_digest: Digest,
+        data_digests: digest_page::Table,
+        recovery_digests: digest_page::Table,
+        rolling_fingerprints: rolling_page::Table,
+    ) -> Result<Self, manifest::Error> {
+        let manifest = Manifest::new(
+            geometry,
+            source_digest,
+            &data_digests,
+            &recovery_digests,
+            &rolling_fingerprints,
+        )?;
+        Ok(Self {
+            manifest,
+            data_digests,
+            recovery_digests,
+            rolling_fingerprints,
+        })
+    }
+
+    /// Revalidates the public tables and their binding to the manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a table is noncanonical or incorrectly rooted,
+    /// its page count cannot be represented, or the rebuilt manifest differs
+    /// from the stored manifest.
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        let data_page_limit = u32::try_from(self.data_digests.pages.len())
+            .map_err(|_| ValidationError::PageCountUnrepresentable)?;
+        let recovery_page_limit = u32::try_from(self.recovery_digests.pages.len())
+            .map_err(|_| ValidationError::PageCountUnrepresentable)?;
+        let rolling_page_limit = u32::try_from(self.rolling_fingerprints.pages.len())
+            .map_err(|_| ValidationError::PageCountUnrepresentable)?;
+
+        let data = digest_page::Table::assemble(
+            Kind::Data,
+            self.data_digests.digest_count,
+            self.data_digests.root,
+            self.data_digests.pages.clone(),
+            digest_page::AssemblyLimits::new(self.data_digests.digest_count, data_page_limit),
+        )
+        .map_err(ValidationError::DataTable)?;
+        let recovery = digest_page::Table::assemble(
+            Kind::Recovery,
+            self.recovery_digests.digest_count,
+            self.recovery_digests.root,
+            self.recovery_digests.pages.clone(),
+            digest_page::AssemblyLimits::new(
+                self.recovery_digests.digest_count,
+                recovery_page_limit,
+            ),
+        )
+        .map_err(ValidationError::RecoveryTable)?;
+        let rolling = rolling_page::Table::assemble(
+            self.rolling_fingerprints.value_count,
+            self.rolling_fingerprints.root,
+            self.rolling_fingerprints.pages.clone(),
+            rolling_page::AssemblyLimits::new(
+                self.rolling_fingerprints.value_count,
+                rolling_page_limit,
+            ),
+        )
+        .map_err(ValidationError::RollingTable)?;
+        let rebuilt = Manifest::new(
+            self.manifest.geometry(),
+            self.manifest.source_digest(),
+            &data,
+            &recovery,
+            &rolling,
+        )
+        .map_err(ValidationError::Manifest)?;
+        if rebuilt == self.manifest {
+            Ok(())
+        } else {
+            Err(ValidationError::ManifestMismatch)
+        }
+    }
+
+    /// Encodes all table pages in canonical data, recovery, rolling order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the page count or an encoded page is invalid.
+    pub fn to_page_records(&self) -> Result<Vec<Record>, RecordEncodingError> {
+        let page_count = self
+            .data_digests
+            .pages
+            .len()
+            .checked_add(self.recovery_digests.pages.len())
+            .and_then(|count| count.checked_add(self.rolling_fingerprints.pages.len()))
+            .ok_or(RecordEncodingError::LengthOverflow)?;
+        let mut records = Vec::with_capacity(page_count);
+        let set_id = self.manifest.protection_set_id();
+        for page in &self.data_digests.pages {
+            records.push(
+                page.to_record(set_id)
+                    .map_err(RecordEncodingError::DigestPage)?,
+            );
+        }
+        for page in &self.recovery_digests.pages {
+            records.push(
+                page.to_record(set_id)
+                    .map_err(RecordEncodingError::DigestPage)?,
+            );
+        }
+        for page in &self.rolling_fingerprints.pages {
+            records.push(
+                page.to_record(set_id)
+                    .map_err(RecordEncodingError::RollingPage)?,
+            );
+        }
+        Ok(records)
+    }
+
+    /// Encodes the core manifest followed by every canonical table page.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when table-page record encoding fails.
+    pub fn to_records(&self) -> Result<Vec<Record>, RecordEncodingError> {
+        let pages = self.to_page_records()?;
+        let capacity = pages
+            .len()
+            .checked_add(1)
+            .ok_or(RecordEncodingError::LengthOverflow)?;
+        let mut records = Vec::with_capacity(capacity);
+        records.push(self.manifest.to_record());
+        records.extend(pages);
+        Ok(records)
+    }
+
     /// Reconciles redundant metadata records into one authenticated manifest.
     ///
     /// Records of unrelated types are ignored. All core-manifest copies must
@@ -118,6 +260,75 @@ impl Metadata {
             recovery_digests,
             rolling_fingerprints,
         })
+    }
+}
+
+#[derive(Debug)]
+pub enum ValidationError {
+    PageCountUnrepresentable,
+    DataTable(digest_page::AssemblyError),
+    RecoveryTable(digest_page::AssemblyError),
+    RollingTable(rolling_page::AssemblyError),
+    Manifest(manifest::Error),
+    ManifestMismatch,
+}
+
+impl fmt::Display for ValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PageCountUnrepresentable => {
+                formatter.write_str("metadata page count cannot be represented")
+            }
+            Self::DataTable(error) => write!(formatter, "data digest table is invalid: {error}"),
+            Self::RecoveryTable(error) => {
+                write!(formatter, "recovery digest table is invalid: {error}")
+            }
+            Self::RollingTable(error) => {
+                write!(formatter, "rolling fingerprint table is invalid: {error}")
+            }
+            Self::Manifest(error) => write!(formatter, "core manifest is invalid: {error}"),
+            Self::ManifestMismatch => {
+                formatter.write_str("core manifest does not match the metadata tables")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ValidationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::DataTable(error) | Self::RecoveryTable(error) => Some(error),
+            Self::RollingTable(error) => Some(error),
+            Self::Manifest(error) => Some(error),
+            Self::PageCountUnrepresentable | Self::ManifestMismatch => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum RecordEncodingError {
+    LengthOverflow,
+    DigestPage(digest_page::Error),
+    RollingPage(rolling_page::Error),
+}
+
+impl fmt::Display for RecordEncodingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LengthOverflow => formatter.write_str("metadata record count overflows"),
+            Self::DigestPage(error) => write!(formatter, "cannot encode digest page: {error}"),
+            Self::RollingPage(error) => write!(formatter, "cannot encode rolling page: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for RecordEncodingError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::DigestPage(error) => Some(error),
+            Self::RollingPage(error) => Some(error),
+            Self::LengthOverflow => None,
+        }
     }
 }
 
@@ -252,43 +463,16 @@ mod tests {
         )
         .unwrap();
         let rolling_fingerprints = rolling_page::Table::new(vec![5, 6]).unwrap();
-        let manifest = Manifest::new(
+        let expected = Metadata::new(
             geometry,
             Digest::from_bytes([7; 32]),
-            &data_digests,
-            &recovery_digests,
-            &rolling_fingerprints,
+            data_digests,
+            recovery_digests,
+            rolling_fingerprints,
         )
         .unwrap();
-
-        let mut records = vec![manifest.to_record()];
-        records.extend(
-            recovery_digests
-                .pages
-                .iter()
-                .map(|page| page.to_record(manifest.protection_set_id()).unwrap()),
-        );
-        records.extend(
-            rolling_fingerprints
-                .pages
-                .iter()
-                .map(|page| page.to_record(manifest.protection_set_id()).unwrap()),
-        );
-        records.extend(
-            data_digests
-                .pages
-                .iter()
-                .map(|page| page.to_record(manifest.protection_set_id()).unwrap()),
-        );
-        Fixture {
-            expected: Metadata {
-                manifest,
-                data_digests,
-                recovery_digests,
-                rolling_fingerprints,
-            },
-            records,
-        }
+        let records = expected.to_records().unwrap();
+        Fixture { expected, records }
     }
 
     fn limits(maximum: u64) -> AssemblyLimits {
@@ -318,6 +502,36 @@ mod tests {
             Metadata::assemble(&fixture.records, limits(20)).unwrap(),
             fixture.expected
         );
+    }
+
+    #[test]
+    fn owns_validation_and_canonical_record_encoding() {
+        let fixture = fixture();
+        fixture.expected.validate().unwrap();
+        assert_eq!(
+            fixture
+                .expected
+                .to_records()
+                .unwrap()
+                .iter()
+                .map(|record| record.record_type)
+                .collect::<Vec<_>>(),
+            vec![
+                manifest::RECORD_TYPE,
+                digest_page::RECORD_TYPE,
+                digest_page::RECORD_TYPE,
+                rolling_page::RECORD_TYPE,
+            ]
+        );
+
+        let mut invalid = fixture.expected;
+        invalid.data_digests.root = Digest::from_bytes([0xff; 32]);
+        assert!(matches!(
+            invalid.validate(),
+            Err(ValidationError::DataTable(
+                digest_page::AssemblyError::RootMismatch { .. }
+            ))
+        ));
     }
 
     #[test]

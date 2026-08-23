@@ -4,13 +4,22 @@ use crate::algorithm::CODING_LEOPARD_GF16;
 use crate::digest::Digest;
 use crate::fingerprint::recovery_chunk_digest;
 use crate::manifest::Manifest;
-use crate::record::{FLAG_REQUIRED, Record};
+use crate::record::{self, FLAG_REQUIRED, Record};
 use crate::wire;
 use std::fmt;
 
 pub const RECORD_TYPE: u16 = 5;
 pub const PAYLOAD_VERSION: u16 = 1;
 pub const PAYLOAD_HEADER_LEN: usize = 32;
+
+pub(crate) const fn encoded_record_len(manifest: Manifest) -> Option<u64> {
+    let Some(payload_len) =
+        (PAYLOAD_HEADER_LEN as u64).checked_add(manifest.geometry().chunk_size.bytes() as u64)
+    else {
+        return None;
+    };
+    record::unextended_encoded_len(payload_len)
+}
 
 /// One complete, full-size parity shard in recovery-index order.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -315,6 +324,7 @@ mod tests {
         let payload_limit = u64::try_from(record.payload.len()).unwrap();
         let mut encoded = Vec::new();
         record::write(&mut encoded, &record).unwrap();
+        assert_eq!(encoded.len() as u64, encoded_record_len(manifest).unwrap());
         let decoded_record = record::read(
             &mut Cursor::new(encoded),
             DecodeLimits::new(BASE_HEADER_LEN, payload_limit),

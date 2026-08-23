@@ -5,7 +5,7 @@ use crate::creator::Creator;
 use crate::digest_page::{self, Kind};
 use crate::fingerprint::{self, SourceFingerprint};
 use crate::geometry::{self, ChunkSize, Geometry, Redundancy};
-use crate::manifest::{self, Manifest};
+use crate::manifest;
 use crate::metadata::Metadata;
 use crate::recovery_chunk::{self, RecoveryChunk};
 use crate::rolling_page;
@@ -126,14 +126,15 @@ fn assemble(
         .collect();
     let recovery_digests = digest_page::Table::new(Kind::Recovery, recovery_digest_values)
         .map_err(Error::DigestTable)?;
-    let manifest = Manifest::new(
+    let metadata = Metadata::new(
         geometry,
         fingerprint.source_digest,
-        &data_digests,
-        &recovery_digests,
-        &rolling_fingerprints,
+        data_digests,
+        recovery_digests,
+        rolling_fingerprints,
     )
     .map_err(Error::Manifest)?;
+    let manifest = metadata.manifest;
     let recovery = recovery
         .into_iter()
         .enumerate()
@@ -142,12 +143,6 @@ fn assemble(
             RecoveryChunk::new(manifest, index, bytes).map_err(Error::RecoveryChunk)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let metadata = Metadata {
-        manifest,
-        data_digests,
-        recovery_digests,
-        rolling_fingerprints,
-    };
     Sidecar::from_generated_parts(metadata, creator, recovery).map_err(Error::Sidecar)
 }
 

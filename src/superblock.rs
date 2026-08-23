@@ -2,13 +2,18 @@
 
 use crate::agreed_copies;
 use crate::manifest::{self, Manifest};
-use crate::record::{FLAG_REQUIRED, Record};
+use crate::record::{self, FLAG_REQUIRED, Record};
 use crate::wire;
 use std::fmt;
 
 pub const RECORD_TYPE: u16 = 1;
 pub const PAYLOAD_VERSION: u16 = 1;
 pub const PAYLOAD_LEN: usize = 64;
+pub(crate) const ENCODED_RECORD_LEN: u64 = match record::unextended_encoded_len(PAYLOAD_LEN as u64)
+{
+    Some(length) => length,
+    None => panic!("superblock record length overflows u64"),
+};
 
 const MANIFEST_COMMITMENT_CONTEXT: &str = "bitrot format v1 core manifest commitment";
 /// Advisory locations for two exact copies of a committed core manifest.
@@ -377,6 +382,7 @@ mod tests {
         let record = expected.to_record();
         let mut encoded = Vec::new();
         record::write(&mut encoded, &record).unwrap();
+        assert_eq!(encoded.len() as u64, ENCODED_RECORD_LEN);
         let decoded = record::read(
             &mut Cursor::new(encoded),
             DecodeLimits::new(BASE_HEADER_LEN, u64::try_from(PAYLOAD_LEN).unwrap()),

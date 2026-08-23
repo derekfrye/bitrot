@@ -274,7 +274,7 @@ struct WriteLayout {
 
 impl WriteLayout {
     fn new(sidecar: &Sidecar) -> Result<Self, WriteError> {
-        validate_manifest(sidecar)?;
+        sidecar.metadata.validate().map_err(WriteError::Metadata)?;
         validate_recovery(sidecar)?;
         validate_optional_records(sidecar)?;
 
@@ -285,12 +285,12 @@ impl WriteLayout {
             .to_record(set_id)
             .map_err(WriteError::Creator)?;
         let manifest_record = manifest.to_record();
-        let page_records = page_records(&sidecar.metadata, set_id)?;
+        let page_records = sidecar
+            .metadata
+            .to_page_records()
+            .map_err(WriteError::MetadataRecords)?;
 
-        let superblock_len = u64::from(record::BASE_HEADER_LEN)
-            .checked_add(superblock::PAYLOAD_LEN as u64)
-            .and_then(|length| length.checked_add(record::DIGEST_LEN as u64))
-            .ok_or(WriteError::LengthOverflow)?;
+        let superblock_len = superblock::ENCODED_RECORD_LEN;
         let creator_len = record::encoded_len(&creator_record).map_err(WriteError::Record)?;
         let manifest_len = record::encoded_len(&manifest_record).map_err(WriteError::Record)?;
         let page_len = records_len(&page_records)?;
@@ -342,14 +342,9 @@ impl WriteLayout {
 
 #[derive(Debug)]
 pub enum WriteError {
-    Manifest(manifest::Error),
-    ManifestMismatch,
-    DataTable(digest_page::AssemblyError),
-    RecoveryTable(digest_page::AssemblyError),
-    RollingTable(rolling_page::AssemblyError),
+    Metadata(metadata::ValidationError),
+    MetadataRecords(metadata::RecordEncodingError),
     Creator(creator::Error),
-    DigestPage(digest_page::Error),
-    RollingPage(rolling_page::Error),
     RecoveryChunk(recovery_chunk::Error),
     CompleteRecoverySet(recovery_set::CompleteError),
     Superblock(superblock::Error),
@@ -364,20 +359,11 @@ pub enum WriteError {
 impl fmt::Display for WriteError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Manifest(error) => write!(formatter, "sidecar manifest is invalid: {error}"),
-            Self::ManifestMismatch => {
-                formatter.write_str("sidecar manifest does not match its assembled tables")
-            }
-            Self::DataTable(error) => write!(formatter, "data digest table is invalid: {error}"),
-            Self::RecoveryTable(error) => {
-                write!(formatter, "recovery digest table is invalid: {error}")
-            }
-            Self::RollingTable(error) => {
-                write!(formatter, "rolling fingerprint table is invalid: {error}")
+            Self::Metadata(error) => write!(formatter, "sidecar metadata is invalid: {error}"),
+            Self::MetadataRecords(error) => {
+                write!(formatter, "sidecar metadata encoding failed: {error}")
             }
             Self::Creator(error) => write!(formatter, "creator record is invalid: {error}"),
-            Self::DigestPage(error) => write!(formatter, "digest page is invalid: {error}"),
-            Self::RollingPage(error) => write!(formatter, "rolling page is invalid: {error}"),
             Self::RecoveryChunk(error) => write!(formatter, "recovery chunk is invalid: {error}"),
             Self::CompleteRecoverySet(error) => {
                 write!(formatter, "generated recovery set is invalid: {error}")
@@ -412,18 +398,14 @@ impl fmt::Display for WriteError {
 impl std::error::Error for WriteError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Manifest(error) => Some(error),
-            Self::DataTable(error) | Self::RecoveryTable(error) => Some(error),
-            Self::RollingTable(error) => Some(error),
+            Self::Metadata(error) => Some(error),
+            Self::MetadataRecords(error) => Some(error),
             Self::Creator(error) => Some(error),
-            Self::DigestPage(error) => Some(error),
-            Self::RollingPage(error) => Some(error),
             Self::RecoveryChunk(error) => Some(error),
             Self::CompleteRecoverySet(error) => Some(error),
             Self::Superblock(error) => Some(error),
             Self::Record(error) => Some(error),
-            Self::ManifestMismatch
-            | Self::MissingRecoveryChunk(_)
+            Self::MissingRecoveryChunk(_)
             | Self::RecoveryDigestMismatch(_)
             | Self::InvalidOptionalRecord { .. }
             | Self::LengthOverflow
@@ -536,53 +518,6 @@ impl std::error::Error for Error {
     }
 }
 
-fn validate_manifest(sidecar: &Sidecar) -> Result<(), WriteError> {
-    let manifest = sidecar.metadata.manifest;
-    let data = &sidecar.metadata.data_digests;
-    let recovery = &sidecar.metadata.recovery_digests;
-    let rolling = &sidecar.metadata.rolling_fingerprints;
-    let digest_page_limit = u32::try_from(data.pages.len().max(recovery.pages.len()))
-        .map_err(|_| WriteError::LengthOverflow)?;
-    let data = digest_page::Table::assemble(
-        digest_page::Kind::Data,
-        data.digest_count,
-        data.root,
-        data.pages.clone(),
-        digest_page::AssemblyLimits::new(data.digest_count, digest_page_limit),
-    )
-    .map_err(WriteError::DataTable)?;
-    let recovery = digest_page::Table::assemble(
-        digest_page::Kind::Recovery,
-        recovery.digest_count,
-        recovery.root,
-        recovery.pages.clone(),
-        digest_page::AssemblyLimits::new(recovery.digest_count, digest_page_limit),
-    )
-    .map_err(WriteError::RecoveryTable)?;
-    let rolling_page_limit =
-        u32::try_from(rolling.pages.len()).map_err(|_| WriteError::LengthOverflow)?;
-    let rolling = rolling_page::Table::assemble(
-        rolling.value_count,
-        rolling.root,
-        rolling.pages.clone(),
-        rolling_page::AssemblyLimits::new(rolling.value_count, rolling_page_limit),
-    )
-    .map_err(WriteError::RollingTable)?;
-    let rebuilt = manifest::Manifest::new(
-        manifest.geometry(),
-        manifest.source_digest(),
-        &data,
-        &recovery,
-        &rolling,
-    )
-    .map_err(WriteError::Manifest)?;
-    if rebuilt == manifest {
-        Ok(())
-    } else {
-        Err(WriteError::ManifestMismatch)
-    }
-}
-
 fn validate_recovery(sidecar: &Sidecar) -> Result<(), WriteError> {
     for (index, expected_digest) in sidecar
         .metadata
@@ -620,36 +555,8 @@ fn validate_optional_records(sidecar: &Sidecar) -> Result<(), WriteError> {
     Ok(())
 }
 
-fn page_records(metadata: &Metadata, set_id: [u8; 32]) -> Result<Vec<Record>, WriteError> {
-    let page_count = metadata
-        .data_digests
-        .pages
-        .len()
-        .checked_add(metadata.recovery_digests.pages.len())
-        .and_then(|count| count.checked_add(metadata.rolling_fingerprints.pages.len()))
-        .ok_or(WriteError::LengthOverflow)?;
-    let mut records = Vec::with_capacity(page_count);
-    for page in &metadata.data_digests.pages {
-        records.push(page.to_record(set_id).map_err(WriteError::DigestPage)?);
-    }
-    for page in &metadata.recovery_digests.pages {
-        records.push(page.to_record(set_id).map_err(WriteError::DigestPage)?);
-    }
-    for page in &metadata.rolling_fingerprints.pages {
-        records.push(page.to_record(set_id).map_err(WriteError::RollingPage)?);
-    }
-    Ok(records)
-}
-
 fn recovery_records_len(sidecar: &Sidecar) -> Result<u64, WriteError> {
-    let per_record = u64::from(record::BASE_HEADER_LEN)
-        .checked_add(recovery_chunk::PAYLOAD_HEADER_LEN as u64)
-        .and_then(|length| {
-            length.checked_add(u64::from(
-                sidecar.metadata.manifest.geometry().chunk_size.bytes(),
-            ))
-        })
-        .and_then(|length| length.checked_add(record::DIGEST_LEN as u64))
+    let per_record = recovery_chunk::encoded_record_len(sidecar.metadata.manifest)
         .ok_or(WriteError::LengthOverflow)?;
     let count = u64::from(sidecar.metadata.manifest.geometry().recovery_chunks);
     per_record
@@ -1091,9 +998,9 @@ mod tests {
 
         assert!(matches!(
             sidecar.write_canonical(&mut output),
-            Err(WriteError::DataTable(
+            Err(WriteError::Metadata(metadata::ValidationError::DataTable(
                 digest_page::AssemblyError::RootMismatch { .. }
-            ))
+            )))
         ));
         assert!(output.is_empty());
     }

@@ -189,6 +189,10 @@ pub fn encoded_len(record: &Record) -> Result<u64, Error> {
     complete_len(header_len, payload_len)
 }
 
+pub(crate) const fn unextended_encoded_len(payload_len: u64) -> Option<u64> {
+    complete_len_checked(BASE_HEADER_LEN, payload_len)
+}
+
 /// Reads one complete record. A clean EOF before a new record returns `None`.
 ///
 /// # Errors
@@ -282,10 +286,14 @@ fn validate_type_and_flags(record_type: u16, flags: u32) -> Result<(), Error> {
 }
 
 fn complete_len(header_len: u32, payload_len: u64) -> Result<u64, Error> {
-    u64::from(header_len)
-        .checked_add(payload_len)
-        .and_then(|length| length.checked_add(DIGEST_LEN as u64))
-        .ok_or(Error::LengthOverflow)
+    complete_len_checked(header_len, payload_len).ok_or(Error::LengthOverflow)
+}
+
+const fn complete_len_checked(header_len: u32, payload_len: u64) -> Option<u64> {
+    let Some(length) = (header_len as u64).checked_add(payload_len) else {
+        return None;
+    };
+    length.checked_add(DIGEST_LEN as u64)
 }
 
 fn digest(header: &[u8], payload: &[u8]) -> blake3::Hash {
@@ -397,6 +405,15 @@ mod tests {
         let record = example();
         let encoded = encoded(&record);
         assert_eq!(encoded_len(&record).unwrap(), encoded.len() as u64);
+    }
+
+    #[test]
+    fn predicts_unextended_lengths_with_checked_arithmetic() {
+        assert_eq!(
+            unextended_encoded_len(17),
+            Some(u64::from(BASE_HEADER_LEN) + 17 + DIGEST_LEN as u64)
+        );
+        assert_eq!(unextended_encoded_len(u64::MAX), None);
     }
 
     #[test]

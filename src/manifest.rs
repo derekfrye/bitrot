@@ -12,8 +12,11 @@ use std::fmt;
 pub const RECORD_TYPE: u16 = 2;
 pub const PAYLOAD_VERSION: u16 = 1;
 pub const PAYLOAD_LEN: usize = 192;
-pub(crate) const ENCODED_RECORD_LEN: u64 =
-    record::BASE_HEADER_LEN as u64 + PAYLOAD_LEN as u64 + record::DIGEST_LEN as u64;
+pub(crate) const ENCODED_RECORD_LEN: u64 = match record::unextended_encoded_len(PAYLOAD_LEN as u64)
+{
+    Some(length) => length,
+    None => panic!("manifest record length overflows u64"),
+};
 
 const SET_ID_CONTEXT: &str = "bitrot format v1 protection set identifier";
 
