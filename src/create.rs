@@ -10,7 +10,7 @@ use crate::creator::Creator;
 use crate::digest_page::{self, Kind};
 use crate::fingerprint::{self, Digest, SourceFingerprint};
 use crate::geometry::{self, ChunkSize, Geometry, Redundancy};
-use crate::manifest::{self, Manifest};
+use crate::manifest;
 use crate::metadata::Metadata;
 use crate::recovery_chunk::{self, RecoveryChunk};
 use crate::rolling_page;
@@ -176,20 +176,14 @@ fn build_metadata(
         rolling_page::Table::new(fingerprint.full_chunk_rolling).map_err(Error::RollingTable)?;
     let recovery_digests = digest_page::Table::new(Kind::Recovery, recovery_digest_values)
         .map_err(Error::DigestTable)?;
-    let manifest = Manifest::new(
+    Metadata::new(
         geometry,
         fingerprint.source_digest,
-        &data_digests,
-        &recovery_digests,
-        &rolling_fingerprints,
-    )
-    .map_err(Error::Manifest)?;
-    Ok(Metadata {
-        manifest,
         data_digests,
         recovery_digests,
         rolling_fingerprints,
-    })
+    )
+    .map_err(Error::Manifest)
 }
 
 #[derive(Debug)]

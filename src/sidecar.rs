@@ -4,11 +4,13 @@ mod record_policy;
 
 use crate::bounded_count;
 use crate::creator::{self, Creator};
+use crate::digest_page;
 use crate::metadata::{self, Metadata};
 use crate::record::Record;
 use crate::record::{self, DecodeLimits};
 use crate::recovery_chunk;
 use crate::recovery_set::{self, RecoverySet};
+use crate::rolling_page;
 use crate::scan::{Event, Scanner};
 use crate::superblock::{self, Superblock};
 use record_policy::Disposition;
@@ -43,6 +45,119 @@ pub struct ReadLimits {
     pub assembly: AssemblyLimits,
     pub max_damage_events: u32,
     pub max_unrecognized_bytes: u64,
+}
+
+impl ReadLimits {
+    /// Derives strict bounds for a canonical sidecar containing `metadata`.
+    ///
+    /// The resulting limits allow the two canonical copies of metadata,
+    /// superblock, and creator records, plus one complete recovery set. They
+    /// reject unknown optional records and physical damage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any derived count or payload bound is not
+    /// representable.
+    pub fn for_canonical_metadata(metadata: &Metadata) -> Result<Self, ReadLimitError> {
+        metadata
+            .validate()
+            .map_err(ReadLimitError::InvalidMetadata)?;
+        let geometry = metadata.manifest.geometry();
+        let data_pages = u32::try_from(metadata.data_digests.pages.len())
+            .map_err(|_| ReadLimitError::Overflow)?;
+        let recovery_pages = u32::try_from(metadata.recovery_digests.pages.len())
+            .map_err(|_| ReadLimitError::Overflow)?;
+        let rolling_pages = u32::try_from(metadata.rolling_fingerprints.pages.len())
+            .map_err(|_| ReadLimitError::Overflow)?;
+        let page_records = u64::from(data_pages)
+            .checked_add(u64::from(recovery_pages))
+            .and_then(|count| count.checked_add(u64::from(rolling_pages)))
+            .ok_or(ReadLimitError::Overflow)?;
+        let metadata_records = page_records
+            .checked_mul(2)
+            .and_then(|count| count.checked_add(2))
+            .ok_or(ReadLimitError::Overflow)?;
+        let max_records = metadata_records
+            .checked_add(u64::from(geometry.recovery_chunks))
+            .and_then(|count| count.checked_add(4))
+            .ok_or(ReadLimitError::Overflow)?;
+        let max_digest_pages = data_pages
+            .max(recovery_pages)
+            .checked_mul(2)
+            .ok_or(ReadLimitError::Overflow)?;
+        let max_rolling_pages = rolling_pages
+            .checked_mul(2)
+            .ok_or(ReadLimitError::Overflow)?;
+        let digest_payload = digest_page::PAYLOAD_HEADER_LEN
+            .checked_add(
+                digest_page::MAX_DIGESTS_PER_PAGE
+                    .checked_mul(record::DIGEST_LEN)
+                    .ok_or(ReadLimitError::Overflow)?,
+            )
+            .ok_or(ReadLimitError::Overflow)?;
+        let recovery_payload = u64::from(geometry.chunk_size.bytes())
+            .checked_add(recovery_chunk::PAYLOAD_HEADER_LEN as u64)
+            .ok_or(ReadLimitError::Overflow)?;
+        let max_payload_len = recovery_payload
+            .max(u64::try_from(digest_payload).map_err(|_| ReadLimitError::Overflow)?);
+
+        Ok(Self {
+            record: DecodeLimits::new(record::BASE_HEADER_LEN, max_payload_len),
+            assembly: AssemblyLimits {
+                max_records,
+                max_unknown_optional_records: 0,
+                max_superblock_copies: 2,
+                max_creator_copies: 2,
+                metadata: metadata::AssemblyLimits::new(
+                    metadata_records,
+                    digest_page::AssemblyLimits::new(
+                        u64::from(geometry.data_chunks.max(geometry.recovery_chunks)),
+                        max_digest_pages,
+                    ),
+                    rolling_page::AssemblyLimits::new(
+                        geometry.full_data_chunks(),
+                        max_rolling_pages,
+                    ),
+                ),
+                recovery: recovery_set::AssemblyLimits::new(
+                    u64::from(geometry.recovery_chunks),
+                    geometry.recovery_chunks,
+                ),
+            },
+            max_damage_events: 0,
+            max_unrecognized_bytes: 0,
+        })
+    }
+}
+
+/// Canonical sidecar read limits could not be derived.
+#[derive(Debug)]
+pub enum ReadLimitError {
+    InvalidMetadata(metadata::ValidationError),
+    Overflow,
+}
+
+impl fmt::Display for ReadLimitError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidMetadata(error) => {
+                write!(
+                    formatter,
+                    "cannot derive read limits from invalid metadata: {error}"
+                )
+            }
+            Self::Overflow => formatter.write_str("canonical sidecar read limits overflow"),
+        }
+    }
+}
+
+impl std::error::Error for ReadLimitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidMetadata(error) => Some(error),
+            Self::Overflow => None,
+        }
+    }
 }
 
 /// Physical damage observed while recovering records from a sidecar.
@@ -89,25 +204,16 @@ impl Sidecar {
             metadata.recovery_digests.digests().copied(),
         )
         .map_err(WriteError::CompleteRecoverySet)?;
-        let manifest_len =
-            record::encoded_len(&manifest.to_record()).map_err(WriteError::Record)?;
-        let second = manifest_len;
-        let observed = manifest_len
-            .checked_mul(2)
-            .ok_or(WriteError::LengthOverflow)?;
+        let layout = CanonicalLayout::new(&metadata, &creator, &[])?;
         let superblock =
-            Superblock::new(manifest, 0, second, observed).map_err(WriteError::Superblock)?;
-        let mut sidecar = Self {
+            Superblock::from_record(layout.superblock_record()).map_err(WriteError::Superblock)?;
+        Ok(Self {
             superblock,
             metadata,
             creator,
             recovery,
             unknown_optional_records: Vec::new(),
-        };
-        let layout = WriteLayout::new(&sidecar)?;
-        sidecar.superblock =
-            Superblock::from_record(&layout.superblock_record).map_err(WriteError::Superblock)?;
-        Ok(sidecar)
+        })
     }
 
     /// Reconciles all required records and preserves unknown optional records.
@@ -235,24 +341,27 @@ impl Sidecar {
     /// layout arithmetic overflows. An output I/O failure may leave the caller's
     /// destination partially written; publication must use a temporary file.
     pub fn write_canonical<W: Write>(&self, writer: &mut W) -> Result<WriteSummary, WriteError> {
-        let layout = WriteLayout::new(self)?;
+        self.recovery
+            .validate_complete(
+                self.metadata.manifest,
+                self.metadata.recovery_digests.digests().copied(),
+            )
+            .map_err(WriteError::CompleteRecoverySet)?;
+        let layout = CanonicalLayout::new(
+            &self.metadata,
+            &self.creator,
+            &self.unknown_optional_records,
+        )?;
         let mut written = 0_u64;
 
-        write_record(writer, &layout.superblock_record, &mut written)?;
-        write_record(writer, &layout.creator_record, &mut written)?;
-        write_record(writer, &layout.manifest_record, &mut written)?;
-        write_records(writer, &layout.page_records, &mut written)?;
-        write_records(writer, &self.unknown_optional_records, &mut written)?;
+        layout.write_prefix(writer, &mut written)?;
         for chunk in self.recovery.available() {
             let record = chunk
                 .to_record(self.metadata.manifest)
                 .map_err(WriteError::RecoveryChunk)?;
             write_record(writer, &record, &mut written)?;
         }
-        write_records(writer, &layout.page_records, &mut written)?;
-        write_record(writer, &layout.manifest_record, &mut written)?;
-        write_record(writer, &layout.creator_record, &mut written)?;
-        write_record(writer, &layout.superblock_record, &mut written)?;
+        layout.write_suffix(writer, &mut written)?;
 
         if written != layout.summary.bytes_written {
             return Err(WriteError::WrittenLengthMismatch {
@@ -264,35 +373,30 @@ impl Sidecar {
     }
 }
 
-struct WriteLayout {
+pub(crate) struct CanonicalLayout<'records> {
+    manifest: crate::manifest::Manifest,
     superblock_record: Record,
     creator_record: Record,
     manifest_record: Record,
     page_records: Vec<Record>,
+    optional_records: &'records [Record],
     summary: WriteSummary,
 }
 
-impl WriteLayout {
-    fn new(sidecar: &Sidecar) -> Result<Self, WriteError> {
-        sidecar.metadata.validate().map_err(WriteError::Metadata)?;
-        sidecar
-            .recovery
-            .validate_complete(
-                sidecar.metadata.manifest,
-                sidecar.metadata.recovery_digests.digests().copied(),
-            )
-            .map_err(WriteError::CompleteRecoverySet)?;
-        validate_optional_records(sidecar)?;
+impl<'records> CanonicalLayout<'records> {
+    pub(crate) fn new(
+        metadata: &Metadata,
+        creator: &Creator,
+        optional_records: &'records [Record],
+    ) -> Result<Self, WriteError> {
+        metadata.validate().map_err(WriteError::Metadata)?;
 
-        let manifest = sidecar.metadata.manifest;
+        let manifest = metadata.manifest;
         let set_id = manifest.protection_set_id();
-        let creator_record = sidecar
-            .creator
-            .to_record(set_id)
-            .map_err(WriteError::Creator)?;
+        validate_optional_records(optional_records, set_id)?;
+        let creator_record = creator.to_record(set_id).map_err(WriteError::Creator)?;
         let manifest_record = manifest.to_record();
-        let page_records = sidecar
-            .metadata
+        let page_records = metadata
             .to_page_records()
             .map_err(WriteError::MetadataRecords)?;
 
@@ -300,8 +404,8 @@ impl WriteLayout {
         let creator_len = record::encoded_len(&creator_record).map_err(WriteError::Record)?;
         let manifest_len = record::encoded_len(&manifest_record).map_err(WriteError::Record)?;
         let page_len = records_len(&page_records)?;
-        let optional_len = records_len(&sidecar.unknown_optional_records)?;
-        let recovery_len = recovery_records_len(sidecar)?;
+        let optional_len = records_len(optional_records)?;
+        let recovery_len = recovery_records_len(manifest)?;
 
         let first_manifest_offset = checked_sum(&[superblock_len, creator_len])?;
         let second_manifest_offset = checked_sum(&[
@@ -333,16 +437,65 @@ impl WriteLayout {
         }
 
         Ok(Self {
+            manifest,
             superblock_record,
             creator_record,
             manifest_record,
             page_records,
+            optional_records,
             summary: WriteSummary {
                 first_manifest_offset,
                 second_manifest_offset,
                 bytes_written,
             },
         })
+    }
+
+    pub(crate) const fn summary(&self) -> WriteSummary {
+        self.summary
+    }
+
+    pub(crate) const fn manifest(&self) -> crate::manifest::Manifest {
+        self.manifest
+    }
+
+    pub(crate) const fn superblock_record(&self) -> &Record {
+        &self.superblock_record
+    }
+
+    pub(crate) const fn creator_record(&self) -> &Record {
+        &self.creator_record
+    }
+
+    pub(crate) const fn manifest_record(&self) -> &Record {
+        &self.manifest_record
+    }
+
+    pub(crate) fn page_records(&self) -> &[Record] {
+        &self.page_records
+    }
+
+    pub(crate) fn write_prefix<W: Write>(
+        &self,
+        writer: &mut W,
+        written: &mut u64,
+    ) -> Result<(), WriteError> {
+        write_record(writer, &self.superblock_record, written)?;
+        write_record(writer, &self.creator_record, written)?;
+        write_record(writer, &self.manifest_record, written)?;
+        write_records(writer, &self.page_records, written)?;
+        write_records(writer, self.optional_records, written)
+    }
+
+    pub(crate) fn write_suffix<W: Write>(
+        &self,
+        writer: &mut W,
+        written: &mut u64,
+    ) -> Result<(), WriteError> {
+        write_records(writer, &self.page_records, written)?;
+        write_record(writer, &self.manifest_record, written)?;
+        write_record(writer, &self.creator_record, written)?;
+        write_record(writer, &self.superblock_record, written)
     }
 }
 
@@ -511,9 +664,8 @@ impl std::error::Error for Error {
     }
 }
 
-fn validate_optional_records(sidecar: &Sidecar) -> Result<(), WriteError> {
-    let set_id = sidecar.metadata.manifest.protection_set_id();
-    for record in &sidecar.unknown_optional_records {
+fn validate_optional_records(records: &[Record], set_id: [u8; 32]) -> Result<(), WriteError> {
+    for record in records {
         if record_policy::classify(record) != Disposition::UnknownOptional
             || record.protection_set_id != set_id
         {
@@ -527,10 +679,10 @@ fn validate_optional_records(sidecar: &Sidecar) -> Result<(), WriteError> {
     Ok(())
 }
 
-fn recovery_records_len(sidecar: &Sidecar) -> Result<u64, WriteError> {
-    let per_record = recovery_chunk::encoded_record_len(sidecar.metadata.manifest)
-        .ok_or(WriteError::LengthOverflow)?;
-    let count = u64::from(sidecar.metadata.manifest.geometry().recovery_chunks);
+fn recovery_records_len(manifest: crate::manifest::Manifest) -> Result<u64, WriteError> {
+    let per_record =
+        recovery_chunk::encoded_record_len(manifest).ok_or(WriteError::LengthOverflow)?;
+    let count = u64::from(manifest.geometry().recovery_chunks);
     per_record
         .checked_mul(count)
         .ok_or(WriteError::LengthOverflow)
@@ -938,6 +1090,29 @@ mod tests {
                 summary.first_manifest_offset,
                 summary.second_manifest_offset
             ]
+        );
+    }
+
+    #[test]
+    fn metadata_derived_limits_accept_the_canonical_sidecar() {
+        let protection = test_support::recovery_fixture();
+        let sidecar = Sidecar::from_generated_parts(
+            protection.metadata,
+            Creator::new("bitrot", "0.1.0").unwrap(),
+            protection.recovery_chunks,
+        )
+        .unwrap();
+        let limits = ReadLimits::for_canonical_metadata(&sidecar.metadata).unwrap();
+        let mut bytes = Vec::new();
+        sidecar.write_canonical(&mut bytes).unwrap();
+
+        let read = Sidecar::read(Cursor::new(bytes), limits).unwrap();
+
+        assert!(read.damage.is_empty());
+        assert_eq!(read.sidecar.metadata, sidecar.metadata);
+        assert_eq!(
+            read.sidecar.recovery.available_count(),
+            usize::try_from(sidecar.metadata.manifest.geometry().recovery_chunks).unwrap()
         );
     }
 

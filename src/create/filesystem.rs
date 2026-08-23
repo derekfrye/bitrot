@@ -2,17 +2,11 @@
 
 use super::spool::RecoverySpool;
 use super::{Error as BuildError, Options, analyze, build_metadata, encode_and_confirm};
-use crate::creator::{self, Creator};
-use crate::digest_page;
-use crate::manifest::{self, Manifest};
-use crate::metadata;
+use crate::creator::Creator;
 use crate::metadata::Metadata as ProtectionMetadata;
 use crate::record::{self, DecodeLimits, Record};
 use crate::recovery_chunk::{self, RecoveryChunk};
-use crate::recovery_set;
-use crate::rolling_page;
-use crate::sidecar::{AssemblyLimits, ReadLimits, Sidecar, WriteSummary};
-use crate::superblock::{self, Superblock};
+use crate::sidecar::{CanonicalLayout, ReadLimits, Sidecar, WriteSummary};
 #[cfg(windows)]
 use cap_std::ambient_authority;
 #[cfg(any(unix, windows))]
@@ -258,70 +252,24 @@ fn open_read_no_follow(path: &Path) -> io::Result<File> {
 }
 
 struct CanonicalPlan {
-    logical_manifest: Manifest,
-    superblock: Record,
-    creator: Record,
-    manifest: Record,
-    pages: Vec<Record>,
+    layout: CanonicalLayout<'static>,
     recovery_digests: Vec<crate::fingerprint::Digest>,
-    summary: WriteSummary,
+    record_limits: DecodeLimits,
 }
 
 impl CanonicalPlan {
     fn new(metadata: &ProtectionMetadata, creator: &Creator) -> Result<Self, PublishError> {
-        let manifest = metadata.manifest;
-        let set_id = manifest.protection_set_id();
-        let creator = creator.to_record(set_id).map_err(PublishError::Creator)?;
-        let manifest_record = manifest.to_record();
-        let pages = page_records(metadata, set_id)?;
-        let page_len = records_len(&pages)?;
-        let creator_len = record::encoded_len(&creator).map_err(PublishError::RecordWrite)?;
-        let recovery_payload_len = (recovery_chunk::PAYLOAD_HEADER_LEN as u64)
-            .checked_add(u64::from(manifest.geometry().chunk_size.bytes()))
-            .ok_or(PublishError::LimitOverflow)?;
-        let recovery_record_len = unextended_record_len(recovery_payload_len)?;
-        let recovery_len = recovery_record_len
-            .checked_mul(u64::from(manifest.geometry().recovery_chunks))
-            .ok_or(PublishError::LimitOverflow)?;
-        let superblock_len = unextended_record_len(superblock::PAYLOAD_LEN as u64)?;
-        let first_manifest_offset = superblock_len
-            .checked_add(creator_len)
-            .ok_or(PublishError::LimitOverflow)?;
-        let second_manifest_offset = checked_sum(&[
-            first_manifest_offset,
-            manifest::ENCODED_RECORD_LEN,
-            page_len,
-            recovery_len,
-            page_len,
-        ])?;
-        let bytes_written = checked_sum(&[
-            second_manifest_offset,
-            manifest::ENCODED_RECORD_LEN,
-            creator_len,
-            superblock_len,
-        ])?;
-        let superblock = Superblock::new(
-            manifest,
-            first_manifest_offset,
-            second_manifest_offset,
-            bytes_written,
-        )
-        .map_err(PublishError::Superblock)?
-        .to_record();
+        let layout =
+            CanonicalLayout::new(metadata, creator, &[]).map_err(PublishError::CanonicalLayout)?;
+        let record_limits = ReadLimits::for_canonical_metadata(metadata)
+            .map_err(PublishError::ReadLimits)?
+            .record;
         let recovery_digests = metadata.recovery_digests.digests().copied().collect();
 
         Ok(Self {
-            logical_manifest: manifest,
-            superblock,
-            creator,
-            manifest: manifest_record,
-            pages,
+            layout,
             recovery_digests,
-            summary: WriteSummary {
-                first_manifest_offset,
-                second_manifest_offset,
-                bytes_written,
-            },
+            record_limits,
         })
     }
 
@@ -331,11 +279,10 @@ impl CanonicalPlan {
         spool: &mut RecoverySpool,
     ) -> Result<WriteSummary, PublishError> {
         let mut written = 0_u64;
-        write_record(writer, &self.superblock, &mut written)?;
-        write_record(writer, &self.creator, &mut written)?;
-        write_record(writer, &self.manifest, &mut written)?;
-        write_records(writer, &self.pages, &mut written)?;
-        let manifest = self.logical_manifest;
+        self.layout
+            .write_prefix(writer, &mut written)
+            .map_err(PublishError::CanonicalLayout)?;
+        let manifest = self.layout.manifest();
         for (index, expected_digest) in self.recovery_digests.iter().enumerate() {
             let index = u32::try_from(index).map_err(|_| PublishError::LimitOverflow)?;
             let bytes = spool.read_chunk(index).map_err(PublishError::Spool)?;
@@ -349,26 +296,26 @@ impl CanonicalPlan {
                 .map_err(PublishError::RecoveryChunk)?;
             write_record(writer, &record, &mut written)?;
         }
-        write_records(writer, &self.pages, &mut written)?;
-        write_record(writer, &self.manifest, &mut written)?;
-        write_record(writer, &self.creator, &mut written)?;
-        write_record(writer, &self.superblock, &mut written)?;
-        if written != self.summary.bytes_written {
+        self.layout
+            .write_suffix(writer, &mut written)
+            .map_err(PublishError::CanonicalLayout)?;
+        let summary = self.layout.summary();
+        if written != summary.bytes_written {
             return Err(PublishError::WrittenLengthMismatch {
                 actual: written,
-                expected: self.summary.bytes_written,
+                expected: summary.bytes_written,
             });
         }
-        Ok(self.summary)
+        Ok(summary)
     }
 
     fn verify(&self, reader: &mut File) -> Result<(), PublishError> {
-        let limits = DecodeLimits::new(record::BASE_HEADER_LEN, self.max_payload_len()?);
-        expect_record(reader, limits, &self.superblock)?;
-        expect_record(reader, limits, &self.creator)?;
-        expect_record(reader, limits, &self.manifest)?;
-        expect_records(reader, limits, &self.pages)?;
-        let manifest = self.logical_manifest;
+        let limits = self.record_limits;
+        expect_record(reader, limits, self.layout.superblock_record())?;
+        expect_record(reader, limits, self.layout.creator_record())?;
+        expect_record(reader, limits, self.layout.manifest_record())?;
+        expect_records(reader, limits, self.layout.page_records())?;
+        let manifest = self.layout.manifest();
         for (index, expected_digest) in self.recovery_digests.iter().enumerate() {
             let record = read_required_record(reader, limits)?;
             let index = u32::try_from(index).map_err(|_| PublishError::LimitOverflow)?;
@@ -378,10 +325,10 @@ impl CanonicalPlan {
                 return Err(PublishError::VerificationMismatch);
             }
         }
-        expect_records(reader, limits, &self.pages)?;
-        expect_record(reader, limits, &self.manifest)?;
-        expect_record(reader, limits, &self.creator)?;
-        expect_record(reader, limits, &self.superblock)?;
+        expect_records(reader, limits, self.layout.page_records())?;
+        expect_record(reader, limits, self.layout.manifest_record())?;
+        expect_record(reader, limits, self.layout.creator_record())?;
+        expect_record(reader, limits, self.layout.superblock_record())?;
         if record::read(reader, limits)
             .map_err(PublishError::VerifyRecord)?
             .is_some()
@@ -390,75 +337,6 @@ impl CanonicalPlan {
         }
         Ok(())
     }
-
-    fn max_payload_len(&self) -> Result<u64, PublishError> {
-        let manifest = self.logical_manifest;
-        let recovery = u64::from(manifest.geometry().chunk_size.bytes())
-            .checked_add(recovery_chunk::PAYLOAD_HEADER_LEN as u64)
-            .ok_or(PublishError::LimitOverflow)?;
-        let metadata = self
-            .pages
-            .iter()
-            .map(|record| record.payload.len())
-            .max()
-            .unwrap_or(0);
-        Ok(recovery.max(u64::try_from(metadata).map_err(|_| PublishError::LimitOverflow)?))
-    }
-}
-
-fn page_records(
-    metadata: &ProtectionMetadata,
-    set_id: [u8; 32],
-) -> Result<Vec<Record>, PublishError> {
-    let page_count = metadata
-        .data_digests
-        .pages
-        .len()
-        .checked_add(metadata.recovery_digests.pages.len())
-        .and_then(|count| count.checked_add(metadata.rolling_fingerprints.pages.len()))
-        .ok_or(PublishError::LimitOverflow)?;
-    let mut records = Vec::with_capacity(page_count);
-    for page in &metadata.data_digests.pages {
-        records.push(page.to_record(set_id).map_err(PublishError::DigestPage)?);
-    }
-    for page in &metadata.recovery_digests.pages {
-        records.push(page.to_record(set_id).map_err(PublishError::DigestPage)?);
-    }
-    for page in &metadata.rolling_fingerprints.pages {
-        records.push(page.to_record(set_id).map_err(PublishError::RollingPage)?);
-    }
-    Ok(records)
-}
-
-fn unextended_record_len(payload_len: u64) -> Result<u64, PublishError> {
-    u64::from(record::BASE_HEADER_LEN)
-        .checked_add(payload_len)
-        .and_then(|length| length.checked_add(record::DIGEST_LEN as u64))
-        .ok_or(PublishError::LimitOverflow)
-}
-
-fn records_len(records: &[Record]) -> Result<u64, PublishError> {
-    records.iter().try_fold(0_u64, |total, record| {
-        let length = record::encoded_len(record).map_err(PublishError::RecordWrite)?;
-        total.checked_add(length).ok_or(PublishError::LimitOverflow)
-    })
-}
-
-fn checked_sum(parts: &[u64]) -> Result<u64, PublishError> {
-    parts.iter().try_fold(0_u64, |total, part| {
-        total.checked_add(*part).ok_or(PublishError::LimitOverflow)
-    })
-}
-
-fn write_records(
-    writer: &mut File,
-    records: &[Record],
-    written: &mut u64,
-) -> Result<(), PublishError> {
-    for record in records {
-        write_record(writer, record, written)?;
-    }
-    Ok(())
 }
 
 fn write_record(writer: &mut File, record: &Record, written: &mut u64) -> Result<(), PublishError> {
@@ -515,7 +393,8 @@ fn inspect_existing(
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(PublishError::InspectExisting(error)),
     };
-    let Ok(read) = Sidecar::read(file, verification_limits(expected)?) else {
+    let limits = ReadLimits::for_canonical_metadata(expected).map_err(PublishError::ReadLimits)?;
+    let Ok(read) = Sidecar::read(file, limits) else {
         return Ok(Some(false));
     };
     Ok(Some(
@@ -908,71 +787,6 @@ fn verify_temporary(
     plan.verify(file)
 }
 
-fn verification_limits(metadata: &ProtectionMetadata) -> Result<ReadLimits, PublishError> {
-    let geometry = metadata.manifest.geometry();
-    let data_pages = u32::try_from(metadata.data_digests.pages.len())
-        .map_err(|_| PublishError::LimitOverflow)?;
-    let recovery_pages = u32::try_from(metadata.recovery_digests.pages.len())
-        .map_err(|_| PublishError::LimitOverflow)?;
-    let rolling_pages = u32::try_from(metadata.rolling_fingerprints.pages.len())
-        .map_err(|_| PublishError::LimitOverflow)?;
-    let page_records = u64::from(data_pages)
-        .checked_add(u64::from(recovery_pages))
-        .and_then(|count| count.checked_add(u64::from(rolling_pages)))
-        .ok_or(PublishError::LimitOverflow)?;
-    let metadata_records = page_records
-        .checked_mul(2)
-        .and_then(|count| count.checked_add(2))
-        .ok_or(PublishError::LimitOverflow)?;
-    let max_records = metadata_records
-        .checked_add(u64::from(geometry.recovery_chunks))
-        .and_then(|count| count.checked_add(4))
-        .ok_or(PublishError::LimitOverflow)?;
-    let max_digest_pages = data_pages
-        .max(recovery_pages)
-        .checked_mul(2)
-        .ok_or(PublishError::LimitOverflow)?;
-    let max_rolling_pages = rolling_pages
-        .checked_mul(2)
-        .ok_or(PublishError::LimitOverflow)?;
-    let digest_payload = digest_page::PAYLOAD_HEADER_LEN
-        .checked_add(
-            digest_page::MAX_DIGESTS_PER_PAGE
-                .checked_mul(record::DIGEST_LEN)
-                .ok_or(PublishError::LimitOverflow)?,
-        )
-        .ok_or(PublishError::LimitOverflow)?;
-    let recovery_payload = u64::from(geometry.chunk_size.bytes())
-        .checked_add(recovery_chunk::PAYLOAD_HEADER_LEN as u64)
-        .ok_or(PublishError::LimitOverflow)?;
-    let max_payload_len = recovery_payload
-        .max(u64::try_from(digest_payload).map_err(|_| PublishError::LimitOverflow)?);
-
-    Ok(ReadLimits {
-        record: DecodeLimits::new(record::BASE_HEADER_LEN, max_payload_len),
-        assembly: AssemblyLimits {
-            max_records,
-            max_unknown_optional_records: 0,
-            max_superblock_copies: 2,
-            max_creator_copies: 2,
-            metadata: metadata::AssemblyLimits::new(
-                metadata_records,
-                digest_page::AssemblyLimits::new(
-                    u64::from(geometry.data_chunks.max(geometry.recovery_chunks)),
-                    max_digest_pages,
-                ),
-                rolling_page::AssemblyLimits::new(geometry.full_data_chunks(), max_rolling_pages),
-            ),
-            recovery: recovery_set::AssemblyLimits::new(
-                u64::from(geometry.recovery_chunks),
-                geometry.recovery_chunks,
-            ),
-        },
-        max_damage_events: 0,
-        max_unrecognized_bytes: 0,
-    })
-}
-
 fn publish_temporary(
     temporary: &mut TemporaryFile<'_>,
     directory: &DestinationDirectory,
@@ -1124,11 +938,9 @@ pub enum PublishError {
     CreateTemporary(io::Error),
     LockTemporary(io::Error),
     CleanupTemporaries(io::Error),
-    Creator(creator::Error),
-    DigestPage(digest_page::Error),
-    RollingPage(rolling_page::Error),
+    CanonicalLayout(crate::sidecar::WriteError),
+    ReadLimits(crate::sidecar::ReadLimitError),
     RecoveryChunk(recovery_chunk::Error),
-    Superblock(superblock::Error),
     RecordWrite(record::Error),
     Flush(io::Error),
     SyncTemporary(io::Error),
@@ -1199,15 +1011,15 @@ impl fmt::Display for PublishError {
             Self::CleanupTemporaries(error) => {
                 write!(formatter, "cannot clean stale temporary files: {error}")
             }
-            Self::Creator(error) => write!(formatter, "creator encoding failed: {error}"),
-            Self::DigestPage(error) => write!(formatter, "digest-page encoding failed: {error}"),
-            Self::RollingPage(error) => {
-                write!(formatter, "rolling-page encoding failed: {error}")
+            Self::CanonicalLayout(error) => {
+                write!(formatter, "canonical sidecar layout failed: {error}")
+            }
+            Self::ReadLimits(error) => {
+                write!(formatter, "sidecar verification limits failed: {error}")
             }
             Self::RecoveryChunk(error) => {
                 write!(formatter, "recovery-chunk encoding failed: {error}")
             }
-            Self::Superblock(error) => write!(formatter, "superblock creation failed: {error}"),
             Self::RecordWrite(error) => write!(formatter, "record writing failed: {error}"),
             Self::Flush(error) => write!(formatter, "cannot flush temporary sidecar: {error}"),
             Self::SyncTemporary(error) => {
@@ -1260,11 +1072,9 @@ impl std::error::Error for PublishError {
             | Self::PublishedButSyncFailed(error) => Some(error),
             Self::PublishedButCleanupAndSyncFailed { cleanup, .. } => Some(cleanup),
             Self::Build(error) => Some(error),
-            Self::Creator(error) => Some(error),
-            Self::DigestPage(error) => Some(error),
-            Self::RollingPage(error) => Some(error),
+            Self::CanonicalLayout(error) => Some(error),
+            Self::ReadLimits(error) => Some(error),
             Self::RecoveryChunk(error) | Self::VerifyRecovery(error) => Some(error),
-            Self::Superblock(error) => Some(error),
             Self::RecordWrite(error) | Self::VerifyRecord(error) => Some(error),
             Self::OverlappingPaths
             | Self::SourceIsSymlink
