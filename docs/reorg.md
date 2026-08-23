@@ -26,7 +26,8 @@ The highest-value candidates are:
 
 | Current file | Approximate production lines | Recommendation |
 | --- | ---: | --- |
-| `src/sidecar.rs` | 462 | Separate physical reading from logical assembly |
+| `src/sidecar.rs` | 210 | Extract logical assembly behind the facade |
+| `src/sidecar/read.rs` | 262 | Keep physical reading and read limits together |
 | `src/sidecar/write.rs` | 346 | Keep canonical writing and layout together for now |
 | `src/create/publish.rs` | 767 | Extract canonical streaming |
 | `src/verify.rs` | 810 | Separate ordinary verification from displaced-chunk location |
@@ -50,13 +51,14 @@ Whole-sidecar processing originally owned four distinct concerns:
 - calculating the canonical physical layout.
 
 Canonical writing and physical-layout calculation now live together in
-`src/sidecar/write.rs`. They share record sequencing, length accounting, and
-write errors closely enough that a further `layout.rs` split is not currently
-useful. The public `Sidecar`, `WriteSummary`, and `WriteError` paths remain
-unchanged through the facade.
+`src/sidecar/write.rs`. Physical scanning, canonical read-limit derivation,
+damage diagnostics, and read errors live in `src/sidecar/read.rs`. Each group
+shares its internal policy and error handling closely enough that further
+splits are not currently useful. Their existing public paths remain unchanged
+through the facade.
 
-The remaining production code in `sidecar.rs` owns the public types and limits,
-logical assembly, and damaged-stream reading. Continue the split toward:
+The remaining production code in `sidecar.rs` owns the core public types,
+logical assembly, and the assembly error model. Finish the split toward:
 
 ```text
 src/sidecar.rs
@@ -264,8 +266,7 @@ Integration tests should complement rather than replace focused unit tests.
 
 ## Suggested order of work
 
-1. Finish splitting sidecar reading and logical assembly behind the existing
-   public facade.
+1. Extract logical sidecar assembly behind the existing public facade.
 2. Split `verify.rs` into source verification and displaced-location logic.
 3. Extract replacement platform machinery.
 4. Split the shared filesystem implementation behind its private facade if the
