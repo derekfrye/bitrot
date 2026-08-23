@@ -328,6 +328,37 @@ Optional records may include comments and original path metadata. Readers skip
 unknown optional record types. Unknown required feature bits cause a clean
 failure.
 
+### Experimental superblock
+
+Record type 1 is the required superblock. Its logical identifier is zero, and
+version 1 has no record-header extension. Identical copies are stored at the
+beginning and end of the sidecar. Its fixed 64-byte payload is:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 2 | Payload version, currently 1 |
+| 2 | 2 | Required feature bits, currently zero |
+| 4 | 4 | Reserved; must be zero |
+| 8 | 8 | Byte offset of the first core-manifest record |
+| 16 | 8 | Byte offset of the second core-manifest record |
+| 24 | 8 | Observed sidecar length when the hints were written |
+| 32 | 32 | Exact core-manifest commitment |
+
+The two manifest offsets are canonical ascending hints. Each must leave room
+for a complete fixed-size core-manifest record within the observed length.
+Readers still validate a record found at either location and fall back to a
+bounded record scan when a hint does not resolve, because later append-only
+updates may leave otherwise valid hints stale. The observed length does not
+assert that the current sidecar has no appended bytes.
+
+The core-manifest commitment uses BLAKE3 derive-key mode with context
+`bitrot format v1 core manifest commitment`. Its input is the 32-byte
+protection-set identifier followed by the canonical 192-byte core-manifest
+payload. This binds the superblock to the recovery- and rolling-table roots,
+which the protection-set identifier deliberately excludes. Valid superblock
+copies must agree exactly and their commitment must match the core manifest
+selected by logical metadata assembly.
+
 ### Experimental core manifest
 
 Record type 2 is the required core manifest. Its logical identifier is zero,
@@ -429,6 +460,15 @@ requires the table kind, page indexes, first-digest indexes, page sizes, and
 final table root to agree with the core manifest. Every non-final page must
 contain 4,096 digests; every expected page must be present. Readers never pick
 one of two conflicting valid copies.
+
+Logical-manifest assembly first applies a caller-selected limit to the total
+number of core-manifest, digest-page, and rolling-page records. It then requires
+at least one valid core manifest and exact agreement among every valid copy.
+All table pages must carry that manifest's protection-set identifier. Data,
+recovery, and rolling tables are assembled independently under their own count
+and page limits, and each completed ordered table must match the root committed
+by the agreed core manifest. Other record types do not participate in metadata
+assembly.
 
 ### Experimental recovery-chunk records
 
