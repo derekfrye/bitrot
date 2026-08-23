@@ -4,6 +4,7 @@ use bitrot::verify::{
     ChunkReport, ChunkState, LocationSummary, Report, SourceDigestState, SourceState,
 };
 use serde::Serialize;
+use std::fmt;
 use std::io::{self, Write};
 use std::path::Path;
 
@@ -13,7 +14,7 @@ const SCHEMA_VERSION: u32 = 1;
 pub struct VerificationReport {
     schema_version: u32,
     command: &'static str,
-    status: &'static str,
+    status: Status,
     source_path: PathReport,
     sidecar_path: PathReport,
     protection_set_id: String,
@@ -38,7 +39,7 @@ impl VerificationReport {
         Self {
             schema_version: SCHEMA_VERSION,
             command: "verify",
-            status: source_state(source.state),
+            status: source.state.into(),
             source_path: PathReport::new(source_path),
             sidecar_path: PathReport::new(sidecar_path),
             protection_set_id: encode_hex(&source.protection_set_id),
@@ -108,14 +109,14 @@ impl VerificationReport {
 pub struct ErrorReport {
     schema_version: u32,
     command: &'static str,
-    status: &'static str,
+    status: Status,
     source_path: PathReport,
     sidecar_path: PathReport,
     pub error: String,
 }
 
 impl ErrorReport {
-    pub fn new(status: &'static str, source: &Path, sidecar: &Path, error: String) -> Self {
+    pub fn new(status: Status, source: &Path, sidecar: &Path, error: String) -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
             command: "verify",
@@ -129,6 +130,39 @@ impl ErrorReport {
     pub fn write_json(&self, mut writer: impl Write) -> io::Result<()> {
         serde_json::to_writer_pretty(&mut writer, self).map_err(io::Error::other)?;
         writeln!(writer)
+    }
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Status {
+    Intact,
+    Repairable,
+    Unrepairable,
+    InvalidSidecar,
+    OperationalFailure,
+}
+
+impl From<SourceState> for Status {
+    fn from(state: SourceState) -> Self {
+        match state {
+            SourceState::Intact => Self::Intact,
+            SourceState::Repairable => Self::Repairable,
+            SourceState::Unrepairable => Self::Unrepairable,
+        }
+    }
+}
+
+impl fmt::Display for Status {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Intact => "intact",
+            Self::Repairable => "repairable",
+            Self::Unrepairable => "unrepairable",
+            Self::InvalidSidecar => "invalid_sidecar",
+            Self::OperationalFailure => "operational_failure",
+        };
+        formatter.write_str(name)
     }
 }
 
@@ -157,7 +191,7 @@ struct CreatorReport {
 struct SourceReport {
     expected_bytes: u64,
     observed_bytes: u64,
-    digest: &'static str,
+    digest: SourceDigestStatus,
     good_chunks: u32,
     unexpectedly_located_chunks: u32,
     corrupt_chunks: u32,
@@ -183,7 +217,7 @@ impl From<Report> for SourceReport {
         Self {
             expected_bytes: report.expected_source_len,
             observed_bytes: report.observed_source_len,
-            digest: source_digest_state(report.source_digest),
+            digest: report.source_digest.into(),
             good_chunks: report.good_data_chunks,
             unexpectedly_located_chunks: report.unexpectedly_located_data_chunks,
             corrupt_chunks: corrupt,
@@ -204,20 +238,24 @@ struct DataChunkReport {
     index: u32,
     expected_bytes: u32,
     bytes_read: u32,
-    state: &'static str,
+    state: DataChunkStatus,
     located_offset: Option<u64>,
-    io_error_kind: Option<String>,
+    io_error_kind: Option<IoErrorKind>,
 }
 
 impl From<ChunkReport> for DataChunkReport {
     fn from(chunk: ChunkReport) -> Self {
         let (state, located_offset, io_error_kind) = match chunk.state {
-            ChunkState::Good => ("good", None, None),
-            ChunkState::Corrupt => ("corrupt", None, None),
-            ChunkState::Missing => ("missing", None, None),
-            ChunkState::Unreadable(kind) => ("unreadable", None, Some(format!("{kind:?}"))),
+            ChunkState::Good => (DataChunkStatus::Good, None, None),
+            ChunkState::Corrupt => (DataChunkStatus::Corrupt, None, None),
+            ChunkState::Missing => (DataChunkStatus::Missing, None, None),
+            ChunkState::Unreadable(kind) => (
+                DataChunkStatus::Unreadable,
+                None,
+                Some(IoErrorKind::from(kind)),
+            ),
             ChunkState::UnexpectedlyLocated { offset } => {
-                ("unexpectedly_located", Some(offset), None)
+                (DataChunkStatus::UnexpectedlyLocated, Some(offset), None)
             }
         };
         Self {
@@ -227,6 +265,125 @@ impl From<ChunkReport> for DataChunkReport {
             state,
             located_offset,
             io_error_kind,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SourceDigestStatus {
+    Match,
+    Mismatch,
+    Unavailable,
+}
+
+impl From<SourceDigestState> for SourceDigestStatus {
+    fn from(state: SourceDigestState) -> Self {
+        match state {
+            SourceDigestState::Match => Self::Match,
+            SourceDigestState::Mismatch => Self::Mismatch,
+            SourceDigestState::Unavailable => Self::Unavailable,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DataChunkStatus {
+    Good,
+    Corrupt,
+    Missing,
+    Unreadable,
+    UnexpectedlyLocated,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum IoErrorKind {
+    NotFound,
+    PermissionDenied,
+    ConnectionRefused,
+    ConnectionReset,
+    HostUnreachable,
+    NetworkUnreachable,
+    ConnectionAborted,
+    NotConnected,
+    AddrInUse,
+    AddrNotAvailable,
+    NetworkDown,
+    BrokenPipe,
+    AlreadyExists,
+    WouldBlock,
+    NotADirectory,
+    IsADirectory,
+    DirectoryNotEmpty,
+    ReadOnlyFilesystem,
+    StaleNetworkFileHandle,
+    InvalidInput,
+    InvalidData,
+    TimedOut,
+    WriteZero,
+    StorageFull,
+    NotSeekable,
+    QuotaExceeded,
+    FileTooLarge,
+    ResourceBusy,
+    ExecutableFileBusy,
+    Deadlock,
+    CrossesDevices,
+    TooManyLinks,
+    InvalidFilename,
+    ArgumentListTooLong,
+    Interrupted,
+    Unsupported,
+    UnexpectedEof,
+    OutOfMemory,
+    Other,
+}
+
+impl From<io::ErrorKind> for IoErrorKind {
+    #[allow(clippy::too_many_lines)]
+    fn from(kind: io::ErrorKind) -> Self {
+        match kind {
+            io::ErrorKind::NotFound => Self::NotFound,
+            io::ErrorKind::PermissionDenied => Self::PermissionDenied,
+            io::ErrorKind::ConnectionRefused => Self::ConnectionRefused,
+            io::ErrorKind::ConnectionReset => Self::ConnectionReset,
+            io::ErrorKind::HostUnreachable => Self::HostUnreachable,
+            io::ErrorKind::NetworkUnreachable => Self::NetworkUnreachable,
+            io::ErrorKind::ConnectionAborted => Self::ConnectionAborted,
+            io::ErrorKind::NotConnected => Self::NotConnected,
+            io::ErrorKind::AddrInUse => Self::AddrInUse,
+            io::ErrorKind::AddrNotAvailable => Self::AddrNotAvailable,
+            io::ErrorKind::NetworkDown => Self::NetworkDown,
+            io::ErrorKind::BrokenPipe => Self::BrokenPipe,
+            io::ErrorKind::AlreadyExists => Self::AlreadyExists,
+            io::ErrorKind::WouldBlock => Self::WouldBlock,
+            io::ErrorKind::NotADirectory => Self::NotADirectory,
+            io::ErrorKind::IsADirectory => Self::IsADirectory,
+            io::ErrorKind::DirectoryNotEmpty => Self::DirectoryNotEmpty,
+            io::ErrorKind::ReadOnlyFilesystem => Self::ReadOnlyFilesystem,
+            io::ErrorKind::StaleNetworkFileHandle => Self::StaleNetworkFileHandle,
+            io::ErrorKind::InvalidInput => Self::InvalidInput,
+            io::ErrorKind::InvalidData => Self::InvalidData,
+            io::ErrorKind::TimedOut => Self::TimedOut,
+            io::ErrorKind::WriteZero => Self::WriteZero,
+            io::ErrorKind::StorageFull => Self::StorageFull,
+            io::ErrorKind::NotSeekable => Self::NotSeekable,
+            io::ErrorKind::QuotaExceeded => Self::QuotaExceeded,
+            io::ErrorKind::FileTooLarge => Self::FileTooLarge,
+            io::ErrorKind::ResourceBusy => Self::ResourceBusy,
+            io::ErrorKind::ExecutableFileBusy => Self::ExecutableFileBusy,
+            io::ErrorKind::Deadlock => Self::Deadlock,
+            io::ErrorKind::CrossesDevices => Self::CrossesDevices,
+            io::ErrorKind::TooManyLinks => Self::TooManyLinks,
+            io::ErrorKind::InvalidFilename => Self::InvalidFilename,
+            io::ErrorKind::ArgumentListTooLong => Self::ArgumentListTooLong,
+            io::ErrorKind::Interrupted => Self::Interrupted,
+            io::ErrorKind::Unsupported => Self::Unsupported,
+            io::ErrorKind::UnexpectedEof => Self::UnexpectedEof,
+            io::ErrorKind::OutOfMemory => Self::OutOfMemory,
+            _ => Self::Other,
         }
     }
 }
@@ -288,22 +445,6 @@ impl From<LocationSummary> for DisplacedScanReport {
     }
 }
 
-const fn source_state(state: SourceState) -> &'static str {
-    match state {
-        SourceState::Intact => "intact",
-        SourceState::Repairable => "repairable",
-        SourceState::Unrepairable => "unrepairable",
-    }
-}
-
-const fn source_digest_state(state: SourceDigestState) -> &'static str {
-    match state {
-        SourceDigestState::Match => "match",
-        SourceDigestState::Mismatch => "mismatch",
-        SourceDigestState::Unavailable => "unavailable",
-    }
-}
-
 fn encode_hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
 
@@ -321,5 +462,13 @@ mod tests {
     #[test]
     fn encodes_protection_ids_as_lowercase_hex() {
         assert_eq!(encode_hex(&[0, 1, 0xab, 0xff]), "0001abff");
+    }
+
+    #[test]
+    fn serializes_io_error_kinds_as_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&IoErrorKind::from(io::ErrorKind::PermissionDenied)).unwrap(),
+            r#""permission_denied""#
+        );
     }
 }

@@ -134,15 +134,23 @@ impl RecoveryChunk {
         }
 
         let geometry = manifest.geometry();
-        validate_field("data chunk count", payload.u32(8)?, geometry.data_chunks)?;
         validate_field(
-            "recovery chunk count",
+            GeometryField::DataChunkCount,
+            payload.u32(8)?,
+            geometry.data_chunks,
+        )?;
+        validate_field(
+            GeometryField::RecoveryChunkCount,
             payload.u32(12)?,
             geometry.recovery_chunks,
         )?;
-        validate_field("chunk size", payload.u32(16)?, geometry.chunk_size.bytes())?;
         validate_field(
-            "logical length",
+            GeometryField::ChunkSize,
+            payload.u32(16)?,
+            geometry.chunk_size.bytes(),
+        )?;
+        validate_field(
+            GeometryField::LogicalLength,
             payload.u32(20)?,
             geometry.chunk_size.bytes(),
         )?;
@@ -163,6 +171,25 @@ impl RecoveryChunk {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GeometryField {
+    DataChunkCount,
+    RecoveryChunkCount,
+    ChunkSize,
+    LogicalLength,
+}
+
+impl fmt::Display for GeometryField {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DataChunkCount => formatter.write_str("data chunk count"),
+            Self::RecoveryChunkCount => formatter.write_str("recovery chunk count"),
+            Self::ChunkSize => formatter.write_str("chunk size"),
+            Self::LogicalLength => formatter.write_str("logical length"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     WrongRecordType(u16),
     InvalidRecordFlags(u32),
@@ -177,7 +204,7 @@ pub enum Error {
     },
     LogicalIdMismatch,
     GeometryMismatch {
-        field: &'static str,
+        field: GeometryField,
         actual: u32,
         expected: u32,
     },
@@ -265,7 +292,7 @@ fn validate_length(manifest: Manifest, actual: usize) -> Result<(), Error> {
     }
 }
 
-fn validate_field(field: &'static str, actual: u32, expected: u32) -> Result<(), Error> {
+fn validate_field(field: GeometryField, actual: u32, expected: u32) -> Result<(), Error> {
     if actual == expected {
         Ok(())
     } else {
@@ -383,12 +410,20 @@ mod tests {
             Err(Error::LogicalIdMismatch)
         ));
 
-        for offset in [8, 12, 16, 20] {
+        for (offset, field) in [
+            (8, GeometryField::DataChunkCount),
+            (12, GeometryField::RecoveryChunkCount),
+            (16, GeometryField::ChunkSize),
+            (20, GeometryField::LogicalLength),
+        ] {
             let mut changed = record.clone();
             changed.payload[offset..offset + 4].copy_from_slice(&99_u32.to_le_bytes());
             assert!(matches!(
                 RecoveryChunk::from_record(&changed, manifest, chunk.digest()),
-                Err(Error::GeometryMismatch { .. })
+                Err(Error::GeometryMismatch {
+                    field: actual_field,
+                    ..
+                }) if actual_field == field
             ));
         }
 

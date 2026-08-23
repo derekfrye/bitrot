@@ -1,7 +1,7 @@
 #[path = "verify/report.rs"]
 mod report;
 
-use self::report::{ErrorReport, VerificationReport};
+use self::report::{ErrorReport, Status, VerificationReport};
 use super::VerifyArgs;
 use bitrot::digest_page;
 use bitrot::geometry::{LEOPARD_FIELD_ORDER, MAX_CHUNK_SIZE};
@@ -50,8 +50,8 @@ pub fn run(arguments: VerifyArgs) -> ExitCode {
         }
         Err(failure) => {
             let (status, exit) = match failure.kind {
-                FailureKind::InvalidSidecar => ("invalid_sidecar", EXIT_INVALID_SIDECAR),
-                FailureKind::Operational => ("operational_failure", EXIT_OPERATIONAL_FAILURE),
+                FailureKind::InvalidSidecar => (Status::InvalidSidecar, EXIT_INVALID_SIDECAR),
+                FailureKind::Operational => (Status::OperationalFailure, EXIT_OPERATIONAL_FAILURE),
             };
             let report = ErrorReport::new(
                 status,

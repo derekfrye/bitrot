@@ -140,9 +140,17 @@ impl Manifest {
         if required_features != 0 {
             return Err(Error::UnsupportedRequiredFeatures(required_features));
         }
-        validate_algorithm("coding", payload.u16(4)?, CODING_LEOPARD_GF16)?;
-        validate_algorithm("strong hash", payload.u16(6)?, STRONG_HASH_BLAKE3_256)?;
-        validate_algorithm("rolling", payload.u16(8)?, ROLLING_CRC64_GO_ISO)?;
+        validate_algorithm(AlgorithmKind::Coding, payload.u16(4)?, CODING_LEOPARD_GF16)?;
+        validate_algorithm(
+            AlgorithmKind::StrongHash,
+            payload.u16(6)?,
+            STRONG_HASH_BLAKE3_256,
+        )?;
+        validate_algorithm(
+            AlgorithmKind::Rolling,
+            payload.u16(8)?,
+            ROLLING_CRC64_GO_ISO,
+        )?;
         if payload.u16(10)? != 0 || payload.u32(36)? != 0 {
             return Err(Error::ReservedField);
         }
@@ -278,11 +286,11 @@ fn set_id(geometry: Geometry, source_digest: Digest, data_table_root: Digest) ->
     hasher.finalize().into()
 }
 
-fn validate_algorithm(name: &'static str, actual: u16, expected: u16) -> Result<(), Error> {
+fn validate_algorithm(kind: AlgorithmKind, actual: u16, expected: u16) -> Result<(), Error> {
     if actual == expected {
         Ok(())
     } else {
-        Err(Error::UnsupportedAlgorithm { name, actual })
+        Err(Error::UnsupportedAlgorithm { kind, actual })
     }
 }
 
@@ -290,6 +298,23 @@ fn invalid_payload_length(bytes: &[u8]) -> Error {
     Error::PayloadLengthMismatch {
         actual: bytes.len(),
         expected: PAYLOAD_LEN,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AlgorithmKind {
+    Coding,
+    StrongHash,
+    Rolling,
+}
+
+impl fmt::Display for AlgorithmKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Coding => formatter.write_str("coding"),
+            Self::StrongHash => formatter.write_str("strong hash"),
+            Self::Rolling => formatter.write_str("rolling"),
+        }
     }
 }
 
@@ -319,7 +344,7 @@ pub enum Error {
     UnsupportedPayloadVersion(u16),
     UnsupportedRequiredFeatures(u16),
     UnsupportedAlgorithm {
-        name: &'static str,
+        kind: AlgorithmKind,
         actual: u16,
     },
     ReservedField,
@@ -384,10 +409,10 @@ impl fmt::Display for Error {
                 formatter,
                 "unsupported core-manifest required features {actual:#x}"
             ),
-            Self::UnsupportedAlgorithm { name, actual } => {
+            Self::UnsupportedAlgorithm { kind, actual } => {
                 write!(
                     formatter,
-                    "unsupported core-manifest {name} algorithm {actual}"
+                    "unsupported core-manifest {kind} algorithm {actual}"
                 )
             }
             Self::ReservedField => {
@@ -563,35 +588,20 @@ mod tests {
     #[test]
     fn decoder_rejects_unknown_algorithms_reserved_bytes_and_bad_geometry() {
         let canonical = fixture().to_record();
-        for (offset, error) in [
-            (
-                4,
-                Error::UnsupportedAlgorithm {
-                    name: "coding",
-                    actual: 2,
-                },
-            ),
-            (
-                6,
-                Error::UnsupportedAlgorithm {
-                    name: "strong hash",
-                    actual: 2,
-                },
-            ),
-            (
-                8,
-                Error::UnsupportedAlgorithm {
-                    name: "rolling",
-                    actual: 2,
-                },
-            ),
+        for (offset, kind) in [
+            (4, AlgorithmKind::Coding),
+            (6, AlgorithmKind::StrongHash),
+            (8, AlgorithmKind::Rolling),
         ] {
             let mut record = canonical.clone();
             record.payload[offset..offset + 2].copy_from_slice(&2_u16.to_le_bytes());
-            assert_eq!(
-                Manifest::from_record(&record).unwrap_err().to_string(),
-                error.to_string()
-            );
+            assert!(matches!(
+                Manifest::from_record(&record),
+                Err(Error::UnsupportedAlgorithm {
+                    kind: actual_kind,
+                    actual: 2,
+                }) if actual_kind == kind
+            ));
         }
 
         let mut features = canonical.clone();

@@ -97,7 +97,9 @@ fn reports_intact_source_in_human_and_json_formats() {
     assert_eq!(report["schema_version"], 1);
     assert_eq!(report["command"], "verify");
     assert_eq!(report["status"], "intact");
+    assert_eq!(report["source"]["digest"], "match");
     assert_eq!(report["source"]["good_chunks"], 2);
+    assert_eq!(report["source"]["chunks"][0]["state"], "good");
     assert_eq!(report["recovery"]["available_chunks"], 1);
 }
 
