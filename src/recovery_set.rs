@@ -83,13 +83,10 @@ impl RecoverySet {
             let recovery_index = chunk.recovery_index();
             let index =
                 usize::try_from(recovery_index).map_err(|_| CompleteError::CountUnrepresentable)?;
-            let expected = digests.get(index).ok_or(CompleteError::IndexOutOfRange {
-                actual: recovery_index,
-                chunk_count: manifest.geometry().recovery_chunks,
-            })?;
-            if chunk.digest() != *expected {
-                return Err(CompleteError::DigestMismatch {
-                    index: recovery_index,
+            if digests.get(index).is_none() {
+                return Err(CompleteError::IndexOutOfRange {
+                    actual: recovery_index,
+                    chunk_count: manifest.geometry().recovery_chunks,
                 });
             }
             let slot = indexed
@@ -102,11 +99,13 @@ impl RecoverySet {
             }
         }
 
-        Ok(Self {
+        let recovery = Self {
             chunks: indexed,
             rejected: Vec::new(),
             duplicate_records: 0,
-        })
+        };
+        recovery.validate_complete(manifest, digests)?;
+        Ok(recovery)
     }
 
     /// Authenticates and indexes all type-5 records for `manifest`.
@@ -229,6 +228,49 @@ impl RecoverySet {
             .filter_map(|(index, _)| u32::try_from(index).ok())
     }
 
+    /// Verifies that every recovery index is present and matches its expected
+    /// digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the set or digest table has the wrong length, a
+    /// recovery index is missing, or an available chunk has the wrong digest.
+    pub fn validate_complete<I>(
+        &self,
+        manifest: Manifest,
+        expected_digests: I,
+    ) -> Result<(), CompleteError>
+    where
+        I: IntoIterator<Item = Digest>,
+    {
+        let expected_count = usize::try_from(manifest.geometry().recovery_chunks)
+            .map_err(|_| CompleteError::CountUnrepresentable)?;
+        if self.chunks.len() != expected_count {
+            return Err(CompleteError::ChunkCountMismatch {
+                actual: self.chunks.len(),
+                expected: expected_count,
+            });
+        }
+        let digests = expected_digests.into_iter().collect::<Vec<_>>();
+        if digests.len() != expected_count {
+            return Err(CompleteError::DigestCountMismatch {
+                actual: digests.len(),
+                expected: expected_count,
+            });
+        }
+
+        for (index, (chunk, expected_digest)) in self.chunks.iter().zip(digests).enumerate() {
+            let index = u32::try_from(index).map_err(|_| CompleteError::CountUnrepresentable)?;
+            let chunk = chunk
+                .as_ref()
+                .ok_or(CompleteError::MissingIndex { index })?;
+            if chunk.digest() != expected_digest {
+                return Err(CompleteError::DigestMismatch { index });
+            }
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn rejected(&self) -> &[RejectedRecord] {
         &self.rejected
@@ -247,6 +289,7 @@ pub enum CompleteError {
     DigestCountMismatch { actual: usize, expected: usize },
     IndexOutOfRange { actual: u32, chunk_count: u32 },
     DuplicateIndex { index: u32 },
+    MissingIndex { index: u32 },
     DigestMismatch { index: u32 },
 }
 
@@ -273,6 +316,9 @@ impl fmt::Display for CompleteError {
             ),
             Self::DuplicateIndex { index } => {
                 write!(formatter, "generated recovery index {index} is duplicated")
+            }
+            Self::MissingIndex { index } => {
+                write!(formatter, "recovery chunk {index} is missing")
             }
             Self::DigestMismatch { index } => {
                 write!(
@@ -409,6 +455,36 @@ mod tests {
             actual.rejected()[1].reason,
             Rejection::LogicalIdOutOfRange { actual: 9, .. }
         ));
+    }
+
+    #[test]
+    fn complete_validation_reports_missing_and_mismatched_chunks() {
+        let fixture = fixture();
+        let incomplete = RecoverySet::assemble(
+            &fixture.records[..1],
+            fixture.manifest,
+            fixture.digests.clone(),
+            limits(),
+        )
+        .unwrap();
+        assert_eq!(
+            incomplete.validate_complete(fixture.manifest, fixture.digests.clone()),
+            Err(CompleteError::MissingIndex { index: 1 })
+        );
+
+        let complete = RecoverySet::assemble(
+            &fixture.records,
+            fixture.manifest,
+            fixture.digests.clone(),
+            limits(),
+        )
+        .unwrap();
+        let mut wrong_digests = fixture.digests;
+        wrong_digests[1] = Digest::from_bytes([0xff; 32]);
+        assert_eq!(
+            complete.validate_complete(fixture.manifest, wrong_digests),
+            Err(CompleteError::DigestMismatch { index: 1 })
+        );
     }
 
     #[test]

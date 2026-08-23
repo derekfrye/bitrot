@@ -1,17 +1,17 @@
 //! Whole-sidecar logical validation over physically verified records.
 
+mod record_policy;
+
 use crate::bounded_count;
 use crate::creator::{self, Creator};
-use crate::digest_page;
-use crate::manifest;
 use crate::metadata::{self, Metadata};
 use crate::record::Record;
 use crate::record::{self, DecodeLimits};
 use crate::recovery_chunk;
 use crate::recovery_set::{self, RecoverySet};
-use crate::rolling_page;
 use crate::scan::{Event, Scanner};
 use crate::superblock::{self, Superblock};
+use record_policy::Disposition;
 use std::fmt;
 use std::io::{Read, Seek, Write};
 
@@ -275,7 +275,13 @@ struct WriteLayout {
 impl WriteLayout {
     fn new(sidecar: &Sidecar) -> Result<Self, WriteError> {
         sidecar.metadata.validate().map_err(WriteError::Metadata)?;
-        validate_recovery(sidecar)?;
+        sidecar
+            .recovery
+            .validate_complete(
+                sidecar.metadata.manifest,
+                sidecar.metadata.recovery_digests.digests().copied(),
+            )
+            .map_err(WriteError::CompleteRecoverySet)?;
         validate_optional_records(sidecar)?;
 
         let manifest = sidecar.metadata.manifest;
@@ -349,8 +355,6 @@ pub enum WriteError {
     CompleteRecoverySet(recovery_set::CompleteError),
     Superblock(superblock::Error),
     Record(record::Error),
-    MissingRecoveryChunk(u32),
-    RecoveryDigestMismatch(u32),
     InvalidOptionalRecord { record_type: u16, logical_id: u64 },
     LengthOverflow,
     WrittenLengthMismatch { actual: u64, expected: u64 },
@@ -370,15 +374,6 @@ impl fmt::Display for WriteError {
             }
             Self::Superblock(error) => write!(formatter, "superblock layout is invalid: {error}"),
             Self::Record(error) => write!(formatter, "record writing failed: {error}"),
-            Self::MissingRecoveryChunk(index) => {
-                write!(formatter, "recovery chunk {index} is missing")
-            }
-            Self::RecoveryDigestMismatch(index) => {
-                write!(
-                    formatter,
-                    "recovery chunk {index} does not match its digest table"
-                )
-            }
             Self::InvalidOptionalRecord {
                 record_type,
                 logical_id,
@@ -405,9 +400,7 @@ impl std::error::Error for WriteError {
             Self::CompleteRecoverySet(error) => Some(error),
             Self::Superblock(error) => Some(error),
             Self::Record(error) => Some(error),
-            Self::MissingRecoveryChunk(_)
-            | Self::RecoveryDigestMismatch(_)
-            | Self::InvalidOptionalRecord { .. }
+            Self::InvalidOptionalRecord { .. }
             | Self::LengthOverflow
             | Self::WrittenLengthMismatch { .. } => None,
         }
@@ -518,31 +511,10 @@ impl std::error::Error for Error {
     }
 }
 
-fn validate_recovery(sidecar: &Sidecar) -> Result<(), WriteError> {
-    for (index, expected_digest) in sidecar
-        .metadata
-        .recovery_digests
-        .digests()
-        .copied()
-        .enumerate()
-    {
-        let index = u32::try_from(index).map_err(|_| WriteError::LengthOverflow)?;
-        let chunk = sidecar
-            .recovery
-            .chunk(index)
-            .ok_or(WriteError::MissingRecoveryChunk(index))?;
-        if chunk.digest() != expected_digest {
-            return Err(WriteError::RecoveryDigestMismatch(index));
-        }
-    }
-    Ok(())
-}
-
 fn validate_optional_records(sidecar: &Sidecar) -> Result<(), WriteError> {
     let set_id = sidecar.metadata.manifest.protection_set_id();
     for record in &sidecar.unknown_optional_records {
-        if record.is_required()
-            || is_known_type(record.record_type)
+        if record_policy::classify(record) != Disposition::UnknownOptional
             || record.protection_set_id != set_id
         {
             return Err(WriteError::InvalidOptionalRecord {
@@ -621,7 +593,7 @@ fn push_damage(damage: &mut Vec<Damage>, event: Damage, maximum: u32) -> Result<
 
 fn reject_unknown_required(records: &[Record]) -> Result<(), Error> {
     for record in records {
-        if record.is_required() && !is_known_type(record.record_type) {
+        if record_policy::classify(record) == Disposition::UnknownRequired {
             return Err(Error::UnknownRequiredRecord {
                 record_type: record.record_type,
                 logical_id: record.logical_id,
@@ -637,10 +609,17 @@ fn collect_unknown_optional(
     maximum: u32,
 ) -> Result<Vec<Record>, Error> {
     let mut optional = Vec::new();
-    for record in records
-        .iter()
-        .filter(|record| !is_known_type(record.record_type))
-    {
+    for record in records {
+        match record_policy::classify(record) {
+            Disposition::Known => continue,
+            Disposition::UnknownRequired => {
+                return Err(Error::UnknownRequiredRecord {
+                    record_type: record.record_type,
+                    logical_id: record.logical_id,
+                });
+            }
+            Disposition::UnknownOptional => {}
+        }
         if record.protection_set_id != protection_set_id {
             return Err(Error::ForeignUnknownOptionalRecord {
                 record_type: record.record_type,
@@ -656,18 +635,6 @@ fn collect_unknown_optional(
     Ok(optional)
 }
 
-const fn is_known_type(record_type: u16) -> bool {
-    matches!(
-        record_type,
-        superblock::RECORD_TYPE
-            | manifest::RECORD_TYPE
-            | digest_page::RECORD_TYPE
-            | rolling_page::RECORD_TYPE
-            | recovery_chunk::RECORD_TYPE
-            | creator::RECORD_TYPE
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -675,6 +642,7 @@ mod tests {
     use crate::geometry::MIN_CHUNK_SIZE;
     use crate::record::FLAG_REQUIRED;
     use crate::test_support;
+    use crate::{digest_page, manifest, rolling_page};
     use std::io::Cursor;
 
     struct Fixture {
@@ -984,7 +952,9 @@ mod tests {
 
         assert!(matches!(
             sidecar.write_canonical(&mut output),
-            Err(WriteError::MissingRecoveryChunk(1))
+            Err(WriteError::CompleteRecoverySet(
+                recovery_set::CompleteError::MissingIndex { index: 1 }
+            ))
         ));
         assert!(output.is_empty());
     }
