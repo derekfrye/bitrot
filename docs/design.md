@@ -565,6 +565,37 @@ If split recovery volumes are added, every volume contains a superblock and a
 complete manifest copy. Future work may also parity-protect large digest tables,
 but simple repetition is easier to validate for v1.
 
+### Canonical single-sidecar layout
+
+The experimental version-1 writer emits records in exactly this order:
+
+```text
+superblock
+creator
+core manifest
+data digest pages, recovery digest pages, rolling pages
+unknown optional records
+recovery chunks in recovery-index order
+data digest pages, recovery digest pages, rolling pages
+core manifest
+creator
+superblock
+```
+
+Pages within each table are in ascending page-index order. The creator is
+duplicated because it is a required record; unknown optional records are
+preserved once in their existing relative order because duplicating semantics
+that the writer does not understand would be unsafe. Both superblocks are
+identical and contain the actual offsets of the two core manifests and the
+exact final sidecar length.
+
+The writer validates the manifest against all three assembled tables and
+requires every recovery index to have an authenticated shard before emitting
+any bytes. It computes the complete layout before output begins and writes one
+recovery record at a time, avoiding a second complete in-memory copy of parity
+data. Output failure may still leave the destination partial, so creation and
+rewriting publish only through the temporary-file protocol described below.
+
 ### Single sidecar versus volumes
 
 Version 1 may begin with one `.bitrot` file per source file. Independent record

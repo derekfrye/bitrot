@@ -46,6 +46,68 @@ pub struct RecoverySet {
 }
 
 impl RecoverySet {
+    /// Indexes a freshly generated complete recovery set without copying its
+    /// parity bytes through encoded records.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless there is exactly one correctly indexed chunk
+    /// for every manifest recovery index and every digest matches.
+    pub fn from_complete<I>(
+        chunks: Vec<RecoveryChunk>,
+        manifest: Manifest,
+        expected_digests: I,
+    ) -> Result<Self, CompleteError>
+    where
+        I: IntoIterator<Item = Digest>,
+    {
+        let expected_count = usize::try_from(manifest.geometry().recovery_chunks)
+            .map_err(|_| CompleteError::CountUnrepresentable)?;
+        if chunks.len() != expected_count {
+            return Err(CompleteError::ChunkCountMismatch {
+                actual: chunks.len(),
+                expected: expected_count,
+            });
+        }
+        let digests = expected_digests.into_iter().collect::<Vec<_>>();
+        if digests.len() != expected_count {
+            return Err(CompleteError::DigestCountMismatch {
+                actual: digests.len(),
+                expected: expected_count,
+            });
+        }
+
+        let mut indexed = vec![None; expected_count];
+        for chunk in chunks {
+            let recovery_index = chunk.recovery_index();
+            let index =
+                usize::try_from(recovery_index).map_err(|_| CompleteError::CountUnrepresentable)?;
+            let expected = digests.get(index).ok_or(CompleteError::IndexOutOfRange {
+                actual: recovery_index,
+                chunk_count: manifest.geometry().recovery_chunks,
+            })?;
+            if chunk.digest() != *expected {
+                return Err(CompleteError::DigestMismatch {
+                    index: recovery_index,
+                });
+            }
+            let slot = indexed
+                .get_mut(index)
+                .ok_or(CompleteError::CountUnrepresentable)?;
+            if slot.replace(chunk).is_some() {
+                return Err(CompleteError::DuplicateIndex {
+                    index: recovery_index,
+                });
+            }
+        }
+
+        Ok(Self {
+            chunks: indexed,
+            rejected: Vec::new(),
+            duplicate_records: 0,
+        })
+    }
+
     /// Authenticates and indexes all type-5 records for `manifest`.
     ///
     /// Records of other types are ignored. A malformed, foreign, or
@@ -176,6 +238,52 @@ impl RecoverySet {
         self.duplicate_records
     }
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompleteError {
+    CountUnrepresentable,
+    ChunkCountMismatch { actual: usize, expected: usize },
+    DigestCountMismatch { actual: usize, expected: usize },
+    IndexOutOfRange { actual: u32, chunk_count: u32 },
+    DuplicateIndex { index: u32 },
+    DigestMismatch { index: u32 },
+}
+
+impl fmt::Display for CompleteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CountUnrepresentable => {
+                formatter.write_str("recovery chunk count cannot be represented")
+            }
+            Self::ChunkCountMismatch { actual, expected } => write!(
+                formatter,
+                "generated recovery chunk count {actual} does not match expected count {expected}"
+            ),
+            Self::DigestCountMismatch { actual, expected } => write!(
+                formatter,
+                "generated recovery digest count {actual} does not match expected count {expected}"
+            ),
+            Self::IndexOutOfRange {
+                actual,
+                chunk_count,
+            } => write!(
+                formatter,
+                "generated recovery index {actual} is outside chunk count {chunk_count}"
+            ),
+            Self::DuplicateIndex { index } => {
+                write!(formatter, "generated recovery index {index} is duplicated")
+            }
+            Self::DigestMismatch { index } => {
+                write!(
+                    formatter,
+                    "generated recovery chunk {index} has the wrong digest"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for CompleteError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AssemblyError {

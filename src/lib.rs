@@ -2,6 +2,7 @@
 
 mod algorithm;
 pub mod coding;
+pub mod create;
 pub mod creator;
 pub mod digest;
 pub mod digest_page;

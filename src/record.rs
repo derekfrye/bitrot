@@ -153,10 +153,24 @@ pub fn write<W: Write>(writer: &mut W, record: &Record) -> Result<u64, Error> {
     writer.write_all(&record.payload)?;
     writer.write_all(digest.as_bytes())?;
 
-    u64::from(header_len)
-        .checked_add(payload_len)
-        .and_then(|length| length.checked_add(DIGEST_LEN as u64))
-        .ok_or(Error::LengthOverflow)
+    complete_len(header_len, payload_len)
+}
+
+/// Returns the exact encoded length of one record without writing it.
+///
+/// # Errors
+///
+/// Returns an error when record metadata is invalid or its complete encoded
+/// length cannot be represented by the format.
+pub fn encoded_len(record: &Record) -> Result<u64, Error> {
+    validate_type_and_flags(record.record_type, record.flags)?;
+    let extension_len =
+        u32::try_from(record.header_extension.len()).map_err(|_| Error::LengthOverflow)?;
+    let header_len = BASE_HEADER_LEN
+        .checked_add(extension_len)
+        .ok_or(Error::LengthOverflow)?;
+    let payload_len = u64::try_from(record.payload.len()).map_err(|_| Error::LengthOverflow)?;
+    complete_len(header_len, payload_len)
 }
 
 /// Reads one complete record. A clean EOF before a new record returns `None`.
@@ -251,6 +265,13 @@ fn validate_type_and_flags(record_type: u16, flags: u32) -> Result<(), Error> {
     Ok(())
 }
 
+fn complete_len(header_len: u32, payload_len: u64) -> Result<u64, Error> {
+    u64::from(header_len)
+        .checked_add(payload_len)
+        .and_then(|length| length.checked_add(DIGEST_LEN as u64))
+        .ok_or(Error::LengthOverflow)
+}
+
 fn digest(header: &[u8], payload: &[u8]) -> blake3::Hash {
     let mut hasher = blake3::Hasher::new_derive_key(DIGEST_CONTEXT);
     hasher.update(header);
@@ -342,6 +363,13 @@ mod tests {
         assert_eq!(&bytes[16..20], &75_u32.to_le_bytes());
         assert_eq!(&bytes[24..32], &13_u64.to_le_bytes());
         assert_eq!(&bytes[64..72], &0x0102_0304_0506_0708_u64.to_le_bytes());
+    }
+
+    #[test]
+    fn predicts_exact_encoded_length() {
+        let record = example();
+        let encoded = encoded(&record);
+        assert_eq!(encoded_len(&record).unwrap(), encoded.len() as u64);
     }
 
     #[test]
