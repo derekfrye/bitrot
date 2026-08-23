@@ -3,11 +3,9 @@
 use super::spool::RecoverySpool;
 use super::{Error as BuildError, Options, analyze, build_metadata, encode_and_confirm};
 use crate::creator::Creator;
-#[cfg(any(windows, test))]
-use crate::filesystem::same_windows_file_id;
 use crate::filesystem::{
-    CreateTemporaryError, Directory as DestinationDirectory, FinishError, TemporaryFile,
-    TemporaryKind, cleanup_stale_temporaries as cleanup_stale, destination_parent,
+    CreateTemporaryError, Directory as DestinationDirectory, FileIdentity, FinishError,
+    TemporaryFile, TemporaryKind, cleanup_stale_temporaries as cleanup_stale, destination_parent,
     finish_publication as finish_filesystem_publication, remove_file_if_same,
 };
 use crate::metadata::Metadata as ProtectionMetadata;
@@ -15,10 +13,9 @@ use crate::record::{self, DecodeLimits, Record};
 use crate::recovery_chunk::{self, RecoveryChunk};
 use crate::sidecar::{CanonicalLayout, ReadLimits, Sidecar, WriteSummary};
 use std::fmt;
-use std::fs::{self, File, Metadata, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::time::SystemTime;
 
 /// Policy for a conflicting object already at the requested sidecar path.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -95,7 +92,7 @@ pub fn publish(
         |offset, index, bytes| spool.write_window(offset, index, bytes),
     )
     .map_err(PublishError::Build)?;
-    snapshot.recheck(&source, source_path)?;
+    recheck_source(&snapshot, &source, source_path)?;
     if destination_is_source(&directory, destination_name, &snapshot)? {
         return Err(PublishError::OverlappingPaths);
     }
@@ -138,114 +135,33 @@ pub fn publish(
     }
 }
 
-#[derive(Clone, Debug)]
-struct SourceSnapshot {
-    len: u64,
-    modified: Option<SystemTime>,
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-    #[cfg(windows)]
-    volume_serial_number: Option<u32>,
-    #[cfg(windows)]
-    file_index: Option<u64>,
-}
-
-impl SourceSnapshot {
-    fn from_metadata(metadata: &Metadata) -> Self {
-        #[cfg(unix)]
-        use std::os::unix::fs::MetadataExt;
-        #[cfg(windows)]
-        use std::os::windows::fs::MetadataExt as _;
-
-        Self {
-            len: metadata.len(),
-            modified: metadata.modified().ok(),
-            #[cfg(unix)]
-            device: metadata.dev(),
-            #[cfg(unix)]
-            inode: metadata.ino(),
-            #[cfg(windows)]
-            volume_serial_number: metadata.volume_serial_number(),
-            #[cfg(windows)]
-            file_index: metadata.file_index(),
-        }
+fn recheck_source(snapshot: &FileIdentity, source: &File, path: &Path) -> Result<(), PublishError> {
+    let open_metadata = source.metadata().map_err(PublishError::SourceMetadata)?;
+    let path_metadata = fs::symlink_metadata(path).map_err(PublishError::SourceMetadata)?;
+    if path_metadata.file_type().is_symlink()
+        || !path_metadata.is_file()
+        || snapshot != &FileIdentity::from_std(&open_metadata)
+        || snapshot != &FileIdentity::from_std(&path_metadata)
+    {
+        return Err(PublishError::SourceIdentityChanged);
     }
-
-    fn same_file(&self, metadata: &Metadata) -> bool {
-        #[cfg(unix)]
-        use std::os::unix::fs::MetadataExt;
-        #[cfg(windows)]
-        use std::os::windows::fs::MetadataExt as _;
-
-        self.len == metadata.len() && self.modified == metadata.modified().ok() && {
-            #[cfg(unix)]
-            {
-                self.device == metadata.dev() && self.inode == metadata.ino()
-            }
-            #[cfg(windows)]
-            {
-                same_windows_file_id(
-                    self.volume_serial_number,
-                    self.file_index,
-                    metadata.volume_serial_number(),
-                    metadata.file_index(),
-                )
-            }
-            #[cfg(not(any(unix, windows)))]
-            {
-                true
-            }
-        }
-    }
-
-    fn recheck(&self, source: &File, path: &Path) -> Result<(), PublishError> {
-        let open_metadata = source.metadata().map_err(PublishError::SourceMetadata)?;
-        let path_metadata = fs::symlink_metadata(path).map_err(PublishError::SourceMetadata)?;
-        if path_metadata.file_type().is_symlink()
-            || !path_metadata.is_file()
-            || !self.same_file(&open_metadata)
-            || !self.same_file(&path_metadata)
-        {
-            return Err(PublishError::SourceIdentityChanged);
-        }
-        Ok(())
-    }
+    Ok(())
 }
 
 fn destination_is_source(
     directory: &DestinationDirectory,
     destination: &std::ffi::OsStr,
-    snapshot: &SourceSnapshot,
+    snapshot: &FileIdentity,
 ) -> Result<bool, PublishError> {
     let metadata = match directory.symlink_metadata(destination) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(PublishError::InspectExisting(error)),
     };
-    #[cfg(unix)]
-    {
-        Ok((snapshot.device, snapshot.inode) == metadata.unix_identity())
-    }
-    #[cfg(windows)]
-    {
-        let (volume_serial_number, file_index) = metadata.windows_identity();
-        Ok(same_windows_file_id(
-            snapshot.volume_serial_number,
-            snapshot.file_index,
-            volume_serial_number,
-            file_index,
-        ))
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = (metadata, snapshot);
-        Ok(false)
-    }
+    Ok(snapshot.same_entry(metadata.identity()))
 }
 
-fn open_source(path: &Path) -> Result<(File, SourceSnapshot), PublishError> {
+fn open_source(path: &Path) -> Result<(File, FileIdentity), PublishError> {
     let path_metadata = fs::symlink_metadata(path).map_err(PublishError::SourceMetadata)?;
     if path_metadata.file_type().is_symlink() {
         return Err(PublishError::SourceIsSymlink);
@@ -255,8 +171,8 @@ fn open_source(path: &Path) -> Result<(File, SourceSnapshot), PublishError> {
     }
     let source = open_read_no_follow(path).map_err(PublishError::OpenSource)?;
     let open_metadata = source.metadata().map_err(PublishError::SourceMetadata)?;
-    let snapshot = SourceSnapshot::from_metadata(&open_metadata);
-    if !snapshot.same_file(&path_metadata) {
+    let snapshot = FileIdentity::from_std(&open_metadata);
+    if snapshot != FileIdentity::from_std(&path_metadata) {
         return Err(PublishError::SourceIdentityChanged);
     }
     Ok((source, snapshot))
@@ -529,8 +445,8 @@ fn verify_published(
             error: PublishedVerificationError::Open(error),
             published: None,
         })?;
-    let expected = match temporary.metadata() {
-        Ok(metadata) => metadata,
+    let expected = match FileIdentity::capture(temporary) {
+        Ok(identity) => identity,
         Err(error) => {
             return Err(FailedPublishedVerification {
                 error: PublishedVerificationError::Metadata(error),
@@ -538,8 +454,8 @@ fn verify_published(
             });
         }
     };
-    let actual = match published.metadata() {
-        Ok(metadata) => metadata,
+    let actual = match FileIdentity::capture(&published) {
+        Ok(identity) => identity,
         Err(error) => {
             return Err(FailedPublishedVerification {
                 error: PublishedVerificationError::Metadata(error),
@@ -547,7 +463,7 @@ fn verify_published(
             });
         }
     };
-    if !same_std_file_identity(&expected, &actual) {
+    if !expected.same_entry(&actual) {
         return Err(FailedPublishedVerification {
             error: PublishedVerificationError::IdentityChanged,
             published: Some(published),
@@ -617,30 +533,6 @@ fn verify_temporary_path(temporary: &TemporaryFile<'_>) -> Result<(), PublishErr
         Ok(())
     } else {
         Err(PublishError::TemporaryIdentityChanged)
-    }
-}
-
-fn same_std_file_identity(left: &Metadata, right: &Metadata) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-
-        left.dev() == right.dev() && left.ino() == right.ino()
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt as _;
-
-        same_windows_file_id(
-            left.volume_serial_number(),
-            left.file_index(),
-            right.volume_serial_number(),
-            right.file_index(),
-        )
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        left.len() == right.len() && left.modified().ok() == right.modified().ok()
     }
 }
 
@@ -1297,15 +1189,6 @@ mod tests {
         assert!(temporary.remove().is_err());
         assert_eq!(fs::read(&temporary_path).unwrap(), b"not ours");
         assert!(moved.exists());
-    }
-
-    #[test]
-    fn windows_file_identity_requires_matching_available_ids() {
-        assert!(same_windows_file_id(Some(7), Some(11), Some(7), Some(11)));
-        assert!(!same_windows_file_id(Some(7), Some(11), Some(8), Some(11)));
-        assert!(!same_windows_file_id(Some(7), Some(11), Some(7), Some(12)));
-        assert!(!same_windows_file_id(None, None, None, None));
-        assert!(!same_windows_file_id(Some(7), None, Some(7), None));
     }
 
     #[test]

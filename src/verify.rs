@@ -1,6 +1,7 @@
 //! Read-only source verification against authenticated protection metadata.
 
 use crate::digest::Digest;
+use crate::filesystem::FileIdentity;
 use crate::fingerprint;
 use crate::rolling::{self, Locator, ScanSummary, Target};
 use crate::sidecar::Sidecar;
@@ -8,7 +9,6 @@ use std::fmt;
 use std::fs::{File, Metadata};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::ops::ControlFlow;
-use std::time::SystemTime;
 
 /// Verification state of one data chunk at its expected source offset.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -311,20 +311,11 @@ pub fn locate_displaced_file(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FileSnapshot {
-    len: u64,
-    modified: Option<SystemTime>,
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
+    identity: FileIdentity,
     #[cfg(unix)]
     changed_seconds: i64,
     #[cfg(unix)]
     changed_nanoseconds: i64,
-    #[cfg(windows)]
-    volume_serial_number: Option<u32>,
-    #[cfg(windows)]
-    file_index: Option<u64>,
     #[cfg(windows)]
     last_write_time: u64,
 }
@@ -343,20 +334,11 @@ impl FileSnapshot {
         use std::os::windows::fs::MetadataExt as _;
 
         Self {
-            len: metadata.len(),
-            modified: metadata.modified().ok(),
-            #[cfg(unix)]
-            device: metadata.dev(),
-            #[cfg(unix)]
-            inode: metadata.ino(),
+            identity: FileIdentity::from_std(metadata),
             #[cfg(unix)]
             changed_seconds: metadata.ctime(),
             #[cfg(unix)]
             changed_nanoseconds: metadata.ctime_nsec(),
-            #[cfg(windows)]
-            volume_serial_number: metadata.volume_serial_number(),
-            #[cfg(windows)]
-            file_index: metadata.file_index(),
             #[cfg(windows)]
             last_write_time: metadata.last_write_time(),
         }
@@ -376,7 +358,26 @@ fn with_stable_file<T>(
     Ok(value)
 }
 
-pub(crate) fn validate_report(sidecar: &Sidecar, report: &Report) -> Result<(), Error> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ValidatedReport {
+    available_data_chunks: u32,
+    unavailable_data_chunks: u32,
+}
+
+impl ValidatedReport {
+    pub(crate) const fn available_data_chunks(self) -> u32 {
+        self.available_data_chunks
+    }
+
+    pub(crate) const fn unavailable_data_chunks(self) -> u32 {
+        self.unavailable_data_chunks
+    }
+}
+
+pub(crate) fn validate_report(
+    sidecar: &Sidecar,
+    report: &Report,
+) -> Result<ValidatedReport, Error> {
     let manifest = sidecar.metadata.manifest;
     let geometry = manifest.geometry();
     if report.protection_set_id != manifest.protection_set_id() {
@@ -389,6 +390,10 @@ pub(crate) fn validate_report(sidecar: &Sidecar, report: &Report) -> Result<(), 
         || report.available_recovery_chunks
             != u32::try_from(sidecar.recovery.available_count())
                 .map_err(|_| Error::CountUnrepresentable)?
+        || report
+            .available_recovery_chunks
+            .checked_add(report.unavailable_recovery_chunks)
+            != Some(geometry.recovery_chunks)
     {
         return Err(Error::ReportStructureMismatch);
     }
@@ -401,8 +406,38 @@ pub(crate) fn validate_report(sidecar: &Sidecar, report: &Report) -> Result<(), 
         if chunk.index != expected_index || chunk.expected_len != layout.len {
             return Err(Error::ReportStructureMismatch);
         }
+        if let ChunkState::UnexpectedlyLocated { offset } = chunk.state {
+            let end = offset
+                .checked_add(u64::from(chunk.expected_len))
+                .ok_or(Error::SourceOffsetOverflow)?;
+            if chunk.expected_len != geometry.chunk_size.bytes()
+                || offset == layout.offset
+                || end > report.observed_source_len
+            {
+                return Err(Error::InvalidDisplacedLocation(chunk.index));
+            }
+        }
     }
-    Ok(())
+
+    let counts = ChunkCounts::from_chunks(&report.chunks)?;
+    let available = counts.available()?;
+    if counts.good != report.good_data_chunks
+        || counts.unexpectedly_located != report.unexpectedly_located_data_chunks
+        || counts.unavailable != report.unavailable_data_chunks
+        || available.checked_add(counts.unavailable) != Some(geometry.data_chunks)
+        || counts.source_state(
+            report.available_recovery_chunks,
+            report.observed_source_len,
+            report.expected_source_len,
+            report.source_digest,
+        ) != report.state
+    {
+        return Err(Error::ReportStructureMismatch);
+    }
+    Ok(ValidatedReport {
+        available_data_chunks: available,
+        unavailable_data_chunks: counts.unavailable,
+    })
 }
 
 fn location_targets(sidecar: &Sidecar, report: &Report) -> Result<Vec<Target>, Error> {
@@ -480,6 +515,12 @@ impl ChunkCounts {
             *counter = increment(*counter)?;
         }
         Ok(counts)
+    }
+
+    fn available(self) -> Result<u32, Error> {
+        self.good
+            .checked_add(self.unexpectedly_located)
+            .ok_or(Error::CountUnrepresentable)
     }
 
     const fn source_state(
@@ -680,6 +721,7 @@ pub enum Error {
     SourceChangedDuringLocation,
     ReportProtectionSetMismatch,
     ReportStructureMismatch,
+    InvalidDisplacedLocation(u32),
     FingerprintTableCountMismatch,
     DataDigestCountMismatch,
     RecoveryCountMismatch,
@@ -712,6 +754,9 @@ impl fmt::Display for Error {
             }
             Self::ReportStructureMismatch => {
                 formatter.write_str("verification report structure disagrees with the sidecar")
+            }
+            Self::InvalidDisplacedLocation(index) => {
+                write!(formatter, "chunk {index} has an invalid displaced location")
             }
             Self::FingerprintTableCountMismatch => {
                 formatter.write_str("sidecar fingerprint table counts disagree with its geometry")
@@ -827,6 +872,41 @@ mod tests {
         assert_eq!(report.available_recovery_chunks, 1);
         assert_eq!(report.unavailable_recovery_chunks, 0);
         assert!(report.chunks.iter().all(|chunk| chunk.state.is_good()));
+    }
+
+    #[test]
+    fn report_validation_owns_derived_counts_state_and_locations() {
+        let bytes = original();
+        let sidecar = sidecar(&bytes);
+        let report = source(&mut Cursor::new(&bytes), &sidecar).unwrap();
+        let validated = validate_report(&sidecar, &report).unwrap();
+        assert_eq!(validated.available_data_chunks(), 3);
+        assert_eq!(validated.unavailable_data_chunks(), 0);
+
+        let mut wrong_count = report.clone();
+        wrong_count.good_data_chunks -= 1;
+        assert!(matches!(
+            validate_report(&sidecar, &wrong_count),
+            Err(Error::ReportStructureMismatch)
+        ));
+
+        let mut wrong_state = report;
+        wrong_state.state = SourceState::Repairable;
+        assert!(matches!(
+            validate_report(&sidecar, &wrong_state),
+            Err(Error::ReportStructureMismatch)
+        ));
+
+        let mut damaged = bytes;
+        damaged[19] ^= 1;
+        let mut canonical_location = source(&mut Cursor::new(damaged), &sidecar).unwrap();
+        canonical_location.chunks[0].state = ChunkState::UnexpectedlyLocated { offset: 0 };
+        canonical_location.unavailable_data_chunks = 0;
+        canonical_location.unexpectedly_located_data_chunks = 1;
+        assert!(matches!(
+            validate_report(&sidecar, &canonical_location),
+            Err(Error::InvalidDisplacedLocation(0))
+        ));
     }
 
     #[test]

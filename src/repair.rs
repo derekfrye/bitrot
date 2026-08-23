@@ -12,7 +12,7 @@ pub use replace::{ReplaceError, ReplaceOutcome, ReplaceSummary, damaged_backup_p
 use crate::coding::{self, CodingWindow, WindowDecoder};
 use crate::geometry::Geometry;
 use crate::sidecar::Sidecar;
-use crate::verify::{self, ChunkReport, ChunkState, Report, SourceDigestState, SourceState};
+use crate::verify::{self, ChunkState, Report, SourceDigestState, SourceState};
 use std::fmt;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
@@ -86,7 +86,7 @@ where
     }
 
     let coding = CodingWindow::new(geometry, options.coding_window_bytes).map_err(Error::Coding)?;
-    let mut decoder = if counts.unavailable == 0 {
+    let mut decoder = if counts.unavailable_data_chunks() == 0 {
         None
     } else {
         Some(coding.decoder().map_err(Error::Coding)?)
@@ -125,80 +125,19 @@ where
 
     Ok(Summary {
         bytes_written: geometry.source_len,
-        copied_data_chunks: counts.available,
-        reconstructed_data_chunks: counts.unavailable,
+        copied_data_chunks: counts.available_data_chunks(),
+        reconstructed_data_chunks: counts.unavailable_data_chunks(),
     })
 }
 
-#[derive(Clone, Copy)]
-struct Counts {
-    available: u32,
-    unavailable: u32,
-}
-
-fn validate_repair(sidecar: &Sidecar, report: &Report) -> Result<Counts, Error> {
-    verify::validate_report(sidecar, report).map_err(Error::Report)?;
+fn validate_repair(sidecar: &Sidecar, report: &Report) -> Result<verify::ValidatedReport, Error> {
+    let counts = verify::validate_report(sidecar, report).map_err(Error::Report)?;
     match report.state {
         SourceState::Intact => return Err(Error::SourceIntact),
         SourceState::Unrepairable => return Err(Error::Unrepairable),
         SourceState::Repairable => {}
     }
-
-    let geometry = sidecar.metadata.manifest.geometry();
-    let mut good = 0_u32;
-    let mut located = 0_u32;
-    let mut unavailable = 0_u32;
-    for chunk in &report.chunks {
-        match chunk.state {
-            ChunkState::Good => good = increment(good)?,
-            ChunkState::UnexpectedlyLocated { offset } => {
-                validate_location(*chunk, geometry, report.observed_source_len, offset)?;
-                located = increment(located)?;
-            }
-            ChunkState::Corrupt | ChunkState::Missing | ChunkState::Unreadable(_) => {
-                unavailable = increment(unavailable)?;
-            }
-        }
-    }
-    let available = good
-        .checked_add(located)
-        .ok_or(Error::CountUnrepresentable)?;
-    if good != report.good_data_chunks
-        || located != report.unexpectedly_located_data_chunks
-        || unavailable != report.unavailable_data_chunks
-        || available
-            .checked_add(unavailable)
-            .ok_or(Error::CountUnrepresentable)?
-            != geometry.data_chunks
-    {
-        return Err(Error::ReportCountMismatch);
-    }
-    if unavailable > report.available_recovery_chunks {
-        return Err(Error::Unrepairable);
-    }
-    Ok(Counts {
-        available,
-        unavailable,
-    })
-}
-
-fn validate_location(
-    chunk: ChunkReport,
-    geometry: Geometry,
-    observed_source_len: u64,
-    offset: u64,
-) -> Result<(), Error> {
-    if chunk.expected_len != geometry.chunk_size.bytes() {
-        return Err(Error::InvalidDisplacedLocation(chunk.index));
-    }
-    let canonical = chunk_offset(chunk.index, geometry)?;
-    let end = offset
-        .checked_add(u64::from(chunk.expected_len))
-        .ok_or(Error::SourceOffsetOverflow)?;
-    if offset == canonical || end > observed_source_len {
-        return Err(Error::InvalidDisplacedLocation(chunk.index));
-    }
-    Ok(())
+    Ok(counts)
 }
 
 fn reconstruct_windows<S, D>(
@@ -365,17 +304,11 @@ fn chunk_offset(index: u32, geometry: Geometry) -> Result<u64, Error> {
         .ok_or(Error::SourceOffsetOverflow)
 }
 
-fn increment(value: u32) -> Result<u32, Error> {
-    value.checked_add(1).ok_or(Error::CountUnrepresentable)
-}
-
 #[derive(Debug)]
 pub enum Error {
     Report(verify::Error),
     SourceIntact,
     Unrepairable,
-    ReportCountMismatch,
-    InvalidDisplacedLocation(u32),
     DestinationNotEmpty(u64),
     SourceChanged {
         before: u64,
@@ -407,12 +340,6 @@ impl fmt::Display for Error {
             Self::SourceIntact => formatter.write_str("source is already intact"),
             Self::Unrepairable => {
                 formatter.write_str("verification report does not describe a repairable source")
-            }
-            Self::ReportCountMismatch => {
-                formatter.write_str("verification report counts disagree with its chunks")
-            }
-            Self::InvalidDisplacedLocation(index) => {
-                write!(formatter, "chunk {index} has an invalid displaced location")
             }
             Self::DestinationNotEmpty(length) => {
                 write!(

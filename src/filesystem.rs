@@ -196,12 +196,9 @@ impl Directory {
     }
 }
 
-pub(crate) struct EntryMetadata {
-    is_file: bool,
-    is_symlink: bool,
-    #[cfg(not(any(unix, windows)))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FileIdentity {
     len: u64,
-    #[cfg(not(windows))]
     modified: Option<SystemTime>,
     #[cfg(unix)]
     device: u64,
@@ -213,13 +210,35 @@ pub(crate) struct EntryMetadata {
     file_index: Option<u64>,
 }
 
-impl EntryMetadata {
-    #[cfg(any(unix, windows))]
-    fn from_cap(metadata: &cap_std::fs::Metadata) -> Self {
+impl FileIdentity {
+    pub(crate) fn capture(file: &File) -> io::Result<Self> {
+        file.metadata().map(|metadata| Self::from_std(&metadata))
+    }
+
+    pub(crate) fn from_std(metadata: &Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt as _;
+        #[cfg(windows)]
+        use std::os::windows::fs::MetadataExt as _;
+
         Self {
-            is_file: metadata.is_file(),
-            is_symlink: metadata.file_type().is_symlink(),
-            #[cfg(not(windows))]
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(windows)]
+            volume_serial_number: metadata.volume_serial_number(),
+            #[cfg(windows)]
+            file_index: metadata.file_index(),
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    pub(crate) fn from_cap(metadata: &cap_std::fs::Metadata) -> Self {
+        Self {
+            len: metadata.len(),
             modified: metadata
                 .modified()
                 .ok()
@@ -235,13 +254,49 @@ impl EntryMetadata {
         }
     }
 
+    pub(crate) const fn same_entry(&self, other: &Self) -> bool {
+        #[cfg(unix)]
+        {
+            self.device == other.device && self.inode == other.inode
+        }
+        #[cfg(windows)]
+        {
+            same_windows_file_id(
+                self.volume_serial_number,
+                self.file_index,
+                other.volume_serial_number,
+                other.file_index,
+            )
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            self.len == other.len && self.modified == other.modified
+        }
+    }
+}
+
+pub(crate) struct EntryMetadata {
+    is_file: bool,
+    is_symlink: bool,
+    identity: FileIdentity,
+}
+
+impl EntryMetadata {
+    #[cfg(any(unix, windows))]
+    fn from_cap(metadata: &cap_std::fs::Metadata) -> Self {
+        Self {
+            is_file: metadata.is_file(),
+            is_symlink: metadata.file_type().is_symlink(),
+            identity: FileIdentity::from_cap(metadata),
+        }
+    }
+
     #[cfg(not(any(unix, windows)))]
     fn from_std(metadata: Metadata) -> Self {
         Self {
             is_file: metadata.is_file(),
             is_symlink: metadata.file_type().is_symlink(),
-            len: metadata.len(),
-            modified: metadata.modified().ok(),
+            identity: FileIdentity::from_std(&metadata),
         }
     }
 
@@ -253,23 +308,12 @@ impl EntryMetadata {
         self.is_symlink
     }
 
-    #[cfg(unix)]
-    pub(crate) const fn unix_identity(&self) -> (u64, u64) {
-        (self.device, self.inode)
-    }
-
-    #[cfg(windows)]
-    pub(crate) const fn windows_identity(&self) -> (Option<u32>, Option<u64>) {
-        (self.volume_serial_number, self.file_index)
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    pub(crate) const fn fallback_identity(&self) -> (u64, Option<SystemTime>) {
-        (self.len, self.modified)
+    pub(crate) const fn identity(&self) -> &FileIdentity {
+        &self.identity
     }
 
     pub(crate) fn same_file(&self, metadata: &Metadata) -> bool {
-        same_entry_identity(metadata, self)
+        self.identity.same_entry(&FileIdentity::from_std(metadata))
     }
 }
 
@@ -432,6 +476,7 @@ pub(crate) fn cleanup_stale_temporaries(
             let metadata = directory.symlink_metadata(&name)?;
             if !metadata.is_file()
                 || metadata
+                    .identity
                     .modified
                     .and_then(|modified| now.duration_since(modified).ok())
                     .is_none_or(|age| age < STALE_TEMPORARY_AGE)
@@ -599,30 +644,8 @@ pub(crate) fn remove_file_if_same(
     }
 }
 
-fn same_entry_identity(left: &Metadata, right: &EntryMetadata) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        left.dev() == right.device && left.ino() == right.inode
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt as _;
-        same_windows_file_id(
-            left.volume_serial_number(),
-            left.file_index(),
-            right.volume_serial_number,
-            right.file_index,
-        )
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        left.len() == right.len && left.modified().ok() == right.modified
-    }
-}
-
 #[cfg(any(windows, test))]
-pub(crate) const fn same_windows_file_id(
+const fn same_windows_file_id(
     left_volume: Option<u32>,
     left_index: Option<u64>,
     right_volume: Option<u32>,
@@ -651,5 +674,37 @@ pub(crate) fn finish_publication(
         (Some(error), None) => Err(FinishError::Cleanup(error)),
         (None, Some(error)) => Err(FinishError::Sync(error)),
         (Some(cleanup), Some(sync)) => Err(FinishError::CleanupAndSync { cleanup, sync }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn entry_identity_is_independent_of_mutable_metadata() {
+        let original = FileIdentity {
+            len: 10,
+            modified: None,
+            device: 7,
+            inode: 11,
+        };
+        let changed = FileIdentity {
+            len: 20,
+            ..original.clone()
+        };
+
+        assert_ne!(original, changed);
+        assert!(original.same_entry(&changed));
+    }
+
+    #[test]
+    fn windows_identity_requires_both_available_identifiers() {
+        assert!(same_windows_file_id(Some(7), Some(11), Some(7), Some(11)));
+        assert!(!same_windows_file_id(None, Some(11), None, Some(11)));
+        assert!(!same_windows_file_id(Some(7), None, Some(7), None));
+        assert!(!same_windows_file_id(Some(7), Some(11), Some(8), Some(11)));
+        assert!(!same_windows_file_id(Some(7), Some(11), Some(7), Some(12)));
     }
 }

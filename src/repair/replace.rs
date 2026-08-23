@@ -1,20 +1,19 @@
 //! Transactional replacement with retention of the damaged source.
 
 use super::{PublishError, PublishOptions, PublishOutcome, PublishSummary, publish};
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+use crate::filesystem::FileIdentity;
 use crate::sidecar::{ReadError as SidecarReadError, Sidecar};
 use crate::verify::{self, SourceDigestState, SourceState};
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-use cap_std::fs::{
-    Dir, MetadataExt as _, OpenOptions as DirectoryOpenOptions, OpenOptionsExt as _,
-};
+use cap_std::fs::{Dir, OpenOptions as DirectoryOpenOptions, OpenOptionsExt as _};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::fs::{self, File, Metadata, OpenOptions, TryLockError};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Seek, SeekFrom};
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 const BACKUP_SUFFIX: &str = ".bitrot-damaged";
 const STAGING_SUFFIX: &str = ".bitrot-replacement";
@@ -175,7 +174,7 @@ fn read_sidecar(path: &Path, options: PublishOptions) -> Result<Sidecar, Replace
     open_options.custom_flags(libc::O_NOFOLLOW);
     let file = open_options.open(path).map_err(ReplaceError::OpenSidecar)?;
     let opened = file.metadata().map_err(ReplaceError::SidecarMetadata)?;
-    if FileIdentity::from_metadata(&metadata) != FileIdentity::from_metadata(&opened) {
+    if FileIdentity::from_std(&metadata) != FileIdentity::from_std(&opened) {
         return Err(ReplaceError::SidecarIdentityChanged);
     }
     Sidecar::read(file, options.sidecar_limits)
@@ -387,7 +386,7 @@ impl SourceDirectory {
             .map(cap_std::fs::File::into_std)
             .map_err(EntryError::Open)?;
         let identity = FileIdentity::capture(&file).map_err(EntryError::Metadata)?;
-        if !identity.same_cap_metadata(&metadata) {
+        if identity != FileIdentity::from_cap(&metadata) {
             return Err(EntryError::IdentityChanged(role));
         }
         file.try_lock().map_err(|error| match error {
@@ -430,7 +429,7 @@ impl SourceDirectory {
     fn entry_identity(&self, name: &OsStr) -> io::Result<Option<FileIdentity>> {
         match self.directory.symlink_metadata(name) {
             Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
-                Ok(Some(FileIdentity::from_cap_metadata(&metadata)))
+                Ok(Some(FileIdentity::from_cap(&metadata)))
             }
             Ok(_) => Ok(None),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -456,49 +455,6 @@ fn require_path_identity(
         Ok(())
     } else {
         Err(io::Error::other("pathname or open-file identity changed"))
-    }
-}
-
-#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct FileIdentity {
-    len: u64,
-    modified: Option<SystemTime>,
-    device: u64,
-    inode: u64,
-}
-
-#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-impl FileIdentity {
-    fn capture(file: &File) -> io::Result<Self> {
-        file.metadata()
-            .map(|metadata| Self::from_metadata(&metadata))
-    }
-
-    fn from_metadata(metadata: &Metadata) -> Self {
-        use std::os::unix::fs::MetadataExt as _;
-        Self {
-            len: metadata.len(),
-            modified: metadata.modified().ok(),
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        }
-    }
-
-    fn from_cap_metadata(metadata: &cap_std::fs::Metadata) -> Self {
-        Self {
-            len: metadata.len(),
-            modified: metadata
-                .modified()
-                .ok()
-                .map(cap_std::time::SystemTime::into_std),
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        }
-    }
-
-    fn same_cap_metadata(&self, metadata: &cap_std::fs::Metadata) -> bool {
-        self == &Self::from_cap_metadata(metadata)
     }
 }
 

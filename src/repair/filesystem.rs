@@ -1,12 +1,10 @@
 //! Safe publication of a repaired source under a new filesystem name.
 
 use super::{Error as ReconstructionError, Options as ReconstructionOptions, Summary};
-#[cfg(any(windows, test))]
-use crate::filesystem::same_windows_file_id;
 #[cfg(test)]
 use crate::filesystem::temporary_name;
 use crate::filesystem::{
-    CreateTemporaryError, Directory as DestinationDirectory, EntryMetadata, FinishError,
+    CreateTemporaryError, Directory as DestinationDirectory, FileIdentity, FinishError,
     TemporaryFile, TemporaryKind, cleanup_stale_temporaries as cleanup_stale, destination_parent,
     finish_publication as finish_filesystem_publication, path_names_file,
 };
@@ -14,10 +12,9 @@ use crate::sidecar::{ReadError as SidecarReadError, ReadLimits, Sidecar};
 use crate::verify::{self, LocateOptions, LocationSummary, SourceDigestState, SourceState};
 use std::ffi::OsStr;
 use std::fmt;
-use std::fs::{self, File, Metadata, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, SeekFrom};
 use std::path::Path;
-use std::time::SystemTime;
 #[cfg(test)]
 use std::time::UNIX_EPOCH;
 
@@ -308,7 +305,7 @@ fn inspect_destination(
     if metadata.is_symlink() || !metadata.is_file() {
         return Ok(DestinationState::Conflict);
     }
-    if source_identity.same_entry(&metadata) {
+    if source_identity.same_entry(metadata.identity()) {
         return Ok(DestinationState::SourceAlias);
     }
     let mut file = match directory.open_read_no_follow(destination) {
@@ -319,73 +316,12 @@ fn inspect_destination(
         Err(error) => return Err(PublishError::InspectDestination(error)),
     };
     let open_identity = FileIdentity::capture(&file).map_err(PublishError::InspectDestination)?;
-    if !open_identity.same_entry(&metadata) {
+    if !open_identity.same_entry(metadata.identity()) {
         return Ok(DestinationState::Conflict);
     }
     match verify_intact(&mut file, sidecar) {
         Ok(()) => Ok(DestinationState::Current),
         Err(_) => Ok(DestinationState::Conflict),
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct FileIdentity {
-    len: u64,
-    modified: Option<SystemTime>,
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-    #[cfg(windows)]
-    volume_serial_number: Option<u32>,
-    #[cfg(windows)]
-    file_index: Option<u64>,
-}
-
-impl FileIdentity {
-    fn capture(file: &File) -> io::Result<Self> {
-        file.metadata().map(|metadata| Self::from_std(&metadata))
-    }
-
-    fn from_std(metadata: &Metadata) -> Self {
-        #[cfg(unix)]
-        use std::os::unix::fs::MetadataExt as _;
-        #[cfg(windows)]
-        use std::os::windows::fs::MetadataExt as _;
-
-        Self {
-            len: metadata.len(),
-            modified: metadata.modified().ok(),
-            #[cfg(unix)]
-            device: metadata.dev(),
-            #[cfg(unix)]
-            inode: metadata.ino(),
-            #[cfg(windows)]
-            volume_serial_number: metadata.volume_serial_number(),
-            #[cfg(windows)]
-            file_index: metadata.file_index(),
-        }
-    }
-
-    fn same_entry(&self, metadata: &EntryMetadata) -> bool {
-        #[cfg(unix)]
-        {
-            (self.device, self.inode) == metadata.unix_identity()
-        }
-        #[cfg(windows)]
-        {
-            let (volume_serial_number, file_index) = metadata.windows_identity();
-            same_windows_file_id(
-                self.volume_serial_number,
-                self.file_index,
-                volume_serial_number,
-                file_index,
-            )
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            (self.len, self.modified) == metadata.fallback_identity()
-        }
     }
 }
 
@@ -810,14 +746,6 @@ mod tests {
             .into_iter()
             .flat_map(|value| vec![value; CHUNK_BYTES])
             .collect()
-    }
-
-    #[test]
-    fn windows_identity_requires_both_available_identifiers() {
-        assert!(same_windows_file_id(Some(7), Some(11), Some(7), Some(11)));
-        assert!(!same_windows_file_id(None, Some(11), None, Some(11)));
-        assert!(!same_windows_file_id(Some(7), None, Some(7), None));
-        assert!(!same_windows_file_id(Some(7), Some(11), Some(8), Some(11)));
     }
 
     fn create_options() -> CreateOptions {
