@@ -604,8 +604,12 @@ useful later feature for storing parity across devices and copying only part of
 a recovery set.
 
 The creator must write to a uniquely named temporary file in the destination
-directory, flush it, verify its records, and atomically rename it into place.
-It must not publish a partially created sidecar.
+directory, flush it, verify its records, and atomically install it. Default
+no-clobber publication may link the completed temporary inode into place and
+then remove its temporary name; explicit replacement uses an atomic rename.
+A filesystem without the required atomic primitive fails safely rather than
+falling back to a racy existence check. Creation must never publish a partial
+sidecar.
 
 ## Operations
 
@@ -627,7 +631,14 @@ Creation performs these steps:
 5. Recheck source metadata and digest; abort if the source changed.
 6. Finish and flush the temporary sidecar.
 7. Parse and verify the new sidecar from disk.
-8. Atomically rename it and sync the containing directory where supported.
+8. Atomically install it and sync the containing directory where supported.
+
+Path-based creation stores generated recovery bytes in a uniquely named scratch
+file and consumes that scratch one recovery chunk at a time when writing and
+verifying the final sidecar. New recovery data is therefore never retained as
+one complete in-memory set: memory is bounded by the chosen coding window,
+fingerprint tables, and a constant number of chunks rather than the total
+redundancy size. Scratch data is removed after publication or error.
 
 An existing valid sidecar is not overwritten unless explicitly requested. A
 matching sidecar makes creation a successful no-op. A conflicting sidecar is

@@ -1,11 +1,16 @@
 //! Construction of a complete protection set from a seekable source.
 
+mod filesystem;
+mod spool;
+
+pub use filesystem::{ExistingSidecar, PublishError, PublishOutcome, publish};
+
 use crate::coding::{self, CodingWindow};
 use crate::creator::Creator;
 use crate::digest_page::{self, Kind};
-use crate::fingerprint::{self, SourceFingerprint};
+use crate::fingerprint::{self, Digest, SourceFingerprint};
 use crate::geometry::{self, ChunkSize, Geometry, Redundancy};
-use crate::manifest;
+use crate::manifest::{self, Manifest};
 use crate::metadata::Metadata;
 use crate::recovery_chunk::{self, RecoveryChunk};
 use crate::rolling_page;
@@ -54,21 +59,14 @@ impl Options {
 /// for the recovery set cannot be reserved, or generated format structures do
 /// not validate.
 pub fn build<R: Read + Seek>(source: &mut R, options: &Options) -> Result<Sidecar, Error> {
-    source.seek(SeekFrom::Start(0)).map_err(Error::SourceSeek)?;
-    let fingerprint =
-        fingerprint::source(source, options.chunk_size).map_err(Error::Fingerprint)?;
-    let geometry = Geometry::new(
-        fingerprint.source_len,
-        options.chunk_size,
-        options.redundancy,
-    )
-    .map_err(Error::Geometry)?;
-    let coding = CodingWindow::new(geometry, options.coding_window_bytes).map_err(Error::Coding)?;
-
+    let (fingerprint, geometry) = analyze(source, options)?;
     let mut recovery = recovery_buffers(geometry)?;
-    let mut encoder = coding.encoder().map_err(Error::Coding)?;
-    encoder
-        .encode_source(source, |offset, index, bytes| {
+    encode_and_confirm(
+        source,
+        options,
+        &fingerprint,
+        geometry,
+        |offset, index, bytes| {
             let chunk = recovery.get_mut(index).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "unexpected recovery index")
             })?;
@@ -80,16 +78,50 @@ pub fn build<R: Read + Seek>(source: &mut R, options: &Options) -> Result<Sideca
             }
             chunk.extend_from_slice(bytes);
             Ok(())
-        })
+        },
+    )?;
+    assemble(fingerprint, geometry, recovery, options.creator.clone())
+}
+
+fn analyze<R: Read + Seek>(
+    source: &mut R,
+    options: &Options,
+) -> Result<(SourceFingerprint, Geometry), Error> {
+    source.seek(SeekFrom::Start(0)).map_err(Error::SourceSeek)?;
+    let fingerprint =
+        fingerprint::source(source, options.chunk_size).map_err(Error::Fingerprint)?;
+    let geometry = Geometry::new(
+        fingerprint.source_len,
+        options.chunk_size,
+        options.redundancy,
+    )
+    .map_err(Error::Geometry)?;
+    Ok((fingerprint, geometry))
+}
+
+fn encode_and_confirm<R, F>(
+    source: &mut R,
+    options: &Options,
+    fingerprint: &SourceFingerprint,
+    geometry: Geometry,
+    output: F,
+) -> Result<(), Error>
+where
+    R: Read + Seek,
+    F: FnMut(usize, usize, &[u8]) -> io::Result<()>,
+{
+    let coding = CodingWindow::new(geometry, options.coding_window_bytes).map_err(Error::Coding)?;
+    let mut encoder = coding.encoder().map_err(Error::Coding)?;
+    encoder
+        .encode_source(source, output)
         .map_err(Error::Coding)?;
 
     source.seek(SeekFrom::Start(0)).map_err(Error::SourceSeek)?;
     let confirmed = fingerprint::source(source, options.chunk_size).map_err(Error::Fingerprint)?;
-    if confirmed != fingerprint {
+    if confirmed != *fingerprint {
         return Err(Error::SourceChanged);
     }
-
-    assemble(fingerprint, geometry, recovery, options.creator.clone())
+    Ok(())
 }
 
 fn recovery_buffers(geometry: Geometry) -> Result<Vec<Vec<u8>>, Error> {
@@ -116,24 +148,11 @@ fn assemble(
     recovery: Vec<Vec<u8>>,
     creator: Creator,
 ) -> Result<Sidecar, Error> {
-    let data_digests = digest_page::Table::new(Kind::Data, fingerprint.data_chunk_digests)
-        .map_err(Error::DigestTable)?;
-    let rolling_fingerprints =
-        rolling_page::Table::new(fingerprint.full_chunk_rolling).map_err(Error::RollingTable)?;
     let recovery_digest_values = recovery
         .iter()
         .map(|chunk| fingerprint::recovery_chunk_digest(chunk))
         .collect();
-    let recovery_digests = digest_page::Table::new(Kind::Recovery, recovery_digest_values)
-        .map_err(Error::DigestTable)?;
-    let metadata = Metadata::new(
-        geometry,
-        fingerprint.source_digest,
-        data_digests,
-        recovery_digests,
-        rolling_fingerprints,
-    )
-    .map_err(Error::Manifest)?;
+    let metadata = build_metadata(fingerprint, geometry, recovery_digest_values)?;
     let manifest = metadata.manifest;
     let recovery = recovery
         .into_iter()
@@ -144,6 +163,33 @@ fn assemble(
         })
         .collect::<Result<Vec<_>, _>>()?;
     Sidecar::from_generated_parts(metadata, creator, recovery).map_err(Error::Sidecar)
+}
+
+fn build_metadata(
+    fingerprint: SourceFingerprint,
+    geometry: Geometry,
+    recovery_digest_values: Vec<Digest>,
+) -> Result<Metadata, Error> {
+    let data_digests = digest_page::Table::new(Kind::Data, fingerprint.data_chunk_digests)
+        .map_err(Error::DigestTable)?;
+    let rolling_fingerprints =
+        rolling_page::Table::new(fingerprint.full_chunk_rolling).map_err(Error::RollingTable)?;
+    let recovery_digests = digest_page::Table::new(Kind::Recovery, recovery_digest_values)
+        .map_err(Error::DigestTable)?;
+    let manifest = Manifest::new(
+        geometry,
+        fingerprint.source_digest,
+        &data_digests,
+        &recovery_digests,
+        &rolling_fingerprints,
+    )
+    .map_err(Error::Manifest)?;
+    Ok(Metadata {
+        manifest,
+        data_digests,
+        recovery_digests,
+        rolling_fingerprints,
+    })
 }
 
 #[derive(Debug)]
