@@ -8,6 +8,7 @@ pub mod create;
 pub mod creator;
 pub mod digest;
 pub mod digest_page;
+mod filesystem;
 pub mod fingerprint;
 pub mod geometry;
 pub mod manifest;

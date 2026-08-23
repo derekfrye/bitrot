@@ -157,6 +157,13 @@ pub struct Geometry {
     pub final_data_chunk_len: u32,
 }
 
+/// Canonical byte range occupied by one data chunk in its source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DataChunkLayout {
+    pub offset: u64,
+    pub len: u32,
+}
+
 #[derive(Clone, Copy)]
 struct SourceLayout {
     data_chunks: u64,
@@ -253,6 +260,24 @@ impl Geometry {
     pub const fn full_data_chunks(self) -> u64 {
         let short_final = self.final_data_chunk_len < self.chunk_size.bytes();
         self.data_chunks.saturating_sub(short_final as u32) as u64
+    }
+
+    /// Returns the canonical byte range for `index`, or `None` when the index
+    /// is outside this geometry's data chunks.
+    #[must_use]
+    pub const fn data_chunk_layout(self, index: u32) -> Option<DataChunkLayout> {
+        if index >= self.data_chunks {
+            return None;
+        }
+        let len = if index + 1 == self.data_chunks {
+            self.final_data_chunk_len
+        } else {
+            self.chunk_size.bytes()
+        };
+        Some(DataChunkLayout {
+            offset: index as u64 * self.chunk_size.bytes() as u64,
+            len,
+        })
     }
 
     #[must_use]
@@ -439,12 +464,28 @@ mod tests {
         assert_eq!(partial.final_data_chunk_len, 7);
         assert_eq!(partial.full_data_chunks(), 1);
         assert_eq!(partial.padded_source_len(), u64::from(MIN_CHUNK_SIZE) * 2);
+        assert_eq!(
+            partial.data_chunk_layout(0),
+            Some(DataChunkLayout {
+                offset: 0,
+                len: MIN_CHUNK_SIZE,
+            })
+        );
+        assert_eq!(
+            partial.data_chunk_layout(1),
+            Some(DataChunkLayout {
+                offset: u64::from(MIN_CHUNK_SIZE),
+                len: 7,
+            })
+        );
+        assert_eq!(partial.data_chunk_layout(2), None);
 
         let exact =
             Geometry::new(u64::from(MIN_CHUNK_SIZE) * 2, chunk_size, fifteen_percent()).unwrap();
         assert_eq!(exact.data_chunks, 2);
         assert_eq!(exact.final_data_chunk_len, MIN_CHUNK_SIZE);
         assert_eq!(exact.full_data_chunks(), 2);
+        assert_eq!(exact.data_chunk_layout(1).unwrap().len, MIN_CHUNK_SIZE);
     }
 
     #[test]

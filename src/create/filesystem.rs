@@ -3,33 +3,22 @@
 use super::spool::RecoverySpool;
 use super::{Error as BuildError, Options, analyze, build_metadata, encode_and_confirm};
 use crate::creator::Creator;
+#[cfg(any(windows, test))]
+use crate::filesystem::same_windows_file_id;
+use crate::filesystem::{
+    CreateTemporaryError, Directory as DestinationDirectory, FinishError, TemporaryFile,
+    TemporaryKind, cleanup_stale_temporaries as cleanup_stale, destination_parent,
+    finish_publication as finish_filesystem_publication, remove_file_if_same,
+};
 use crate::metadata::Metadata as ProtectionMetadata;
 use crate::record::{self, DecodeLimits, Record};
 use crate::recovery_chunk::{self, RecoveryChunk};
 use crate::sidecar::{CanonicalLayout, ReadLimits, Sidecar, WriteSummary};
-#[cfg(windows)]
-use cap_std::ambient_authority;
-#[cfg(any(unix, windows))]
-use cap_std::fs::MetadataExt as CapMetadataExt;
-#[cfg(unix)]
-use cap_std::fs::OpenOptionsExt as CapOpenOptionsExt;
-#[cfg(any(unix, windows))]
-use cap_std::fs::{Dir, OpenOptions as DirectoryOpenOptions};
-use std::ffi::OsString;
 use std::fmt;
-use std::fs::{self, File, Metadata, OpenOptions, TryLockError};
+use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::Path;
-#[cfg(not(any(unix, windows)))]
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
-
-#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-const STALE_TEMPORARY_AGE: Duration = Duration::from_hours(24);
-static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
+use std::time::SystemTime;
 
 /// Policy for a conflicting object already at the requested sidecar path.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -82,15 +71,14 @@ pub fn publish(
     }
 
     let parent = destination_parent(sidecar_path);
-    let directory = DestinationDirectory::open(parent)?;
+    let directory = DestinationDirectory::open(parent).map_err(PublishError::OpenDirectory)?;
     let destination_name = sidecar_path
         .file_name()
         .ok_or(PublishError::DestinationHasNoFileName)?;
     let (mut source, snapshot) = open_source(source_path)?;
     let (fingerprint, geometry) = analyze(&mut source, options).map_err(PublishError::Build)?;
     cleanup_stale_temporaries(&directory, destination_name)?;
-    let spool_temporary =
-        create_temporary(&directory, destination_name, TemporaryKind::RecoverySpool)?;
+    let spool_temporary = create_temporary(&directory, destination_name, TemporaryKind::Recovery)?;
     let mut spool = RecoverySpool::new(
         spool_temporary
             .file
@@ -133,7 +121,7 @@ pub fn publish(
         .sync_all()
         .map_err(PublishError::SyncTemporary)?;
     verify_temporary(&mut temporary.file, &plan, summary)?;
-    temporary.verify_path_identity()?;
+    verify_temporary_path(&temporary)?;
     let published = publish_temporary(
         &mut temporary,
         &directory,
@@ -238,15 +226,16 @@ fn destination_is_source(
     };
     #[cfg(unix)]
     {
-        Ok(snapshot.device == metadata.device && snapshot.inode == metadata.inode)
+        Ok((snapshot.device, snapshot.inode) == metadata.unix_identity())
     }
     #[cfg(windows)]
     {
+        let (volume_serial_number, file_index) = metadata.windows_identity();
         Ok(same_windows_file_id(
             snapshot.volume_serial_number,
             snapshot.file_index,
-            metadata.volume_serial_number,
-            metadata.file_index,
+            volume_serial_number,
+            file_index,
         ))
     }
     #[cfg(not(any(unix, windows)))]
@@ -438,459 +427,29 @@ fn inspect_existing(
     ))
 }
 
-fn destination_parent(path: &Path) -> &Path {
-    path.parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."))
-}
-
-struct DestinationDirectory {
-    #[cfg(any(unix, windows))]
-    directory: Dir,
-    #[cfg(unix)]
-    sync_file: File,
-    #[cfg(not(any(unix, windows)))]
-    ambient_path: PathBuf,
-}
-
-impl DestinationDirectory {
-    fn open(path: &Path) -> Result<Self, PublishError> {
-        #[cfg(unix)]
-        let (directory, sync_file) = {
-            let sync_file = File::open(path).map_err(PublishError::OpenDirectory)?;
-            let directory =
-                Dir::from_std_file(sync_file.try_clone().map_err(PublishError::OpenDirectory)?);
-            (directory, sync_file)
-        };
-        #[cfg(not(unix))]
-        #[cfg(windows)]
-        let directory = Dir::open_ambient_dir(path, ambient_authority())
-            .map_err(PublishError::OpenDirectory)?;
-        #[cfg(not(any(unix, windows)))]
-        let ambient_path = path.to_owned();
-        Ok(Self {
-            #[cfg(any(unix, windows))]
-            directory,
-            #[cfg(unix)]
-            sync_file,
-            #[cfg(not(any(unix, windows)))]
-            ambient_path,
-        })
-    }
-
-    fn open_read_no_follow(&self, name: &std::ffi::OsStr) -> io::Result<File> {
-        #[cfg(any(unix, windows))]
-        {
-            let mut options = DirectoryOpenOptions::new();
-            options.read(true);
-            set_no_follow(&mut options);
-            self.directory
-                .open_with(name, &options)
-                .map(cap_std::fs::File::into_std)
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            open_read_no_follow(&self.ambient_path.join(name))
-        }
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-    fn open_read_write_no_follow(&self, name: &std::ffi::OsStr) -> io::Result<File> {
-        let mut options = DirectoryOpenOptions::new();
-        options.read(true).write(true);
-        set_no_follow(&mut options);
-        self.directory
-            .open_with(name, &options)
-            .map(cap_std::fs::File::into_std)
-    }
-
-    fn create_new(&self, name: &std::ffi::OsStr) -> io::Result<File> {
-        #[cfg(any(unix, windows))]
-        {
-            let mut options = DirectoryOpenOptions::new();
-            options.read(true).write(true).create_new(true);
-            set_no_follow(&mut options);
-            self.directory
-                .open_with(name, &options)
-                .map(cap_std::fs::File::into_std)
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .open(self.ambient_path.join(name))
-        }
-    }
-
-    fn symlink_metadata(&self, name: &std::ffi::OsStr) -> io::Result<EntryMetadata> {
-        #[cfg(any(unix, windows))]
-        {
-            self.directory
-                .symlink_metadata(name)
-                .map(|metadata| EntryMetadata::from_cap(&metadata))
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            fs::symlink_metadata(self.ambient_path.join(name)).map(EntryMetadata::from_std)
-        }
-    }
-
-    fn hard_link(&self, source: &std::ffi::OsStr, destination: &std::ffi::OsStr) -> io::Result<()> {
-        #[cfg(any(unix, windows))]
-        {
-            self.directory
-                .hard_link(source, &self.directory, destination)
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            fs::hard_link(
-                self.ambient_path.join(source),
-                self.ambient_path.join(destination),
-            )
-        }
-    }
-
-    fn rename(&self, source: &std::ffi::OsStr, destination: &std::ffi::OsStr) -> io::Result<()> {
-        #[cfg(any(unix, windows))]
-        {
-            self.directory.rename(source, &self.directory, destination)
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            fs::rename(
-                self.ambient_path.join(source),
-                self.ambient_path.join(destination),
-            )
-        }
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-    fn rename_no_replace(
-        &self,
-        source: &std::ffi::OsStr,
-        destination: &std::ffi::OsStr,
-    ) -> io::Result<()> {
-        rustix::fs::renameat_with(
-            &self.directory,
-            source,
-            &self.directory,
-            destination,
-            rustix::fs::RenameFlags::NOREPLACE,
-        )
-        .map_err(io::Error::from)
-    }
-
-    fn remove_file(&self, name: &std::ffi::OsStr) -> io::Result<()> {
-        #[cfg(any(unix, windows))]
-        {
-            self.directory.remove_file(name)
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            fs::remove_file(self.ambient_path.join(name))
-        }
-    }
-
-    fn sync(&self) -> io::Result<()> {
-        #[cfg(unix)]
-        {
-            self.sync_file.sync_all()
-        }
-        #[cfg(not(unix))]
-        {
-            Ok(())
-        }
-    }
-}
-
-struct EntryMetadata {
-    is_file: bool,
-    is_symlink: bool,
-    #[cfg(not(any(unix, windows)))]
-    len: u64,
-    #[cfg(not(windows))]
-    modified: Option<SystemTime>,
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-    #[cfg(windows)]
-    volume_serial_number: Option<u32>,
-    #[cfg(windows)]
-    file_index: Option<u64>,
-}
-
-impl EntryMetadata {
-    #[cfg(any(unix, windows))]
-    fn from_cap(metadata: &cap_std::fs::Metadata) -> Self {
-        Self {
-            is_file: metadata.is_file(),
-            is_symlink: metadata.file_type().is_symlink(),
-            #[cfg(not(any(unix, windows)))]
-            len: metadata.len(),
-            #[cfg(not(windows))]
-            modified: metadata
-                .modified()
-                .ok()
-                .map(cap_std::time::SystemTime::into_std),
-            #[cfg(unix)]
-            device: metadata.dev(),
-            #[cfg(unix)]
-            inode: metadata.ino(),
-            #[cfg(windows)]
-            volume_serial_number: metadata.volume_serial_number(),
-            #[cfg(windows)]
-            file_index: metadata.file_index(),
-        }
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    fn from_std(metadata: Metadata) -> Self {
-        Self {
-            is_file: metadata.is_file(),
-            is_symlink: metadata.file_type().is_symlink(),
-            len: metadata.len(),
-            modified: metadata.modified().ok(),
-        }
-    }
-
-    const fn is_file(&self) -> bool {
-        self.is_file
-    }
-
-    const fn is_symlink(&self) -> bool {
-        self.is_symlink
-    }
-}
-
-#[cfg(any(unix, windows))]
-fn set_no_follow(options: &mut DirectoryOpenOptions) {
-    #[cfg(unix)]
-    {
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = options;
-    }
-}
-
-#[derive(Clone, Copy)]
-enum TemporaryKind {
-    RecoverySpool,
-    Sidecar,
-}
-
-impl TemporaryKind {
-    const fn name(self) -> &'static str {
-        match self {
-            Self::RecoverySpool => "recovery",
-            Self::Sidecar => "sidecar",
-        }
-    }
-}
-
 fn create_temporary<'directory>(
     directory: &'directory DestinationDirectory,
     destination_name: &std::ffi::OsStr,
     kind: TemporaryKind,
 ) -> Result<TemporaryFile<'directory>, PublishError> {
-    let epoch_nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    for _ in 0_u32..128 {
-        let nonce = NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed);
-        let temporary_name = temporary_name(destination_name, kind, epoch_nonce, nonce);
-        match directory.create_new(&temporary_name) {
-            Ok(file) => {
-                file.try_lock().map_err(|error| match error {
-                    TryLockError::Error(error) => PublishError::LockTemporary(error),
-                    TryLockError::WouldBlock => PublishError::TemporaryLockContended,
-                })?;
-                return Ok(TemporaryFile::new(
-                    directory,
-                    destination_name.to_owned(),
-                    temporary_name,
-                    file,
-                ));
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(PublishError::CreateTemporary(error)),
-        }
-    }
-    Err(PublishError::TemporaryNameExhausted)
+    TemporaryFile::create(directory, destination_name, kind).map_err(|error| match error {
+        CreateTemporaryError::NameExhausted => PublishError::TemporaryNameExhausted,
+        CreateTemporaryError::LockContended => PublishError::TemporaryLockContended,
+        CreateTemporaryError::Create(error) => PublishError::CreateTemporary(error),
+        CreateTemporaryError::Lock(error) => PublishError::LockTemporary(error),
+    })
 }
 
-fn temporary_name(
-    destination_name: &std::ffi::OsStr,
-    kind: TemporaryKind,
-    epoch_nonce: u128,
-    nonce: u64,
-) -> OsString {
-    let mut temporary_name = OsString::from(destination_name);
-    temporary_name.push(format!(
-        ".bitrot-partial-{}-{}-{epoch_nonce:x}-{nonce:x}",
-        std::process::id(),
-        kind.name()
-    ));
-    temporary_name
-}
-
-#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 fn cleanup_stale_temporaries(
     directory: &DestinationDirectory,
     destination_name: &std::ffi::OsStr,
 ) -> Result<(), PublishError> {
-    use std::os::unix::ffi::OsStrExt;
-
-    let now = SystemTime::now();
-    let mut removed = false;
-
-    for entry in directory
-        .directory
-        .entries()
-        .map_err(PublishError::CleanupTemporaries)?
-    {
-        let entry = entry.map_err(PublishError::CleanupTemporaries)?;
-        let name = entry.file_name();
-        if !is_temporary_name_for(name.as_bytes(), destination_name.as_bytes()) {
-            continue;
-        }
-        let metadata = directory
-            .symlink_metadata(&name)
-            .map_err(PublishError::CleanupTemporaries)?;
-        if !metadata.is_file()
-            || metadata
-                .modified
-                .and_then(|modified| now.duration_since(modified).ok())
-                .is_none_or(|age| age < STALE_TEMPORARY_AGE)
-        {
-            continue;
-        }
-        let file = match directory.open_read_write_no_follow(&name) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(PublishError::CleanupTemporaries(error)),
-        };
-        match file.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => continue,
-            Err(TryLockError::Error(error)) => {
-                return Err(PublishError::CleanupTemporaries(error));
-            }
-        }
-        removed |= quarantine_and_remove(directory, destination_name, &name, &file)
-            .map_err(PublishError::CleanupTemporaries)?;
-    }
-
-    if removed {
-        directory.sync().map_err(PublishError::CleanupTemporaries)?;
-    }
-    Ok(())
-}
-
-#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-fn quarantine_and_remove(
-    directory: &DestinationDirectory,
-    destination_name: &std::ffi::OsStr,
-    original_name: &std::ffi::OsStr,
-    opened_file: &File,
-) -> io::Result<bool> {
-    let epoch_nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let mut quarantine_name = None;
-    for _ in 0_u32..128 {
-        let nonce = NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed);
-        let candidate =
-            temporary_name(destination_name, TemporaryKind::Sidecar, epoch_nonce, nonce);
-        match directory.rename_no_replace(original_name, &candidate) {
-            Ok(()) => {
-                quarantine_name = Some(candidate);
-                break;
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error),
-        }
-    }
-    let Some(quarantine_name) = quarantine_name else {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "cannot reserve a temporary-file quarantine name",
-        ));
-    };
-
-    let open_metadata = opened_file.metadata()?;
-    let moved_metadata = directory.symlink_metadata(&quarantine_name)?;
-    if moved_metadata.is_file() && same_entry_identity(&open_metadata, &moved_metadata) {
-        directory.remove_file(&quarantine_name)?;
-        return Ok(true);
-    }
-
-    match directory.rename_no_replace(&quarantine_name, original_name) {
-        Ok(()) => Err(io::Error::other(
-            "temporary pathname changed during cleanup; replacement was restored",
-        )),
-        Err(restore_error) => {
-            let quarantine_name = Path::new(&quarantine_name).display();
-            Err(io::Error::new(
-                restore_error.kind(),
-                format!(
-                    "temporary pathname changed during cleanup; replacement remains at {quarantine_name}: {restore_error}"
-                ),
-            ))
-        }
-    }
-}
-
-#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-fn is_temporary_name_for(candidate: &[u8], destination: &[u8]) -> bool {
-    let Some(suffix) = candidate.strip_prefix(destination) else {
-        return false;
-    };
-    let Some(fields) = suffix.strip_prefix(b".bitrot-partial-") else {
-        return false;
-    };
-    let mut fields = fields.split(|byte| *byte == b'-');
-    let Some(pid) = fields.next() else {
-        return false;
-    };
-    let Some(kind) = fields.next() else {
-        return false;
-    };
-    let Some(epoch) = fields.next() else {
-        return false;
-    };
-    let Some(nonce) = fields.next() else {
-        return false;
-    };
-    fields.next().is_none()
-        && !pid.is_empty()
-        && pid.iter().all(u8::is_ascii_digit)
-        && matches!(kind, b"recovery" | b"sidecar")
-        && is_lower_hex(epoch)
-        && is_lower_hex(nonce)
-}
-
-#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-fn is_lower_hex(value: &[u8]) -> bool {
-    !value.is_empty()
-        && value
-            .iter()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-fn cleanup_stale_temporaries(
-    _directory: &DestinationDirectory,
-    _destination_name: &std::ffi::OsStr,
-) -> Result<(), PublishError> {
-    Ok(())
+    cleanup_stale(
+        directory,
+        destination_name,
+        &[TemporaryKind::Recovery, TemporaryKind::Sidecar],
+    )
+    .map_err(PublishError::CleanupTemporaries)
 }
 
 fn verify_temporary(
@@ -1028,24 +587,7 @@ fn remove_published_file(
     destination: &std::ffi::OsStr,
     published: &File,
 ) -> io::Result<()> {
-    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-    let removed = quarantine_and_remove(directory, destination, destination, published)?;
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-    let removed = {
-        let expected = published.metadata()?;
-        let actual = match directory.symlink_metadata(destination) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(error),
-            Err(error) => return Err(error),
-        };
-        if actual.is_file() && same_entry_identity(&expected, &actual) {
-            directory.remove_file(destination)?;
-            true
-        } else {
-            false
-        }
-    };
-    if removed {
+    if remove_file_if_same(directory, destination, published, TemporaryKind::Sidecar)? {
         directory.sync()
     } else {
         Err(io::Error::other(
@@ -1058,150 +600,23 @@ fn finish_publication(
     cleanup: impl FnOnce() -> io::Result<()>,
     sync: impl FnOnce() -> io::Result<()>,
 ) -> Result<(), PublishError> {
-    let cleanup_error = cleanup().err();
-    let sync_error = sync().err();
-
-    match (cleanup_error, sync_error) {
-        (None, None) => Ok(()),
-        (Some(error), None) => Err(PublishError::PublishedButCleanupFailed(error)),
-        (None, Some(error)) => Err(PublishError::PublishedButSyncFailed(error)),
-        (Some(cleanup), Some(sync)) => {
-            Err(PublishError::PublishedButCleanupAndSyncFailed { cleanup, sync })
+    finish_filesystem_publication(cleanup, sync).map_err(|error| match error {
+        FinishError::Cleanup(error) => PublishError::PublishedButCleanupFailed(error),
+        FinishError::Sync(error) => PublishError::PublishedButSyncFailed(error),
+        FinishError::CleanupAndSync { cleanup, sync } => {
+            PublishError::PublishedButCleanupAndSyncFailed { cleanup, sync }
         }
-    }
+    })
 }
 
-struct TemporaryFile<'directory> {
-    directory: &'directory DestinationDirectory,
-    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-    destination_name: OsString,
-    name: OsString,
-    file: File,
-    armed: bool,
-}
-
-impl<'directory> TemporaryFile<'directory> {
-    fn new(
-        directory: &'directory DestinationDirectory,
-        destination_name: OsString,
-        name: OsString,
-        file: File,
-    ) -> Self {
-        #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-        let _ = destination_name;
-        Self {
-            directory,
-            #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-            destination_name,
-            name,
-            file,
-            armed: true,
-        }
-    }
-
-    fn name(&self) -> &std::ffi::OsStr {
-        &self.name
-    }
-
-    fn remove(&mut self) -> io::Result<()> {
-        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-        {
-            let result = quarantine_and_remove(
-                self.directory,
-                &self.destination_name,
-                &self.name,
-                &self.file,
-            );
-            self.armed = false;
-            match result {
-                Ok(true) => Ok(()),
-                Ok(false) => Err(io::Error::other(
-                    "temporary path no longer names the file created by this process",
-                )),
-                Err(error) => Err(error),
-            }
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-        {
-            if !self.path_still_names_file()? {
-                self.armed = false;
-                return Err(io::Error::other(
-                    "temporary path no longer names the file created by this process",
-                ));
-            }
-            self.directory.remove_file(&self.name)?;
-            self.armed = false;
-            Ok(())
-        }
-    }
-
-    fn verify_path_identity(&self) -> Result<(), PublishError> {
-        if !self
-            .path_still_names_file()
-            .map_err(PublishError::TemporaryMetadata)?
-        {
-            return Err(PublishError::TemporaryIdentityChanged);
-        }
+fn verify_temporary_path(temporary: &TemporaryFile<'_>) -> Result<(), PublishError> {
+    if temporary
+        .verify_path_identity()
+        .map_err(PublishError::TemporaryMetadata)?
+    {
         Ok(())
-    }
-
-    fn path_still_names_file(&self) -> io::Result<bool> {
-        let open_metadata = self.file.metadata()?;
-        let path_metadata = match self.directory.symlink_metadata(&self.name) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error),
-        };
-        Ok(path_metadata.is_file() && same_entry_identity(&open_metadata, &path_metadata))
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for TemporaryFile<'_> {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-        {
-            let _ = quarantine_and_remove(
-                self.directory,
-                &self.destination_name,
-                &self.name,
-                &self.file,
-            );
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-        if self.path_still_names_file().unwrap_or(false) {
-            let _ = self.directory.remove_file(&self.name);
-        }
-    }
-}
-
-fn same_entry_identity(left: &Metadata, right: &EntryMetadata) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-
-        left.dev() == right.device && left.ino() == right.inode
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt as _;
-
-        same_windows_file_id(
-            left.volume_serial_number(),
-            left.file_index(),
-            right.volume_serial_number,
-            right.file_index,
-        )
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        left.len() == right.len && left.modified().ok() == right.modified
+    } else {
+        Err(PublishError::TemporaryIdentityChanged)
     }
 }
 
@@ -1227,20 +642,6 @@ fn same_std_file_identity(left: &Metadata, right: &Metadata) -> bool {
     {
         left.len() == right.len() && left.modified().ok() == right.modified().ok()
     }
-}
-
-#[cfg(any(windows, test))]
-const fn same_windows_file_id(
-    left_volume: Option<u32>,
-    left_index: Option<u64>,
-    right_volume: Option<u32>,
-    right_index: Option<u64>,
-) -> bool {
-    matches!(
-        (left_volume, left_index, right_volume, right_index),
-        (Some(left_volume), Some(left_index), Some(right_volume), Some(right_index))
-            if left_volume == right_volume && left_index == right_index
-    )
 }
 
 /// A published sidecar did not preserve the verified temporary inode and
@@ -1789,6 +1190,7 @@ mod tests {
     #[test]
     fn removes_old_unlocked_partials_but_preserves_locked_ones() {
         use std::fs::FileTimes;
+        use std::time::UNIX_EPOCH;
 
         let directory = TestDirectory::new();
         let destination = directory.join("source.bin.bitrot");
@@ -1825,7 +1227,6 @@ mod tests {
     #[test]
     fn stale_cleanup_restores_a_substituted_path_instead_of_deleting_it() {
         let directory = TestDirectory::new();
-        let destination_name = std::ffi::OsStr::new("source.bin.bitrot");
         let stale_name =
             std::ffi::OsStr::new("source.bin.bitrot.bitrot-partial-999999-sidecar-0-1");
         let stale_path = directory.0.join(stale_name);
@@ -1840,7 +1241,7 @@ mod tests {
         fs::write(&stale_path, b"replacement that must survive").unwrap();
         let anchored = DestinationDirectory::open(&directory.0).unwrap();
 
-        let error = quarantine_and_remove(&anchored, destination_name, stale_name, &stale_file)
+        let error = remove_file_if_same(&anchored, stale_name, &stale_file, TemporaryKind::Sidecar)
             .unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::Other);
@@ -1868,7 +1269,7 @@ mod tests {
         fs::write(&temporary_path, b"not ours").unwrap();
 
         assert!(matches!(
-            temporary.verify_path_identity(),
+            verify_temporary_path(&temporary),
             Err(PublishError::TemporaryIdentityChanged)
         ));
         drop(temporary);

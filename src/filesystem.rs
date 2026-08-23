@@ -1,0 +1,655 @@
+//! Shared filesystem primitives for crash-safe publication.
+
+#[cfg(windows)]
+use cap_std::ambient_authority;
+#[cfg(any(unix, windows))]
+use cap_std::fs::MetadataExt as _;
+#[cfg(unix)]
+use cap_std::fs::OpenOptionsExt as _;
+#[cfg(any(unix, windows))]
+use cap_std::fs::{Dir, OpenOptions as DirectoryOpenOptions};
+use std::ffi::{OsStr, OsString};
+#[cfg(not(any(unix, windows)))]
+use std::fs::{self, OpenOptions};
+use std::fs::{File, Metadata, TryLockError};
+use std::io;
+use std::path::Path;
+#[cfg(not(any(unix, windows)))]
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+const STALE_TEMPORARY_AGE: Duration = Duration::from_hours(24);
+const TEMPORARY_NAME_ATTEMPTS: u32 = 128;
+static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn destination_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+pub(crate) struct Directory {
+    #[cfg(any(unix, windows))]
+    directory: Dir,
+    #[cfg(unix)]
+    sync_file: File,
+    #[cfg(not(any(unix, windows)))]
+    ambient_path: PathBuf,
+}
+
+impl Directory {
+    pub(crate) fn open(path: &Path) -> io::Result<Self> {
+        #[cfg(unix)]
+        let (directory, sync_file) = {
+            let sync_file = File::open(path)?;
+            let directory = Dir::from_std_file(sync_file.try_clone()?);
+            (directory, sync_file)
+        };
+        #[cfg(windows)]
+        let directory = Dir::open_ambient_dir(path, ambient_authority())?;
+        #[cfg(not(any(unix, windows)))]
+        let ambient_path = path.to_owned();
+        Ok(Self {
+            #[cfg(any(unix, windows))]
+            directory,
+            #[cfg(unix)]
+            sync_file,
+            #[cfg(not(any(unix, windows)))]
+            ambient_path,
+        })
+    }
+
+    pub(crate) fn open_read_no_follow(&self, name: &OsStr) -> io::Result<File> {
+        #[cfg(any(unix, windows))]
+        {
+            let mut options = DirectoryOpenOptions::new();
+            options.read(true);
+            set_no_follow(&mut options);
+            self.directory
+                .open_with(name, &options)
+                .map(cap_std::fs::File::into_std)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let mut options = OpenOptions::new();
+            options.read(true).open(self.ambient_path.join(name))
+        }
+    }
+
+    fn open_read_write_no_follow(&self, name: &OsStr) -> io::Result<File> {
+        #[cfg(any(unix, windows))]
+        {
+            let mut options = DirectoryOpenOptions::new();
+            options.read(true).write(true);
+            set_no_follow(&mut options);
+            self.directory
+                .open_with(name, &options)
+                .map(cap_std::fs::File::into_std)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(self.ambient_path.join(name))
+        }
+    }
+
+    fn create_new(&self, name: &OsStr) -> io::Result<File> {
+        #[cfg(any(unix, windows))]
+        {
+            let mut options = DirectoryOpenOptions::new();
+            options.read(true).write(true).create_new(true);
+            set_no_follow(&mut options);
+            self.directory
+                .open_with(name, &options)
+                .map(cap_std::fs::File::into_std)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(self.ambient_path.join(name))
+        }
+    }
+
+    pub(crate) fn symlink_metadata(&self, name: &OsStr) -> io::Result<EntryMetadata> {
+        #[cfg(any(unix, windows))]
+        {
+            self.directory
+                .symlink_metadata(name)
+                .map(|metadata| EntryMetadata::from_cap(&metadata))
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            fs::symlink_metadata(self.ambient_path.join(name)).map(EntryMetadata::from_std)
+        }
+    }
+
+    pub(crate) fn hard_link(&self, source: &OsStr, destination: &OsStr) -> io::Result<()> {
+        #[cfg(any(unix, windows))]
+        {
+            self.directory
+                .hard_link(source, &self.directory, destination)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            fs::hard_link(
+                self.ambient_path.join(source),
+                self.ambient_path.join(destination),
+            )
+        }
+    }
+
+    pub(crate) fn rename(&self, source: &OsStr, destination: &OsStr) -> io::Result<()> {
+        #[cfg(any(unix, windows))]
+        {
+            self.directory.rename(source, &self.directory, destination)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            fs::rename(
+                self.ambient_path.join(source),
+                self.ambient_path.join(destination),
+            )
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    fn rename_no_replace(&self, source: &OsStr, destination: &OsStr) -> io::Result<()> {
+        rustix::fs::renameat_with(
+            &self.directory,
+            source,
+            &self.directory,
+            destination,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .map_err(io::Error::from)
+    }
+
+    pub(crate) fn remove_file(&self, name: &OsStr) -> io::Result<()> {
+        #[cfg(any(unix, windows))]
+        {
+            self.directory.remove_file(name)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            fs::remove_file(self.ambient_path.join(name))
+        }
+    }
+
+    pub(crate) fn sync(&self) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            self.sync_file.sync_all()
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(())
+        }
+    }
+}
+
+pub(crate) struct EntryMetadata {
+    is_file: bool,
+    is_symlink: bool,
+    #[cfg(not(any(unix, windows)))]
+    len: u64,
+    #[cfg(not(windows))]
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(windows)]
+    volume_serial_number: Option<u32>,
+    #[cfg(windows)]
+    file_index: Option<u64>,
+}
+
+impl EntryMetadata {
+    #[cfg(any(unix, windows))]
+    fn from_cap(metadata: &cap_std::fs::Metadata) -> Self {
+        Self {
+            is_file: metadata.is_file(),
+            is_symlink: metadata.file_type().is_symlink(),
+            #[cfg(not(windows))]
+            modified: metadata
+                .modified()
+                .ok()
+                .map(cap_std::time::SystemTime::into_std),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(windows)]
+            volume_serial_number: metadata.volume_serial_number(),
+            #[cfg(windows)]
+            file_index: metadata.file_index(),
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn from_std(metadata: Metadata) -> Self {
+        Self {
+            is_file: metadata.is_file(),
+            is_symlink: metadata.file_type().is_symlink(),
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        }
+    }
+
+    pub(crate) const fn is_file(&self) -> bool {
+        self.is_file
+    }
+
+    pub(crate) const fn is_symlink(&self) -> bool {
+        self.is_symlink
+    }
+
+    #[cfg(unix)]
+    pub(crate) const fn unix_identity(&self) -> (u64, u64) {
+        (self.device, self.inode)
+    }
+
+    #[cfg(windows)]
+    pub(crate) const fn windows_identity(&self) -> (Option<u32>, Option<u64>) {
+        (self.volume_serial_number, self.file_index)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    pub(crate) const fn fallback_identity(&self) -> (u64, Option<SystemTime>) {
+        (self.len, self.modified)
+    }
+
+    pub(crate) fn same_file(&self, metadata: &Metadata) -> bool {
+        same_entry_identity(metadata, self)
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn set_no_follow(options: &mut DirectoryOpenOptions) {
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    #[cfg(not(unix))]
+    let _ = options;
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum TemporaryKind {
+    Recovery,
+    Sidecar,
+    Repair,
+}
+
+impl TemporaryKind {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Recovery => "recovery",
+            Self::Sidecar => "sidecar",
+            Self::Repair => "repair",
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    const fn bytes(self) -> &'static [u8] {
+        self.name().as_bytes()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum CreateTemporaryError {
+    NameExhausted,
+    LockContended,
+    Create(io::Error),
+    Lock(io::Error),
+}
+
+pub(crate) struct TemporaryFile<'directory> {
+    directory: &'directory Directory,
+    destination_name: OsString,
+    kind: TemporaryKind,
+    name: OsString,
+    pub(crate) file: File,
+    armed: bool,
+}
+
+impl<'directory> TemporaryFile<'directory> {
+    pub(crate) fn create(
+        directory: &'directory Directory,
+        destination_name: &OsStr,
+        kind: TemporaryKind,
+    ) -> Result<Self, CreateTemporaryError> {
+        let epoch_nonce = epoch_nonce();
+        for _ in 0..TEMPORARY_NAME_ATTEMPTS {
+            let name = temporary_name(destination_name, kind, epoch_nonce, next_nonce());
+            match directory.create_new(&name) {
+                Ok(file) => {
+                    file.try_lock().map_err(|error| match error {
+                        TryLockError::Error(error) => CreateTemporaryError::Lock(error),
+                        TryLockError::WouldBlock => CreateTemporaryError::LockContended,
+                    })?;
+                    return Ok(Self {
+                        directory,
+                        destination_name: destination_name.to_owned(),
+                        kind,
+                        name,
+                        file,
+                        armed: true,
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(CreateTemporaryError::Create(error)),
+            }
+        }
+        Err(CreateTemporaryError::NameExhausted)
+    }
+
+    pub(crate) fn name(&self) -> &OsStr {
+        &self.name
+    }
+
+    pub(crate) fn verify_path_identity(&self) -> io::Result<bool> {
+        path_names_file(self.directory, &self.name, &self.file)
+    }
+
+    pub(crate) fn remove(&mut self) -> io::Result<()> {
+        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        let result = quarantine_and_remove(
+            self.directory,
+            &self.destination_name,
+            self.kind,
+            &self.name,
+            &self.file,
+        );
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+        let result = if path_names_file(self.directory, &self.name, &self.file)? {
+            self.directory.remove_file(&self.name).map(|()| true)
+        } else {
+            Ok(false)
+        };
+        self.armed = false;
+        match result {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(io::Error::other(
+                "temporary path no longer names the file created by this process",
+            )),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TemporaryFile<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        let _ = quarantine_and_remove(
+            self.directory,
+            &self.destination_name,
+            self.kind,
+            &self.name,
+            &self.file,
+        );
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+        if path_names_file(self.directory, &self.name, &self.file).unwrap_or(false) {
+            let _ = self.directory.remove_file(&self.name);
+        }
+    }
+}
+
+pub(crate) fn cleanup_stale_temporaries(
+    directory: &Directory,
+    destination: &OsStr,
+    kinds: &[TemporaryKind],
+) -> io::Result<()> {
+    let Some(&quarantine_kind) = kinds.first() else {
+        return Ok(());
+    };
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let now = SystemTime::now();
+        let mut removed = false;
+        for entry in directory.directory.entries()? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if !is_temporary_name_for(name.as_bytes(), destination.as_bytes(), kinds) {
+                continue;
+            }
+            let metadata = directory.symlink_metadata(&name)?;
+            if !metadata.is_file()
+                || metadata
+                    .modified
+                    .and_then(|modified| now.duration_since(modified).ok())
+                    .is_none_or(|age| age < STALE_TEMPORARY_AGE)
+            {
+                continue;
+            }
+            let file = match directory.open_read_write_no_follow(&name) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            match file.try_lock() {
+                Ok(()) => {}
+                Err(TryLockError::WouldBlock) => continue,
+                Err(TryLockError::Error(error)) => return Err(error),
+            }
+            removed |=
+                quarantine_and_remove(directory, destination, quarantine_kind, &name, &file)?;
+        }
+        if removed {
+            directory.sync()?;
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    let _ = (directory, destination, quarantine_kind);
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn quarantine_and_remove(
+    directory: &Directory,
+    destination: &OsStr,
+    kind: TemporaryKind,
+    original_name: &OsStr,
+    opened_file: &File,
+) -> io::Result<bool> {
+    let epoch_nonce = epoch_nonce();
+    let mut quarantine_name = None;
+    for _ in 0..TEMPORARY_NAME_ATTEMPTS {
+        let candidate = temporary_name(destination, kind, epoch_nonce, next_nonce());
+        match directory.rename_no_replace(original_name, &candidate) {
+            Ok(()) => {
+                quarantine_name = Some(candidate);
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        }
+    }
+    let Some(quarantine_name) = quarantine_name else {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "cannot reserve a temporary-file quarantine name",
+        ));
+    };
+
+    if path_names_file(directory, &quarantine_name, opened_file)? {
+        directory.remove_file(&quarantine_name)?;
+        return Ok(true);
+    }
+
+    match directory.rename_no_replace(&quarantine_name, original_name) {
+        Ok(()) => Err(io::Error::other(
+            "temporary pathname changed during cleanup; replacement was restored",
+        )),
+        Err(restore_error) => Err(io::Error::new(
+            restore_error.kind(),
+            format!(
+                "temporary pathname changed during cleanup; replacement remains at {}: {restore_error}",
+                quarantine_name.display()
+            ),
+        )),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn is_temporary_name_for(candidate: &[u8], destination: &[u8], kinds: &[TemporaryKind]) -> bool {
+    let Some(fields) = candidate
+        .strip_prefix(destination)
+        .and_then(|suffix| suffix.strip_prefix(b".bitrot-partial-"))
+    else {
+        return false;
+    };
+    let mut fields = fields.split(|byte| *byte == b'-');
+    let (Some(pid), Some(kind), Some(epoch), Some(nonce)) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        return false;
+    };
+    fields.next().is_none()
+        && !pid.is_empty()
+        && pid.iter().all(u8::is_ascii_digit)
+        && kinds.iter().any(|candidate| candidate.bytes() == kind)
+        && is_lower_hex(epoch)
+        && is_lower_hex(nonce)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn is_lower_hex(value: &[u8]) -> bool {
+    !value.is_empty()
+        && value
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+}
+
+pub(crate) fn temporary_name(
+    destination: &OsStr,
+    kind: TemporaryKind,
+    epoch_nonce: u128,
+    nonce: u64,
+) -> OsString {
+    let mut name = OsString::from(destination);
+    name.push(format!(
+        ".bitrot-partial-{}-{}-{epoch_nonce:x}-{nonce:x}",
+        std::process::id(),
+        kind.name()
+    ));
+    name
+}
+
+fn epoch_nonce() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+}
+
+fn next_nonce() -> u64 {
+    NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed)
+}
+
+pub(crate) fn path_names_file(
+    directory: &Directory,
+    name: &OsStr,
+    file: &File,
+) -> io::Result<bool> {
+    let open_metadata = file.metadata()?;
+    let path_metadata = match directory.symlink_metadata(name) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    Ok(path_metadata.is_file() && path_metadata.same_file(&open_metadata))
+}
+
+pub(crate) fn remove_file_if_same(
+    directory: &Directory,
+    name: &OsStr,
+    file: &File,
+    quarantine_kind: TemporaryKind,
+) -> io::Result<bool> {
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    {
+        quarantine_and_remove(directory, name, quarantine_kind, name, file)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    {
+        let _ = quarantine_kind;
+        if !path_names_file(directory, name, file)? {
+            return Ok(false);
+        }
+        directory.remove_file(name)?;
+        Ok(true)
+    }
+}
+
+fn same_entry_identity(left: &Metadata, right: &EntryMetadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        left.dev() == right.device && left.ino() == right.inode
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        same_windows_file_id(
+            left.volume_serial_number(),
+            left.file_index(),
+            right.volume_serial_number,
+            right.file_index,
+        )
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        left.len() == right.len && left.modified().ok() == right.modified
+    }
+}
+
+#[cfg(any(windows, test))]
+pub(crate) const fn same_windows_file_id(
+    left_volume: Option<u32>,
+    left_index: Option<u64>,
+    right_volume: Option<u32>,
+    right_index: Option<u64>,
+) -> bool {
+    matches!(
+        (left_volume, left_index, right_volume, right_index),
+        (Some(left_volume), Some(left_index), Some(right_volume), Some(right_index))
+            if left_volume == right_volume && left_index == right_index
+    )
+}
+
+#[derive(Debug)]
+pub(crate) enum FinishError {
+    Cleanup(io::Error),
+    Sync(io::Error),
+    CleanupAndSync { cleanup: io::Error, sync: io::Error },
+}
+
+pub(crate) fn finish_publication(
+    cleanup: impl FnOnce() -> io::Result<()>,
+    sync: impl FnOnce() -> io::Result<()>,
+) -> Result<(), FinishError> {
+    match (cleanup().err(), sync().err()) {
+        (None, None) => Ok(()),
+        (Some(error), None) => Err(FinishError::Cleanup(error)),
+        (None, Some(error)) => Err(FinishError::Sync(error)),
+        (Some(cleanup), Some(sync)) => Err(FinishError::CleanupAndSync { cleanup, sync }),
+    }
+}

@@ -13,7 +13,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 /// windows bound the coding workspace without changing recovery bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CodingWindow {
-    source_len: u64,
+    geometry: Geometry,
     chunk_bytes: usize,
     data_chunks: usize,
     recovery_chunks: usize,
@@ -63,7 +63,7 @@ impl CodingWindow {
         }
 
         Ok(Self {
-            source_len: geometry.source_len,
+            geometry,
             chunk_bytes,
             data_chunks,
             recovery_chunks,
@@ -145,22 +145,22 @@ impl WindowEncoder {
             )?;
             for data_index in 0..self.config.data_chunks {
                 original.fill(0);
-                let chunk_offset = u64::try_from(data_index)
-                    .ok()
-                    .and_then(|index| {
-                        index.checked_mul(u64::try_from(self.config.chunk_bytes).ok()?)
-                    })
+                let index = u32::try_from(data_index).map_err(|_| Error::SourceOffsetOverflow)?;
+                let layout = self
+                    .config
+                    .geometry
+                    .data_chunk_layout(index)
                     .ok_or(Error::SourceOffsetOverflow)?;
-                let absolute_offset = chunk_offset
+                let absolute_offset = layout
+                    .offset
                     .checked_add(
                         u64::try_from(window_offset).map_err(|_| Error::SourceOffsetOverflow)?,
                     )
                     .ok_or(Error::SourceOffsetOverflow)?;
-                let available = self.config.source_len.saturating_sub(absolute_offset).min(
-                    u64::try_from(self.config.bytes).map_err(|_| Error::SourceOffsetOverflow)?,
-                );
-                let available =
-                    usize::try_from(available).map_err(|_| Error::SourceOffsetOverflow)?;
+                let available = usize::try_from(layout.len)
+                    .map_err(|_| Error::SourceOffsetOverflow)?
+                    .saturating_sub(window_offset)
+                    .min(self.config.bytes);
                 if available != 0 {
                     source
                         .seek(SeekFrom::Start(absolute_offset))

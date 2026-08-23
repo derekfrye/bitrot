@@ -156,13 +156,12 @@ pub fn source<R: Read + Seek>(reader: &mut R, sidecar: &Sidecar) -> Result<Repor
         .recovery_chunks
         .checked_sub(available_recovery_chunks)
         .ok_or(Error::RecoveryCountMismatch)?;
-    let state = overall_state(
-        data.unavailable_chunks,
+    let counts = ChunkCounts::from_chunks(&data.chunks)?;
+    let state = counts.source_state(
         available_recovery_chunks,
         observed_source_len,
         geometry.source_len,
         source_digest,
-        0,
     );
 
     Ok(Report {
@@ -171,9 +170,9 @@ pub fn source<R: Read + Seek>(reader: &mut R, sidecar: &Sidecar) -> Result<Repor
         observed_source_len,
         source_digest,
         chunks: data.chunks,
-        good_data_chunks: data.good_chunks,
-        unexpectedly_located_data_chunks: 0,
-        unavailable_data_chunks: data.unavailable_chunks,
+        good_data_chunks: counts.good,
+        unexpectedly_located_data_chunks: counts.unexpectedly_located,
+        unavailable_data_chunks: counts.unavailable,
         available_recovery_chunks,
         unavailable_recovery_chunks,
         state,
@@ -226,6 +225,7 @@ pub fn locate_displaced<R: Read + Seek>(
     options: LocateOptions,
 ) -> Result<LocationSummary, Error> {
     validate_report(sidecar, report)?;
+    let geometry = sidecar.metadata.manifest.geometry();
     let before = reader.seek(SeekFrom::End(0)).map_err(Error::SourceSeek)?;
     if before != report.observed_source_len {
         return Err(Error::SourceChanged {
@@ -242,36 +242,33 @@ pub fn locate_displaced<R: Read + Seek>(
     let mut canonical_match = false;
     reader.seek(SeekFrom::Start(0)).map_err(Error::SourceSeek)?;
     let scan = locator
-        .scan(
-            reader,
-            sidecar.metadata.manifest.geometry().chunk_size,
-            |found| {
-                for index in found.chunk_indices {
-                    let Ok(slot_index) = usize::try_from(index) else {
-                        continue;
-                    };
-                    let Some(slot) = locations.get_mut(slot_index) else {
-                        continue;
-                    };
-                    if slot.is_some() {
-                        continue;
-                    }
-                    let canonical = u64::from(index)
-                        * u64::from(sidecar.metadata.manifest.geometry().chunk_size.bytes());
-                    if found.offset == canonical {
-                        canonical_match = true;
-                        return ControlFlow::Break(());
-                    }
-                    *slot = Some(found.offset);
-                    remaining = remaining.saturating_sub(1);
+        .scan(reader, geometry.chunk_size, |found| {
+            for index in found.chunk_indices {
+                let Ok(slot_index) = usize::try_from(index) else {
+                    continue;
+                };
+                let Some(slot) = locations.get_mut(slot_index) else {
+                    continue;
+                };
+                if slot.is_some() {
+                    continue;
                 }
-                if remaining == 0 {
-                    ControlFlow::Break(())
-                } else {
-                    ControlFlow::Continue(())
+                let Some(layout) = geometry.data_chunk_layout(index) else {
+                    continue;
+                };
+                if found.offset == layout.offset {
+                    canonical_match = true;
+                    return ControlFlow::Break(());
                 }
-            },
-        )
+                *slot = Some(found.offset);
+                remaining = remaining.saturating_sub(1);
+            }
+            if remaining == 0 {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
         .map_err(Error::Rolling)?;
     if canonical_match {
         return Err(Error::SourceChangedDuringLocation);
@@ -398,12 +395,10 @@ pub(crate) fn validate_report(sidecar: &Sidecar, report: &Report) -> Result<(), 
     for (expected_index, chunk) in report.chunks.iter().enumerate() {
         let expected_index =
             u32::try_from(expected_index).map_err(|_| Error::CountUnrepresentable)?;
-        let expected_len = if expected_index + 1 == geometry.data_chunks {
-            geometry.final_data_chunk_len
-        } else {
-            geometry.chunk_size.bytes()
+        let Some(layout) = geometry.data_chunk_layout(expected_index) else {
+            return Err(Error::ReportStructureMismatch);
         };
-        if chunk.index != expected_index || chunk.expected_len != expected_len {
+        if chunk.index != expected_index || chunk.expected_len != layout.len {
             return Err(Error::ReportStructureMismatch);
         }
     }
@@ -451,38 +446,75 @@ fn apply_locations(report: &mut Report, locations: Vec<Option<u64>>) -> Result<u
 }
 
 fn recompute_report(report: &mut Report) -> Result<(), Error> {
-    let mut good = 0_u32;
-    let mut located = 0_u32;
-    let mut unavailable = 0_u32;
-    for chunk in &report.chunks {
-        match chunk.state {
-            ChunkState::Good => good = increment(good)?,
-            ChunkState::UnexpectedlyLocated { .. } => located = increment(located)?,
-            ChunkState::Corrupt | ChunkState::Missing | ChunkState::Unreadable(_) => {
-                unavailable = increment(unavailable)?;
-            }
-        }
-    }
-    report.good_data_chunks = good;
-    report.unexpectedly_located_data_chunks = located;
-    report.unavailable_data_chunks = unavailable;
-    report.state = overall_state(
-        unavailable,
+    let counts = ChunkCounts::from_chunks(&report.chunks)?;
+    report.good_data_chunks = counts.good;
+    report.unexpectedly_located_data_chunks = counts.unexpectedly_located;
+    report.unavailable_data_chunks = counts.unavailable;
+    report.state = counts.source_state(
         report.available_recovery_chunks,
         report.observed_source_len,
         report.expected_source_len,
         report.source_digest,
-        located,
     );
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ChunkCounts {
+    good: u32,
+    unexpectedly_located: u32,
+    unavailable: u32,
+}
+
+impl ChunkCounts {
+    fn from_chunks(chunks: &[ChunkReport]) -> Result<Self, Error> {
+        let mut counts = Self::default();
+        for chunk in chunks {
+            let counter = match chunk.state {
+                ChunkState::Good => &mut counts.good,
+                ChunkState::UnexpectedlyLocated { .. } => &mut counts.unexpectedly_located,
+                ChunkState::Corrupt | ChunkState::Missing | ChunkState::Unreadable(_) => {
+                    &mut counts.unavailable
+                }
+            };
+            *counter = increment(*counter)?;
+        }
+        Ok(counts)
+    }
+
+    const fn source_state(
+        self,
+        available_recovery: u32,
+        observed_len: u64,
+        expected_len: u64,
+        source_digest: SourceDigestState,
+    ) -> SourceState {
+        if self.unavailable == 0
+            && observed_len == expected_len
+            && matches!(source_digest, SourceDigestState::Match)
+            && self.unexpectedly_located == 0
+        {
+            SourceState::Intact
+        } else if self.unavailable == 0
+            && observed_len == expected_len
+            && matches!(source_digest, SourceDigestState::Mismatch)
+            && self.unexpectedly_located == 0
+        {
+            // Chunk and whole-source commitments disagree, so there is no known
+            // erasure whose reconstruction could satisfy both.
+            SourceState::Unrepairable
+        } else if self.unavailable <= available_recovery {
+            SourceState::Repairable
+        } else {
+            SourceState::Unrepairable
+        }
+    }
 }
 
 struct DataVerification {
     source_hasher: blake3::Hasher,
     digest_available: bool,
     chunks: Vec<ChunkReport>,
-    good_chunks: u32,
-    unavailable_chunks: u32,
 }
 
 fn verify_data_chunks<R: Read + Seek>(
@@ -502,26 +534,18 @@ fn verify_data_chunks<R: Read + Seek>(
         )
         .map_err(Error::ReportAllocation)?;
     let mut expected_digests = sidecar.metadata.data_digests.digests().copied();
-    let mut good_data_chunks = 0_u32;
-    let mut unavailable_data_chunks = 0_u32;
-
     for index in 0..geometry.data_chunks {
         let expected_digest = expected_digests
             .next()
             .ok_or(Error::DataDigestCountMismatch)?;
-        let expected_len = if index + 1 == geometry.data_chunks {
-            geometry.final_data_chunk_len
-        } else {
-            geometry.chunk_size.bytes()
-        };
-        let offset = u64::from(index)
-            .checked_mul(u64::from(geometry.chunk_size.bytes()))
+        let layout = geometry
+            .data_chunk_layout(index)
             .ok_or(Error::SourceOffsetOverflow)?;
         reader
-            .seek(SeekFrom::Start(offset))
+            .seek(SeekFrom::Start(layout.offset))
             .map_err(Error::SourceSeek)?;
         let expected_len_usize =
-            usize::try_from(expected_len).map_err(|_| Error::LengthUnrepresentable)?;
+            usize::try_from(layout.len).map_err(|_| Error::LengthUnrepresentable)?;
         let read = read_chunk(
             reader,
             &mut buffer[..expected_len_usize],
@@ -530,18 +554,13 @@ fn verify_data_chunks<R: Read + Seek>(
         let (bytes_read, state) = classify_chunk(
             read,
             &buffer[..expected_len_usize],
-            expected_len,
+            layout.len,
             expected_digest,
         )?;
-        if state.is_good() {
-            good_data_chunks = increment(good_data_chunks)?;
-        } else {
-            unavailable_data_chunks = increment(unavailable_data_chunks)?;
-        }
         digest_available &= !matches!(state, ChunkState::Unreadable(_));
         chunks.push(ChunkReport {
             index,
-            expected_len,
+            expected_len: layout.len,
             bytes_read,
             state,
         });
@@ -553,8 +572,6 @@ fn verify_data_chunks<R: Read + Seek>(
         source_hasher,
         digest_available,
         chunks,
-        good_chunks: good_data_chunks,
-        unavailable_chunks: unavailable_data_chunks,
     })
 }
 
@@ -597,35 +614,6 @@ fn source_digest_state(
         SourceDigestState::Match
     } else {
         SourceDigestState::Mismatch
-    }
-}
-
-const fn overall_state(
-    unavailable_data: u32,
-    available_recovery: u32,
-    observed_len: u64,
-    expected_len: u64,
-    source_digest: SourceDigestState,
-    unexpectedly_located: u32,
-) -> SourceState {
-    if unavailable_data == 0
-        && observed_len == expected_len
-        && matches!(source_digest, SourceDigestState::Match)
-        && unexpectedly_located == 0
-    {
-        SourceState::Intact
-    } else if unavailable_data == 0
-        && observed_len == expected_len
-        && matches!(source_digest, SourceDigestState::Mismatch)
-        && unexpectedly_located == 0
-    {
-        // Chunk and whole-source commitments disagree, so there is no known
-        // erasure whose reconstruction could satisfy both.
-        SourceState::Unrepairable
-    } else if unavailable_data <= available_recovery {
-        SourceState::Repairable
-    } else {
-        SourceState::Unrepairable
     }
 }
 
