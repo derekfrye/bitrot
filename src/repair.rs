@@ -1,5 +1,12 @@
 //! Bounded-window reconstruction into a fresh seekable destination.
 
+mod filesystem;
+
+pub use filesystem::{
+    OutputVerificationError, PublishError, PublishOptions, PublishOutcome, PublishSummary,
+    PublishedVerificationError, publish,
+};
+
 use crate::coding::{self, CodingWindow, WindowDecoder};
 use crate::geometry::Geometry;
 use crate::sidecar::Sidecar;

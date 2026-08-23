@@ -748,6 +748,20 @@ path before reconstruction succeeds. This core never modifies the damaged
 source; filesystem publication, replacement, and damaged-original retention
 remain a separate operation.
 
+The filesystem repair entry point implements the safe first half of that
+publication boundary. It opens source and sidecar paths without following
+symbolic links, reconstructs into a uniquely named locked file in the output
+directory, synchronizes and re-verifies that inode, then installs a new output
+name with atomic no-clobber semantics. It reopens the published name, confirms
+that it still identifies the verified inode, verifies the complete source again,
+removes the temporary name, and synchronizes the directory. A previously or
+concurrently published intact output is an idempotent success; every other
+existing object is preserved as a conflict. This operation never replaces or
+removes the damaged source. Transactional replacement with damaged-original
+retention remains a subsequent layer. Interrupted repair files use recognizable
+locked names; later repairs reclaim only old unlocked entries after moving them
+to a unique no-clobber quarantine name and confirming the moved inode.
+
 ### Inspect and scrub
 
 `bitrot inspect` prints format and geometry without reading all payload bytes.
