@@ -328,6 +328,23 @@ Optional records may include comments and original path metadata. Readers skip
 unknown optional record types. Unknown required feature bits cause a clean
 failure.
 
+Whole-sidecar logical assembly is performed only over records that have passed
+physical framing and checksum validation. It first applies an overall record
+limit and rejects every unknown required record type. It then reconciles the
+manifest, superblock, and creator copies; authenticates the available recovery
+set; and retains bounded unknown optional records whose protection-set
+identifier matches the manifest. This provides one validated object for
+inspect, verify, and repair without allowing an unsupported required record to
+be silently ignored.
+
+The physical reader combines the resynchronizing scanner with logical sidecar
+assembly. Valid records are collected only up to the assembly record limit;
+invalid candidates and unrecognized byte ranges are returned as bounded damage
+diagnostics. A separate cumulative unrecognized-byte limit prevents a severely
+damaged input from producing an unbounded report. Recoverable physical damage
+does not make reading fail when the remaining redundant records still form a
+valid logical sidecar.
+
 ### Experimental superblock
 
 Record type 1 is the required superblock. Its logical identifier is zero, and
@@ -497,6 +514,35 @@ chunk; unlike the final data chunk it is never short. Its domain-separated
 BLAKE3 digest must equal the digest at the same index in the assembled recovery
 digest table. Thus both the physical record checksum and the logical manifest
 commitment must pass before decoding uses a recovery shard.
+
+Recovery-record assembly applies caller-selected record and recovery-count
+limits before allocating index slots. Records may arrive in any physical
+order. Every record is authenticated against the digest at its recovery index;
+identical valid copies collapse. A physically intact but semantically invalid,
+foreign, or digest-mismatched recovery record is reported and discarded
+without hiding another valid copy of that index. Missing indexes are retained
+as explicit gaps so verification can compare available recovery capacity with
+the number of unavailable data chunks.
+
+### Experimental creator record
+
+Record type 6 is the required creator diagnostic. Its logical identifier is
+zero, and version 1 has no record-header extension. Its payload is:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 2 | Payload version, currently 1 |
+| 2 | 2 | Reserved; must be zero |
+| 4 | 2 | Implementation-name length in bytes |
+| 6 | 2 | Implementation-version length in bytes |
+| 8 | 8 | Reserved; must be zero |
+| 16 | variable | Implementation name followed by implementation version |
+
+Both strings are nonempty UTF-8, contain no Unicode control characters, and
+are independently limited to 255 bytes. They are diagnostic only and do not
+affect decoding behavior or protection-set identity. The strict bound allows a
+reader to decode the complete record without accepting an implementation-name
+controlled allocation.
 
 ### Metadata redundancy
 
