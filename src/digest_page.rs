@@ -119,14 +119,12 @@ impl Page {
             payload.extend_from_slice(digest.as_bytes());
         }
 
-        Ok(Record {
-            record_type: RECORD_TYPE,
-            flags: FLAG_REQUIRED,
+        Ok(Record::required(
+            RECORD_TYPE,
             protection_set_id,
-            logical_id: logical_id(self.kind, self.page_index),
-            header_extension: Vec::new(),
+            logical_id(self.kind, self.page_index),
             payload,
-        })
+        ))
     }
 
     /// Strictly decodes a digest-table page record.
@@ -179,12 +177,18 @@ impl Page {
             });
         }
 
-        let mut digests = Vec::with_capacity(count);
-        for encoded in record.payload[PAYLOAD_HEADER_LEN..].chunks_exact(32) {
-            let mut bytes = [0_u8; 32];
-            bytes.copy_from_slice(encoded);
-            digests.push(Digest::from_bytes(bytes));
+        let (encoded_digests, remainder) = record.payload[PAYLOAD_HEADER_LEN..].as_chunks::<32>();
+        if !remainder.is_empty() {
+            return Err(Error::PayloadLengthMismatch {
+                actual: record.payload.len(),
+                expected: expected_len,
+            });
         }
+        let digests = encoded_digests
+            .iter()
+            .copied()
+            .map(Digest::from_bytes)
+            .collect();
         Self::new(kind, page_index, first_digest_index, digests)
     }
 }

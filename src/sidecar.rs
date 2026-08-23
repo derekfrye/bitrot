@@ -1,5 +1,6 @@
 //! Whole-sidecar logical validation over physically verified records.
 
+use crate::bounded_count;
 use crate::creator::{self, Creator};
 use crate::digest_page;
 use crate::manifest;
@@ -181,9 +182,7 @@ impl Sidecar {
         while let Some(event) = scanner.next_event().map_err(ReadError::Scan)? {
             match event {
                 Event::ValidRecord { record, .. } => {
-                    let actual = u64::try_from(records.len())
-                        .unwrap_or(u64::MAX)
-                        .saturating_add(1);
+                    let actual = bounded_count::after_push(records.len());
                     if actual > limits.assembly.max_records {
                         return Err(ReadError::RecordLimitExceeded {
                             actual,
@@ -695,7 +694,7 @@ fn write_record<W: Write>(
 }
 
 fn enforce_total_limit(records: &[Record], maximum: u64) -> Result<(), Error> {
-    let actual = u64::try_from(records.len()).unwrap_or(u64::MAX);
+    let actual = bounded_count::from_usize(records.len());
     if actual > maximum {
         Err(Error::RecordLimitExceeded { actual, maximum })
     } else {
@@ -704,9 +703,7 @@ fn enforce_total_limit(records: &[Record], maximum: u64) -> Result<(), Error> {
 }
 
 fn push_damage(damage: &mut Vec<Damage>, event: Damage, maximum: u32) -> Result<(), ReadError> {
-    let actual = u64::try_from(damage.len())
-        .unwrap_or(u64::MAX)
-        .saturating_add(1);
+    let actual = bounded_count::after_push(damage.len());
     if actual > u64::from(maximum) {
         Err(ReadError::DamageEventLimitExceeded { actual, maximum })
     } else {
@@ -743,9 +740,7 @@ fn collect_unknown_optional(
                 logical_id: record.logical_id,
             });
         }
-        let actual = u64::try_from(optional.len())
-            .unwrap_or(u64::MAX)
-            .saturating_add(1);
+        let actual = bounded_count::after_push(optional.len());
         if actual > u64::from(maximum) {
             return Err(Error::UnknownOptionalLimitExceeded { actual, maximum });
         }
@@ -770,12 +765,9 @@ const fn is_known_type(record_type: u16) -> bool {
 mod tests {
     use super::*;
     use crate::digest::Digest;
-    use crate::digest_page::{Kind, Table};
-    use crate::fingerprint::recovery_chunk_digest;
-    use crate::geometry::Geometry;
-    use crate::geometry::{ChunkSize, MIN_CHUNK_SIZE};
+    use crate::geometry::MIN_CHUNK_SIZE;
     use crate::record::FLAG_REQUIRED;
-    use crate::recovery_chunk::RecoveryChunk;
+    use crate::test_support;
     use std::io::Cursor;
 
     struct Fixture {
@@ -785,66 +777,15 @@ mod tests {
     }
 
     fn fixture() -> Fixture {
-        let chunk_size = ChunkSize::new(u64::from(MIN_CHUNK_SIZE)).unwrap();
-        let geometry = Geometry::from_stored(
-            u64::from(chunk_size.bytes()),
-            chunk_size,
-            1,
-            2,
-            chunk_size.bytes(),
-        )
-        .unwrap();
-        let parity = [
-            vec![0xa5; chunk_size.bytes() as usize],
-            vec![0x5a; chunk_size.bytes() as usize],
-        ];
-        let data_table = Table::new(Kind::Data, vec![Digest::from_bytes([1; 32])]).unwrap();
-        let recovery_table = Table::new(
-            Kind::Recovery,
-            parity
-                .iter()
-                .map(|bytes| recovery_chunk_digest(bytes))
-                .collect(),
-        )
-        .unwrap();
-        let rolling_table = rolling_page::Table::new(vec![9]).unwrap();
-        let manifest = manifest::Manifest::new(
-            geometry,
-            Digest::from_bytes([3; 32]),
-            &data_table,
-            &recovery_table,
-            &rolling_table,
-        )
-        .unwrap();
+        let protection = test_support::recovery_fixture();
+        let manifest = protection.metadata.manifest;
         let set_id = manifest.protection_set_id();
         let superblock = Superblock::new(manifest, 104, 400, 696)
             .unwrap()
             .to_record();
-        let mut records = vec![superblock.clone(), manifest.to_record()];
-        records.extend(
-            data_table
-                .pages
-                .iter()
-                .map(|page| page.to_record(set_id).unwrap()),
-        );
-        records.extend(
-            recovery_table
-                .pages
-                .iter()
-                .map(|page| page.to_record(set_id).unwrap()),
-        );
-        records.extend(
-            rolling_table
-                .pages
-                .iter()
-                .map(|page| page.to_record(set_id).unwrap()),
-        );
-        records.extend(parity.into_iter().enumerate().map(|(index, bytes)| {
-            RecoveryChunk::new(manifest, u32::try_from(index).unwrap(), bytes)
-                .unwrap()
-                .to_record(manifest)
-                .unwrap()
-        }));
+        let mut records = vec![superblock.clone()];
+        records.extend(protection.metadata_records());
+        records.extend(protection.recovery_records());
         records.push(
             Creator::new("bitrot", "0.1.0")
                 .unwrap()

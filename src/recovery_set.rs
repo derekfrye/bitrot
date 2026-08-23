@@ -1,5 +1,6 @@
 //! Bounded authentication and indexing of available recovery records.
 
+use crate::bounded_count;
 use crate::digest::Digest;
 use crate::manifest::Manifest;
 use crate::record::Record;
@@ -184,7 +185,7 @@ impl RecoverySet {
                         .get_mut(index)
                         .ok_or(AssemblyError::CountUnrepresentable)?;
                     if slot.is_some() {
-                        duplicate_records = duplicate_records.saturating_add(1);
+                        duplicate_records = bounded_count::increment(duplicate_records);
                     } else {
                         *slot = Some(chunk);
                     }
@@ -317,13 +318,11 @@ impl fmt::Display for AssemblyError {
 impl std::error::Error for AssemblyError {}
 
 fn enforce_record_limit(records: &[Record], maximum: u64) -> Result<(), AssemblyError> {
-    let actual = records.iter().fold(0_u64, |count, record| {
-        if record.record_type == recovery_chunk::RECORD_TYPE {
-            count.saturating_add(1)
-        } else {
-            count
-        }
-    });
+    let actual = bounded_count::items(
+        records
+            .iter()
+            .filter(|record| record.record_type == recovery_chunk::RECORD_TYPE),
+    );
     if actual > maximum {
         Err(AssemblyError::RecordLimitExceeded { actual, maximum })
     } else {
@@ -334,11 +333,7 @@ fn enforce_record_limit(records: &[Record], maximum: u64) -> Result<(), Assembly
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::digest_page::{Kind, Table};
-    use crate::fingerprint::recovery_chunk_digest;
-    use crate::geometry::Geometry;
-    use crate::geometry::{ChunkSize, MIN_CHUNK_SIZE};
-    use crate::rolling_page;
+    use crate::test_support;
 
     struct Fixture {
         manifest: Manifest,
@@ -347,44 +342,15 @@ mod tests {
     }
 
     fn fixture() -> Fixture {
-        let chunk_size = ChunkSize::new(u64::from(MIN_CHUNK_SIZE)).unwrap();
-        let geometry = Geometry::from_stored(
-            u64::from(chunk_size.bytes()),
-            chunk_size,
-            1,
-            2,
-            chunk_size.bytes(),
-        )
-        .unwrap();
-        let bytes = [
-            vec![0xa5; chunk_size.bytes() as usize],
-            vec![0x5a; chunk_size.bytes() as usize],
-        ];
-        let digests: Vec<_> = bytes
-            .iter()
-            .map(|bytes| recovery_chunk_digest(bytes))
+        let fixture = test_support::recovery_fixture();
+        let manifest = fixture.metadata.manifest;
+        let digests = fixture
+            .metadata
+            .recovery_digests
+            .digests()
+            .copied()
             .collect();
-        let data_table = Table::new(Kind::Data, vec![Digest::from_bytes([1; 32])]).unwrap();
-        let recovery_table = Table::new(Kind::Recovery, digests.clone()).unwrap();
-        let rolling_table = rolling_page::Table::new(vec![7]).unwrap();
-        let manifest = Manifest::new(
-            geometry,
-            Digest::from_bytes([3; 32]),
-            &data_table,
-            &recovery_table,
-            &rolling_table,
-        )
-        .unwrap();
-        let records = bytes
-            .into_iter()
-            .enumerate()
-            .map(|(index, bytes)| {
-                RecoveryChunk::new(manifest, u32::try_from(index).unwrap(), bytes)
-                    .unwrap()
-                    .to_record(manifest)
-                    .unwrap()
-            })
-            .collect();
+        let records = fixture.recovery_records();
         Fixture {
             manifest,
             digests,

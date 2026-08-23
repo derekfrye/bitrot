@@ -48,6 +48,22 @@ pub struct Record {
 }
 
 impl Record {
+    pub(crate) fn required(
+        record_type: u16,
+        protection_set_id: [u8; 32],
+        logical_id: u64,
+        payload: Vec<u8>,
+    ) -> Self {
+        Self {
+            record_type,
+            flags: FLAG_REQUIRED,
+            protection_set_id,
+            logical_id,
+            header_extension: Vec::new(),
+            payload,
+        }
+    }
+
     #[must_use]
     pub const fn is_required(&self) -> bool {
         self.flags & FLAG_REQUIRED != 0
@@ -332,6 +348,17 @@ mod tests {
             header_extension: vec![9, 8, 7],
             payload: b"payload bytes".to_vec(),
         }
+    }
+
+    #[test]
+    fn required_constructor_sets_the_canonical_envelope() {
+        let record = Record::required(9, [0xa5; 32], 17, vec![1, 2, 3]);
+        assert_eq!(record.record_type, 9);
+        assert_eq!(record.flags, FLAG_REQUIRED);
+        assert_eq!(record.protection_set_id, [0xa5; 32]);
+        assert_eq!(record.logical_id, 17);
+        assert!(record.header_extension.is_empty());
+        assert_eq!(record.payload, [1, 2, 3]);
     }
 
     fn encoded(record: &Record) -> Vec<u8> {

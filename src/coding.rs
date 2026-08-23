@@ -36,7 +36,11 @@ impl CodingWindow {
                 bytes,
                 chunk_bytes: usize::MAX,
             })?;
-        if bytes == 0 || bytes % 2 != 0 || bytes > chunk_bytes || chunk_bytes % bytes != 0 {
+        if bytes == 0
+            || !bytes.is_multiple_of(2)
+            || bytes > chunk_bytes
+            || !chunk_bytes.is_multiple_of(bytes)
+        {
             return Err(Error::InvalidWindowSize { bytes, chunk_bytes });
         }
 

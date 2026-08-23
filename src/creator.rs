@@ -1,5 +1,6 @@
 //! Diagnostic identification of the implementation that created a sidecar.
 
+use crate::agreed_copies;
 use crate::record::{FLAG_REQUIRED, Record};
 use crate::wire;
 use std::fmt;
@@ -69,14 +70,7 @@ impl Creator {
         payload.extend_from_slice(self.implementation.as_bytes());
         payload.extend_from_slice(self.version.as_bytes());
 
-        Ok(Record {
-            record_type: RECORD_TYPE,
-            flags: FLAG_REQUIRED,
-            protection_set_id,
-            logical_id: 0,
-            header_extension: Vec::new(),
-            payload,
-        })
+        Ok(Record::required(RECORD_TYPE, protection_set_id, 0, payload))
     }
 
     /// Strictly decodes a creator record for `expected_protection_set_id`.
@@ -150,30 +144,14 @@ impl Creator {
         expected_protection_set_id: [u8; 32],
         max_copies: u32,
     ) -> Result<Self, AssemblyError> {
-        let mut creator = None;
-        let mut copies = 0_u64;
-        for record in records
-            .iter()
-            .filter(|record| record.record_type == RECORD_TYPE)
-        {
-            copies = copies.saturating_add(1);
-            if copies > u64::from(max_copies) {
-                return Err(AssemblyError::CopyLimitExceeded {
-                    actual: copies,
-                    maximum: max_copies,
-                });
-            }
-            let candidate = Self::from_record(record, expected_protection_set_id)
-                .map_err(AssemblyError::InvalidCopy)?;
-            if let Some(existing) = &creator {
-                if existing != &candidate {
-                    return Err(AssemblyError::ConflictingCopies);
-                }
-            } else {
-                creator = Some(candidate);
-            }
-        }
-        creator.ok_or(AssemblyError::Missing)
+        agreed_copies::assemble(
+            records
+                .iter()
+                .filter(|record| record.record_type == RECORD_TYPE),
+            Some(max_copies),
+            |record| Self::from_record(record, expected_protection_set_id),
+        )
+        .map_err(map_agreed_copies_error)
     }
 }
 
@@ -295,6 +273,17 @@ impl std::error::Error for AssemblyError {
             Self::InvalidCopy(error) => Some(error),
             Self::CopyLimitExceeded { .. } | Self::Missing | Self::ConflictingCopies => None,
         }
+    }
+}
+
+fn map_agreed_copies_error(error: agreed_copies::Error<Error>) -> AssemblyError {
+    match error {
+        agreed_copies::Error::CopyLimitExceeded { actual, maximum } => {
+            AssemblyError::CopyLimitExceeded { actual, maximum }
+        }
+        agreed_copies::Error::Missing => AssemblyError::Missing,
+        agreed_copies::Error::InvalidCopy(error) => AssemblyError::InvalidCopy(error),
+        agreed_copies::Error::ConflictingCopies => AssemblyError::ConflictingCopies,
     }
 }
 

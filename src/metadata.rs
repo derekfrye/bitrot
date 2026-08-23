@@ -1,5 +1,7 @@
 //! Assembly of one complete, redundantly stored logical manifest.
 
+use crate::agreed_copies;
+use crate::bounded_count;
 use crate::digest_page::{self, Kind};
 use crate::manifest::{self, Manifest};
 use crate::record::Record;
@@ -54,21 +56,14 @@ impl Metadata {
     pub fn assemble(records: &[Record], limits: AssemblyLimits) -> Result<Self, Error> {
         enforce_record_limit(records, limits.max_metadata_records)?;
 
-        let mut manifest = None;
-        for record in records
-            .iter()
-            .filter(|record| record.record_type == manifest::RECORD_TYPE)
-        {
-            let candidate = Manifest::from_record(record).map_err(Error::CoreManifest)?;
-            if let Some(existing) = manifest {
-                if existing != candidate {
-                    return Err(Error::ConflictingCoreManifest);
-                }
-            } else {
-                manifest = Some(candidate);
-            }
-        }
-        let manifest = manifest.ok_or(Error::MissingCoreManifest)?;
+        let manifest = agreed_copies::assemble(
+            records
+                .iter()
+                .filter(|record| record.record_type == manifest::RECORD_TYPE),
+            None,
+            Manifest::from_record,
+        )
+        .map_err(map_agreed_copies_error)?;
 
         let mut data_pages = Vec::new();
         let mut recovery_pages = Vec::new();
@@ -185,18 +180,27 @@ impl std::error::Error for Error {
     }
 }
 
+fn map_agreed_copies_error(error: agreed_copies::Error<manifest::Error>) -> Error {
+    match error {
+        agreed_copies::Error::CopyLimitExceeded { actual, maximum } => {
+            Error::MetadataRecordLimitExceeded {
+                actual,
+                maximum: u64::from(maximum),
+            }
+        }
+        agreed_copies::Error::Missing => Error::MissingCoreManifest,
+        agreed_copies::Error::InvalidCopy(error) => Error::CoreManifest(error),
+        agreed_copies::Error::ConflictingCopies => Error::ConflictingCoreManifest,
+    }
+}
+
 fn enforce_record_limit(records: &[Record], maximum: u64) -> Result<(), Error> {
-    let actual = records.iter().try_fold(0_u64, |count, record| {
-        if matches!(
+    let actual = bounded_count::items(records.iter().filter(|record| {
+        matches!(
             record.record_type,
             manifest::RECORD_TYPE | digest_page::RECORD_TYPE | rolling_page::RECORD_TYPE
-        ) {
-            count.checked_add(1)
-        } else {
-            Some(count)
-        }
-    });
-    let actual = actual.unwrap_or(u64::MAX);
+        )
+    }));
     if actual > maximum {
         Err(Error::MetadataRecordLimitExceeded { actual, maximum })
     } else {

@@ -2,7 +2,7 @@
 name = "bitrot"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.98"
 license = "MIT"
 description = "A resilient file corruption detection and recovery format"
 

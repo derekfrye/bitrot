@@ -81,14 +81,12 @@ impl Page {
             payload.extend_from_slice(&value.to_le_bytes());
         }
 
-        Ok(Record {
-            record_type: RECORD_TYPE,
-            flags: FLAG_REQUIRED,
+        Ok(Record::required(
+            RECORD_TYPE,
             protection_set_id,
-            logical_id: u64::from(self.page_index),
-            header_extension: Vec::new(),
+            u64::from(self.page_index),
             payload,
-        })
+        ))
     }
 
     /// Strictly decodes a rolling-table page record.
@@ -138,15 +136,19 @@ impl Page {
             });
         }
 
-        let values = record.payload[PAYLOAD_HEADER_LEN..]
-            .chunks_exact(size_of::<u64>())
-            .map(|bytes| {
-                wire::u64(bytes, 0).ok_or(Error::PayloadLengthMismatch {
-                    actual: record.payload.len(),
-                    expected: expected_len,
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let (encoded_values, remainder) =
+            record.payload[PAYLOAD_HEADER_LEN..].as_chunks::<{ size_of::<u64>() }>();
+        if !remainder.is_empty() {
+            return Err(Error::PayloadLengthMismatch {
+                actual: record.payload.len(),
+                expected: expected_len,
+            });
+        }
+        let values = encoded_values
+            .iter()
+            .copied()
+            .map(u64::from_le_bytes)
+            .collect();
         Self::new(page_index, first_value_index, values)
     }
 }

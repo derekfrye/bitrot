@@ -70,14 +70,12 @@ impl RecoveryChunk {
         payload.extend_from_slice(&0_u64.to_le_bytes());
         payload.extend_from_slice(&self.bytes);
 
-        Ok(Record {
-            record_type: RECORD_TYPE,
-            flags: FLAG_REQUIRED,
-            protection_set_id: manifest.protection_set_id(),
-            logical_id: u64::from(self.recovery_index),
-            header_extension: Vec::new(),
+        Ok(Record::required(
+            RECORD_TYPE,
+            manifest.protection_set_id(),
+            u64::from(self.recovery_index),
             payload,
-        })
+        ))
     }
 
     /// Strictly decodes and authenticates a recovery record against a manifest.
@@ -292,40 +290,14 @@ fn parse_u64(bytes: &[u8], offset: usize) -> Result<u64, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::digest_page::{Kind, Table};
-    use crate::geometry::Geometry;
-    use crate::geometry::{ChunkSize, MIN_CHUNK_SIZE};
     use crate::record::{self, BASE_HEADER_LEN, DecodeLimits};
-    use crate::rolling_page;
+    use crate::test_support;
     use std::io::Cursor;
 
     fn fixture() -> (Manifest, RecoveryChunk) {
-        let chunk_size = ChunkSize::new(u64::from(MIN_CHUNK_SIZE)).unwrap();
-        let geometry = Geometry::from_stored(
-            u64::from(chunk_size.bytes()),
-            chunk_size,
-            1,
-            2,
-            chunk_size.bytes(),
-        )
-        .unwrap();
-        let data_table = Table::new(Kind::Data, vec![Digest::from_bytes([1; 32])]).unwrap();
-        let bytes = vec![0xa5; chunk_size.bytes() as usize];
-        let recovery_table = Table::new(
-            Kind::Recovery,
-            vec![recovery_chunk_digest(&bytes), Digest::from_bytes([2; 32])],
-        )
-        .unwrap();
-        let rolling_table = rolling_page::Table::new(vec![7]).unwrap();
-        let manifest = Manifest::new(
-            geometry,
-            Digest::from_bytes([3; 32]),
-            &data_table,
-            &recovery_table,
-            &rolling_table,
-        )
-        .unwrap();
-        let chunk = RecoveryChunk::new(manifest, 0, bytes).unwrap();
+        let fixture = test_support::recovery_fixture();
+        let manifest = fixture.metadata.manifest;
+        let chunk = fixture.recovery_chunks[0].clone();
         (manifest, chunk)
     }
 

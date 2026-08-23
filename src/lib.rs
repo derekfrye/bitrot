@@ -1,6 +1,8 @@
 //! Core primitives for the Bitrot protection format.
 
+mod agreed_copies;
 mod algorithm;
+mod bounded_count;
 pub mod coding;
 pub mod create;
 pub mod creator;
@@ -19,4 +21,6 @@ pub mod rolling_page;
 pub mod scan;
 pub mod sidecar;
 pub mod superblock;
+#[cfg(test)]
+mod test_support;
 mod wire;

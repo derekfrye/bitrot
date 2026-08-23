@@ -4,7 +4,7 @@ use crate::algorithm::{CODING_LEOPARD_GF16, ROLLING_CRC64_GO_ISO, STRONG_HASH_BL
 use crate::digest::Digest;
 use crate::digest_page::{Kind, Table};
 use crate::geometry::{ChunkSize, ChunkSizeError, Geometry, GeometryError};
-use crate::record::{FLAG_REQUIRED, Record};
+use crate::record::{self, FLAG_REQUIRED, Record};
 use crate::rolling_page::Table as RollingTable;
 use crate::wire;
 use std::fmt;
@@ -12,6 +12,8 @@ use std::fmt;
 pub const RECORD_TYPE: u16 = 2;
 pub const PAYLOAD_VERSION: u16 = 1;
 pub const PAYLOAD_LEN: usize = 192;
+pub(crate) const ENCODED_RECORD_LEN: u64 =
+    record::BASE_HEADER_LEN as u64 + PAYLOAD_LEN as u64 + record::DIGEST_LEN as u64;
 
 const SET_ID_CONTEXT: &str = "bitrot format v1 protection set identifier";
 
@@ -96,14 +98,7 @@ impl Manifest {
     /// Encodes this manifest as a canonical required record.
     #[must_use]
     pub fn to_record(self) -> Record {
-        Record {
-            record_type: RECORD_TYPE,
-            flags: FLAG_REQUIRED,
-            protection_set_id: self.protection_set_id,
-            logical_id: 0,
-            header_extension: Vec::new(),
-            payload: self.payload(),
-        }
+        Record::required(RECORD_TYPE, self.protection_set_id, 0, self.payload())
     }
 
     /// Strictly decodes and validates a core-manifest record.
@@ -496,6 +491,7 @@ mod tests {
         let manifest = fixture();
         let mut encoded = Vec::new();
         record::write(&mut encoded, &manifest.to_record()).unwrap();
+        assert_eq!(encoded.len() as u64, ENCODED_RECORD_LEN);
         let record = record::read(
             &mut Cursor::new(encoded),
             DecodeLimits::new(record::BASE_HEADER_LEN, PAYLOAD_LEN as u64),

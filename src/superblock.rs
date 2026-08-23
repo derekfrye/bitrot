@@ -1,6 +1,7 @@
 //! Compact duplicated entry points for locating and authenticating metadata.
 
-use crate::manifest::Manifest;
+use crate::agreed_copies;
+use crate::manifest::{self, Manifest};
 use crate::record::{FLAG_REQUIRED, Record};
 use crate::wire;
 use std::fmt;
@@ -10,8 +11,6 @@ pub const PAYLOAD_VERSION: u16 = 1;
 pub const PAYLOAD_LEN: usize = 64;
 
 const MANIFEST_COMMITMENT_CONTEXT: &str = "bitrot format v1 core manifest commitment";
-const CORE_MANIFEST_RECORD_LEN: u64 = 296;
-
 /// Advisory locations for two exact copies of a committed core manifest.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Superblock {
@@ -91,14 +90,7 @@ impl Superblock {
         payload.extend_from_slice(&self.observed_sidecar_len.to_le_bytes());
         payload.extend_from_slice(&self.manifest_commitment);
         debug_assert_eq!(payload.len(), PAYLOAD_LEN);
-        Record {
-            record_type: RECORD_TYPE,
-            flags: FLAG_REQUIRED,
-            protection_set_id: self.protection_set_id,
-            logical_id: 0,
-            header_extension: Vec::new(),
-            payload,
-        }
+        Record::required(RECORD_TYPE, self.protection_set_id, 0, payload)
     }
 
     /// Strictly decodes a canonical superblock record.
@@ -170,29 +162,14 @@ impl Superblock {
         manifest: Manifest,
         max_copies: u32,
     ) -> Result<Self, AssemblyError> {
-        let mut superblock = None;
-        let mut copies = 0_u64;
-        for record in records
-            .iter()
-            .filter(|record| record.record_type == RECORD_TYPE)
-        {
-            copies = copies.saturating_add(1);
-            if copies > u64::from(max_copies) {
-                return Err(AssemblyError::CopyLimitExceeded {
-                    actual: copies,
-                    maximum: max_copies,
-                });
-            }
-            let candidate = Self::from_record(record).map_err(AssemblyError::InvalidCopy)?;
-            if let Some(existing) = superblock {
-                if existing != candidate {
-                    return Err(AssemblyError::ConflictingCopies);
-                }
-            } else {
-                superblock = Some(candidate);
-            }
-        }
-        let superblock = superblock.ok_or(AssemblyError::Missing)?;
+        let superblock = agreed_copies::assemble(
+            records
+                .iter()
+                .filter(|record| record.record_type == RECORD_TYPE),
+            Some(max_copies),
+            Self::from_record,
+        )
+        .map_err(map_agreed_copies_error)?;
         if !superblock.matches_manifest(manifest) {
             return Err(AssemblyError::ManifestMismatch);
         }
@@ -297,12 +274,23 @@ impl std::error::Error for AssemblyError {
     }
 }
 
+fn map_agreed_copies_error(error: agreed_copies::Error<Error>) -> AssemblyError {
+    match error {
+        agreed_copies::Error::CopyLimitExceeded { actual, maximum } => {
+            AssemblyError::CopyLimitExceeded { actual, maximum }
+        }
+        agreed_copies::Error::Missing => AssemblyError::Missing,
+        agreed_copies::Error::InvalidCopy(error) => AssemblyError::InvalidCopy(error),
+        agreed_copies::Error::ConflictingCopies => AssemblyError::ConflictingCopies,
+    }
+}
+
 fn validate_hints(first: u64, second: u64, observed_len: u64) -> Result<(), Error> {
     if first >= second {
         return Err(Error::ManifestOffsetsNotAscending { first, second });
     }
     for offset in [first, second] {
-        let end = offset.checked_add(CORE_MANIFEST_RECORD_LEN).ok_or(
+        let end = offset.checked_add(manifest::ENCODED_RECORD_LEN).ok_or(
             Error::ManifestRecordOutsideObservedLength {
                 offset,
                 observed_len,
