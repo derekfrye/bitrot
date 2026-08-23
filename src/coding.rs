@@ -317,8 +317,8 @@ impl From<reed_solomon_simd::Error> for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fingerprint::{ChunkSize, MIN_CHUNK_SIZE};
     use crate::geometry::Redundancy;
+    use crate::geometry::{ChunkSize, MIN_CHUNK_SIZE};
     use std::io::Cursor;
 
     const WINDOW_BYTES: usize = 1_024;

@@ -1,15 +1,16 @@
 //! Canonical records containing one complete recovery shard.
 
-use crate::fingerprint::{Digest, recovery_chunk_digest};
+use crate::algorithm::CODING_LEOPARD_GF16;
+use crate::digest::Digest;
+use crate::fingerprint::recovery_chunk_digest;
 use crate::manifest::Manifest;
 use crate::record::{FLAG_REQUIRED, Record};
+use crate::wire;
 use std::fmt;
 
 pub const RECORD_TYPE: u16 = 5;
 pub const PAYLOAD_VERSION: u16 = 1;
 pub const PAYLOAD_HEADER_LEN: usize = 32;
-
-const CODING_ALGORITHM_LEOPARD_GF16: u16 = 1;
 
 /// One complete, full-size parity shard in recovery-index order.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -60,7 +61,7 @@ impl RecoveryChunk {
         let geometry = manifest.geometry();
         let mut payload = Vec::with_capacity(PAYLOAD_HEADER_LEN + self.bytes.len());
         payload.extend_from_slice(&PAYLOAD_VERSION.to_le_bytes());
-        payload.extend_from_slice(&CODING_ALGORITHM_LEOPARD_GF16.to_le_bytes());
+        payload.extend_from_slice(&CODING_LEOPARD_GF16.to_le_bytes());
         payload.extend_from_slice(&self.recovery_index.to_le_bytes());
         payload.extend_from_slice(&geometry.data_chunks.to_le_bytes());
         payload.extend_from_slice(&geometry.recovery_chunks.to_le_bytes());
@@ -109,16 +110,16 @@ impl RecoveryChunk {
             return Err(Error::TruncatedPayload);
         }
 
-        let version = parse_u16(&record.payload, 0);
+        let version = parse_u16(&record.payload, 0)?;
         if version != PAYLOAD_VERSION {
             return Err(Error::UnsupportedPayloadVersion(version));
         }
-        let coding_algorithm = parse_u16(&record.payload, 2);
-        if coding_algorithm != CODING_ALGORITHM_LEOPARD_GF16 {
+        let coding_algorithm = parse_u16(&record.payload, 2)?;
+        if coding_algorithm != CODING_LEOPARD_GF16 {
             return Err(Error::UnsupportedCodingAlgorithm(coding_algorithm));
         }
 
-        let recovery_index = parse_u32(&record.payload, 4);
+        let recovery_index = parse_u32(&record.payload, 4)?;
         validate_index(manifest, recovery_index)?;
         if record.logical_id != u64::from(recovery_index) {
             return Err(Error::LogicalIdMismatch);
@@ -127,25 +128,25 @@ impl RecoveryChunk {
         let geometry = manifest.geometry();
         validate_field(
             "data chunk count",
-            parse_u32(&record.payload, 8),
+            parse_u32(&record.payload, 8)?,
             geometry.data_chunks,
         )?;
         validate_field(
             "recovery chunk count",
-            parse_u32(&record.payload, 12),
+            parse_u32(&record.payload, 12)?,
             geometry.recovery_chunks,
         )?;
         validate_field(
             "chunk size",
-            parse_u32(&record.payload, 16),
+            parse_u32(&record.payload, 16)?,
             geometry.chunk_size.bytes(),
         )?;
         validate_field(
             "logical length",
-            parse_u32(&record.payload, 20),
+            parse_u32(&record.payload, 20)?,
             geometry.chunk_size.bytes(),
         )?;
-        if parse_u64(&record.payload, 24) != 0 {
+        if parse_u64(&record.payload, 24)? != 0 {
             return Err(Error::ReservedField);
         }
 
@@ -276,36 +277,24 @@ fn validate_field(field: &'static str, actual: u32, expected: u32) -> Result<(),
     }
 }
 
-fn parse_u16(bytes: &[u8], offset: usize) -> u16 {
-    u16::from_le_bytes(
-        bytes[offset..offset + 2]
-            .try_into()
-            .expect("fixed recovery field"),
-    )
+fn parse_u16(bytes: &[u8], offset: usize) -> Result<u16, Error> {
+    wire::u16(bytes, offset).ok_or(Error::TruncatedPayload)
 }
 
-fn parse_u32(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(
-        bytes[offset..offset + 4]
-            .try_into()
-            .expect("fixed recovery field"),
-    )
+fn parse_u32(bytes: &[u8], offset: usize) -> Result<u32, Error> {
+    wire::u32(bytes, offset).ok_or(Error::TruncatedPayload)
 }
 
-fn parse_u64(bytes: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes(
-        bytes[offset..offset + 8]
-            .try_into()
-            .expect("fixed recovery field"),
-    )
+fn parse_u64(bytes: &[u8], offset: usize) -> Result<u64, Error> {
+    wire::u64(bytes, offset).ok_or(Error::TruncatedPayload)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::digest_page::{Kind, Table};
-    use crate::fingerprint::{ChunkSize, MIN_CHUNK_SIZE};
     use crate::geometry::Geometry;
+    use crate::geometry::{ChunkSize, MIN_CHUNK_SIZE};
     use crate::record::{self, BASE_HEADER_LEN, DecodeLimits};
     use crate::rolling_page;
     use std::io::Cursor;

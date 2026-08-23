@@ -1,19 +1,18 @@
 //! Canonical core-manifest records for one protection set.
 
+use crate::algorithm::{CODING_LEOPARD_GF16, ROLLING_CRC64_GO_ISO, STRONG_HASH_BLAKE3_256};
+use crate::digest::Digest;
 use crate::digest_page::{Kind, Table};
-use crate::fingerprint::{ChunkSize, ChunkSizeError, Digest};
-use crate::geometry::{Geometry, GeometryError};
+use crate::geometry::{ChunkSize, ChunkSizeError, Geometry, GeometryError};
 use crate::record::{FLAG_REQUIRED, Record};
 use crate::rolling_page::Table as RollingTable;
+use crate::wire;
 use std::fmt;
 
 pub const RECORD_TYPE: u16 = 2;
 pub const PAYLOAD_VERSION: u16 = 1;
 pub const PAYLOAD_LEN: usize = 192;
 
-const CODING_ALGORITHM_LEOPARD_GF16: u16 = 1;
-const STRONG_HASH_BLAKE3_256: u16 = 1;
-const ROLLING_ALGORITHM_CRC64_GO_ISO: u16 = 1;
 const SET_ID_CONTEXT: &str = "bitrot format v1 protection set identifier";
 
 /// The small, duplicated manifest that binds source identity and coding data.
@@ -48,7 +47,7 @@ impl Manifest {
             Kind::Recovery,
             u64::from(geometry.recovery_chunks),
         )?;
-        let expected_rolling_count = expected_rolling_count(geometry);
+        let expected_rolling_count = geometry.full_data_chunks();
         if rolling_table.value_count != expected_rolling_count {
             return Err(Error::RollingCountMismatch {
                 actual: rolling_table.value_count,
@@ -133,38 +132,38 @@ impl Manifest {
             });
         }
 
-        let version = parse_u16(&record.payload, 0);
+        let version = parse_u16(&record.payload, 0)?;
         if version != PAYLOAD_VERSION {
             return Err(Error::UnsupportedPayloadVersion(version));
         }
-        let required_features = parse_u16(&record.payload, 2);
+        let required_features = parse_u16(&record.payload, 2)?;
         if required_features != 0 {
             return Err(Error::UnsupportedRequiredFeatures(required_features));
         }
         validate_algorithm(
             "coding",
-            parse_u16(&record.payload, 4),
-            CODING_ALGORITHM_LEOPARD_GF16,
+            parse_u16(&record.payload, 4)?,
+            CODING_LEOPARD_GF16,
         )?;
         validate_algorithm(
             "strong hash",
-            parse_u16(&record.payload, 6),
+            parse_u16(&record.payload, 6)?,
             STRONG_HASH_BLAKE3_256,
         )?;
         validate_algorithm(
             "rolling",
-            parse_u16(&record.payload, 8),
-            ROLLING_ALGORITHM_CRC64_GO_ISO,
+            parse_u16(&record.payload, 8)?,
+            ROLLING_CRC64_GO_ISO,
         )?;
-        if parse_u16(&record.payload, 10) != 0 || parse_u32(&record.payload, 36) != 0 {
+        if parse_u16(&record.payload, 10)? != 0 || parse_u32(&record.payload, 36)? != 0 {
             return Err(Error::ReservedField);
         }
 
-        let chunk_size = ChunkSize::new(u64::from(parse_u32(&record.payload, 12)))?;
-        let source_len = parse_u64(&record.payload, 16);
-        let data_chunks = parse_u32(&record.payload, 24);
-        let recovery_chunks = parse_u32(&record.payload, 28);
-        let final_data_chunk_len = parse_u32(&record.payload, 32);
+        let chunk_size = ChunkSize::new(u64::from(parse_u32(&record.payload, 12)?))?;
+        let source_len = parse_u64(&record.payload, 16)?;
+        let data_chunks = parse_u32(&record.payload, 24)?;
+        let recovery_chunks = parse_u32(&record.payload, 28)?;
+        let final_data_chunk_len = parse_u32(&record.payload, 32)?;
         let geometry = Geometry::from_stored(
             source_len,
             chunk_size,
@@ -172,34 +171,37 @@ impl Manifest {
             recovery_chunks,
             final_data_chunk_len,
         )?;
-        if parse_u64(&record.payload, 72) != u64::from(data_chunks) {
+        let data_digest_count = parse_u64(&record.payload, 72)?;
+        if data_digest_count != u64::from(data_chunks) {
             return Err(Error::DigestCountMismatch {
                 kind: Kind::Data,
-                actual: parse_u64(&record.payload, 72),
+                actual: data_digest_count,
                 expected: u64::from(data_chunks),
             });
         }
-        if parse_u64(&record.payload, 112) != u64::from(recovery_chunks) {
+        let recovery_digest_count = parse_u64(&record.payload, 112)?;
+        if recovery_digest_count != u64::from(recovery_chunks) {
             return Err(Error::DigestCountMismatch {
                 kind: Kind::Recovery,
-                actual: parse_u64(&record.payload, 112),
+                actual: recovery_digest_count,
                 expected: u64::from(recovery_chunks),
             });
         }
-        let expected_rolling_count = expected_rolling_count(geometry);
-        if parse_u64(&record.payload, 152) != expected_rolling_count {
+        let expected_rolling_count = geometry.full_data_chunks();
+        let rolling_count = parse_u64(&record.payload, 152)?;
+        if rolling_count != expected_rolling_count {
             return Err(Error::RollingCountMismatch {
-                actual: parse_u64(&record.payload, 152),
+                actual: rolling_count,
                 expected: expected_rolling_count,
             });
         }
 
         let manifest = Self::from_validated_parts(
             geometry,
-            digest(&record.payload, 40),
-            digest(&record.payload, 80),
-            digest(&record.payload, 120),
-            digest(&record.payload, 160),
+            digest(&record.payload, 40)?,
+            digest(&record.payload, 80)?,
+            digest(&record.payload, 120)?,
+            digest(&record.payload, 160)?,
         );
         if record.protection_set_id != manifest.protection_set_id {
             return Err(Error::ProtectionSetIdMismatch {
@@ -232,9 +234,9 @@ impl Manifest {
         let mut payload = Vec::with_capacity(PAYLOAD_LEN);
         payload.extend_from_slice(&PAYLOAD_VERSION.to_le_bytes());
         payload.extend_from_slice(&0_u16.to_le_bytes());
-        payload.extend_from_slice(&CODING_ALGORITHM_LEOPARD_GF16.to_le_bytes());
+        payload.extend_from_slice(&CODING_LEOPARD_GF16.to_le_bytes());
         payload.extend_from_slice(&STRONG_HASH_BLAKE3_256.to_le_bytes());
-        payload.extend_from_slice(&ROLLING_ALGORITHM_CRC64_GO_ISO.to_le_bytes());
+        payload.extend_from_slice(&ROLLING_CRC64_GO_ISO.to_le_bytes());
         payload.extend_from_slice(&0_u16.to_le_bytes());
         payload.extend_from_slice(&self.geometry.chunk_size.bytes().to_le_bytes());
         payload.extend_from_slice(&self.geometry.source_len.to_le_bytes());
@@ -247,16 +249,11 @@ impl Manifest {
         payload.extend_from_slice(self.data_table_root.as_bytes());
         payload.extend_from_slice(&u64::from(self.geometry.recovery_chunks).to_le_bytes());
         payload.extend_from_slice(self.recovery_table_root.as_bytes());
-        payload.extend_from_slice(&expected_rolling_count(self.geometry).to_le_bytes());
+        payload.extend_from_slice(&self.geometry.full_data_chunks().to_le_bytes());
         payload.extend_from_slice(self.rolling_table_root.as_bytes());
         debug_assert_eq!(payload.len(), PAYLOAD_LEN);
         payload
     }
-}
-
-const fn expected_rolling_count(geometry: Geometry) -> u64 {
-    let short_final = geometry.final_data_chunk_len < geometry.chunk_size.bytes();
-    geometry.data_chunks as u64 - short_final as u64
 }
 
 fn validate_table(table: &Table, expected_kind: Kind, expected_count: u64) -> Result<(), Error> {
@@ -279,9 +276,9 @@ fn validate_table(table: &Table, expected_kind: Kind, expected_count: u64) -> Re
 fn set_id(geometry: Geometry, source_digest: Digest, data_table_root: Digest) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new_derive_key(SET_ID_CONTEXT);
     hasher.update(&PAYLOAD_VERSION.to_le_bytes());
-    hasher.update(&CODING_ALGORITHM_LEOPARD_GF16.to_le_bytes());
+    hasher.update(&CODING_LEOPARD_GF16.to_le_bytes());
     hasher.update(&STRONG_HASH_BLAKE3_256.to_le_bytes());
-    hasher.update(&ROLLING_ALGORITHM_CRC64_GO_ISO.to_le_bytes());
+    hasher.update(&ROLLING_CRC64_GO_ISO.to_le_bytes());
     hasher.update(&geometry.chunk_size.bytes().to_le_bytes());
     hasher.update(&geometry.source_len.to_le_bytes());
     hasher.update(&geometry.data_chunks.to_le_bytes());
@@ -301,36 +298,29 @@ fn validate_algorithm(name: &'static str, actual: u16, expected: u16) -> Result<
     }
 }
 
-fn parse_u16(bytes: &[u8], offset: usize) -> u16 {
-    u16::from_le_bytes(
-        bytes[offset..offset + 2]
-            .try_into()
-            .expect("fixed manifest field"),
-    )
+fn parse_u16(bytes: &[u8], offset: usize) -> Result<u16, Error> {
+    wire::u16(bytes, offset).ok_or_else(|| invalid_payload_length(bytes))
 }
 
-fn parse_u32(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(
-        bytes[offset..offset + 4]
-            .try_into()
-            .expect("fixed manifest field"),
-    )
+fn parse_u32(bytes: &[u8], offset: usize) -> Result<u32, Error> {
+    wire::u32(bytes, offset).ok_or_else(|| invalid_payload_length(bytes))
 }
 
-fn parse_u64(bytes: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes(
-        bytes[offset..offset + 8]
-            .try_into()
-            .expect("fixed manifest field"),
-    )
+fn parse_u64(bytes: &[u8], offset: usize) -> Result<u64, Error> {
+    wire::u64(bytes, offset).ok_or_else(|| invalid_payload_length(bytes))
 }
 
-fn digest(bytes: &[u8], offset: usize) -> Digest {
-    Digest::from_bytes(
-        bytes[offset..offset + 32]
-            .try_into()
-            .expect("fixed manifest digest"),
-    )
+fn digest(bytes: &[u8], offset: usize) -> Result<Digest, Error> {
+    wire::array(bytes, offset)
+        .map(Digest::from_bytes)
+        .ok_or_else(|| invalid_payload_length(bytes))
+}
+
+fn invalid_payload_length(bytes: &[u8]) -> Error {
+    Error::PayloadLengthMismatch {
+        actual: bytes.len(),
+        expected: PAYLOAD_LEN,
+    }
 }
 
 #[derive(Debug)]
@@ -467,7 +457,8 @@ impl From<GeometryError> for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fingerprint::{self, MIN_CHUNK_SIZE};
+    use crate::fingerprint;
+    use crate::geometry::MIN_CHUNK_SIZE;
     use crate::geometry::Redundancy;
     use crate::record::{self, DecodeLimits};
     use crate::rolling_page::Table as RollingTable;
@@ -687,7 +678,7 @@ mod tests {
             Redundancy::new(1, 2).unwrap(),
         )
         .unwrap();
-        assert_eq!(expected_rolling_count(geometry), 2);
+        assert_eq!(geometry.full_data_chunks(), 2);
 
         let data = Table::new(
             Kind::Data,
@@ -722,7 +713,7 @@ mod tests {
         changed_source.payload[40] ^= 1;
         changed_source.protection_set_id = set_id(
             manifest.geometry(),
-            digest(&changed_source.payload, 40),
+            digest(&changed_source.payload, 40).unwrap(),
             manifest.data_table_root(),
         );
         let changed_source = Manifest::from_record(&changed_source).unwrap();
@@ -736,7 +727,7 @@ mod tests {
         changed_root.protection_set_id = set_id(
             manifest.geometry(),
             manifest.source_digest(),
-            digest(&changed_root.payload, 80),
+            digest(&changed_root.payload, 80).unwrap(),
         );
         let changed_root = Manifest::from_record(&changed_root).unwrap();
         assert_ne!(

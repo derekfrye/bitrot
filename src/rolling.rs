@@ -1,6 +1,8 @@
 //! CRC-64/GO-ISO rolling candidates with mandatory BLAKE3 confirmation.
 
-use crate::fingerprint::{self, ChunkSize, Digest};
+use crate::digest::Digest;
+use crate::fingerprint;
+use crate::geometry::ChunkSize;
 use crc::{CRC_64_GO_ISO, Crc, Table};
 use std::collections::HashMap;
 use std::fmt;
@@ -354,7 +356,8 @@ fn read_byte<R: Read>(reader: &mut R, byte: &mut [u8; 1]) -> Result<bool, Error>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fingerprint::{self, MIN_CHUNK_SIZE};
+    use crate::fingerprint;
+    use crate::geometry::MIN_CHUNK_SIZE;
     use std::io::Cursor;
 
     fn chunk_size() -> ChunkSize {

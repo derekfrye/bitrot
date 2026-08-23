@@ -1,7 +1,10 @@
 //! Bounded pages containing full-chunk rolling fingerprints.
 
-use crate::fingerprint::Digest;
+use crate::digest::Digest;
+use crate::paged_table;
 use crate::record::{FLAG_REQUIRED, Record};
+use crate::wire;
+use std::convert::Infallible;
 use std::fmt;
 
 pub const RECORD_TYPE: u16 = 4;
@@ -17,6 +20,20 @@ pub struct Page {
     pub page_index: u32,
     pub first_value_index: u64,
     pub values: Vec<u64>,
+}
+
+impl paged_table::Page for Page {
+    fn page_index(&self) -> u32 {
+        self.page_index
+    }
+
+    fn first_item_index(&self) -> u64 {
+        self.first_value_index
+    }
+
+    fn item_count(&self) -> usize {
+        self.values.len()
+    }
 }
 
 impl Page {
@@ -124,13 +141,10 @@ impl Page {
         let values = record.payload[PAYLOAD_HEADER_LEN..]
             .chunks_exact(size_of::<u64>())
             .map(|bytes| {
-                bytes
-                    .try_into()
-                    .map(u64::from_le_bytes)
-                    .map_err(|_| Error::PayloadLengthMismatch {
-                        actual: record.payload.len(),
-                        expected: expected_len,
-                    })
+                wire::u64(bytes, 0).ok_or(Error::PayloadLengthMismatch {
+                    actual: record.payload.len(),
+                    expected: expected_len,
+                })
             })
             .collect::<Result<Vec<_>, _>>()?;
         Self::new(page_index, first_value_index, values)
@@ -194,82 +208,17 @@ impl Table {
     where
         I: IntoIterator<Item = Page>,
     {
-        if value_count > limits.max_values {
-            return Err(AssemblyError::ValueLimitExceeded {
-                actual: value_count,
-                maximum: limits.max_values,
-            });
-        }
-        let page_size =
-            u64::try_from(MAX_VALUES_PER_PAGE).map_err(|_| AssemblyError::LengthOverflow)?;
-        let page_count = if value_count == 0 {
-            0
-        } else {
-            ((value_count - 1) / page_size) + 1
-        };
-        if page_count > u64::from(limits.max_pages) {
-            return Err(AssemblyError::PageLimitExceeded {
-                actual: page_count,
-                maximum: limits.max_pages,
-            });
-        }
-        let page_count =
-            usize::try_from(page_count).map_err(|_| AssemblyError::CountUnrepresentable)?;
-        usize::try_from(value_count).map_err(|_| AssemblyError::CountUnrepresentable)?;
-
-        let mut slots = vec![None; page_count];
-        for page in pages {
-            let index = usize::try_from(page.page_index)
-                .map_err(|_| AssemblyError::CountUnrepresentable)?;
-            let Some(slot) = slots.get_mut(index) else {
-                return Err(AssemblyError::PageIndexOutOfRange {
-                    page_index: page.page_index,
-                    page_count: u32::try_from(page_count)
-                        .map_err(|_| AssemblyError::CountUnrepresentable)?,
-                });
-            };
-            let expected_first = u64::from(page.page_index)
-                .checked_mul(page_size)
-                .ok_or(AssemblyError::LengthOverflow)?;
-            if page.first_value_index != expected_first {
-                return Err(AssemblyError::FirstValueIndexMismatch {
-                    page_index: page.page_index,
-                    actual: page.first_value_index,
-                    expected: expected_first,
-                });
-            }
-            let remaining = value_count
-                .checked_sub(expected_first)
-                .ok_or(AssemblyError::LengthOverflow)?;
-            let expected_count = usize::try_from(remaining.min(page_size))
-                .map_err(|_| AssemblyError::LengthOverflow)?;
-            if page.values.len() != expected_count {
-                return Err(AssemblyError::PageValueCountMismatch {
-                    page_index: page.page_index,
-                    actual: page.values.len(),
-                    expected: expected_count,
-                });
-            }
-            if let Some(existing) = slot {
-                if existing != &page {
-                    return Err(AssemblyError::ConflictingPage(page.page_index));
-                }
-            } else {
-                *slot = Some(page);
-            }
-        }
-
-        let missing: Result<Vec<u32>, _> = slots
-            .iter()
-            .enumerate()
-            .filter(|(_, page)| page.is_none())
-            .map(|(index, _)| u32::try_from(index).map_err(|_| AssemblyError::CountUnrepresentable))
-            .collect();
-        let missing = missing?;
-        if !missing.is_empty() {
-            return Err(AssemblyError::MissingPages(missing));
-        }
-        let pages: Vec<_> = slots.into_iter().flatten().collect();
+        let pages = paged_table::assemble(
+            value_count,
+            MAX_VALUES_PER_PAGE,
+            pages,
+            paged_table::Limits {
+                max_items: limits.max_values,
+                max_pages: limits.max_pages,
+            },
+            |_| Ok::<(), Infallible>(()),
+        )
+        .map_err(map_paged_table_error)?;
         let actual_root = table_root_iter(
             value_count,
             pages.iter().flat_map(|page| page.values.iter().copied()),
@@ -397,6 +346,50 @@ impl fmt::Display for AssemblyError {
 
 impl std::error::Error for AssemblyError {}
 
+fn map_paged_table_error(error: paged_table::Error<Infallible>) -> AssemblyError {
+    match error {
+        paged_table::Error::ItemLimitExceeded { actual, maximum } => {
+            AssemblyError::ValueLimitExceeded { actual, maximum }
+        }
+        paged_table::Error::PageLimitExceeded { actual, maximum } => {
+            AssemblyError::PageLimitExceeded { actual, maximum }
+        }
+        paged_table::Error::ItemCountUnrepresentable
+        | paged_table::Error::PageCountUnrepresentable => AssemblyError::CountUnrepresentable,
+        paged_table::Error::LengthOverflow => AssemblyError::LengthOverflow,
+        paged_table::Error::InvalidPage(error) => match error {},
+        paged_table::Error::PageIndexOutOfRange {
+            page_index,
+            page_count,
+        } => AssemblyError::PageIndexOutOfRange {
+            page_index,
+            page_count,
+        },
+        paged_table::Error::FirstItemIndexMismatch {
+            page_index,
+            actual,
+            expected,
+        } => AssemblyError::FirstValueIndexMismatch {
+            page_index,
+            actual,
+            expected,
+        },
+        paged_table::Error::PageItemCountMismatch {
+            page_index,
+            actual,
+            expected,
+        } => AssemblyError::PageValueCountMismatch {
+            page_index,
+            actual,
+            expected,
+        },
+        paged_table::Error::ConflictingPage(page_index) => {
+            AssemblyError::ConflictingPage(page_index)
+        }
+        paged_table::Error::MissingPages(pages) => AssemblyError::MissingPages(pages),
+    }
+}
+
 /// Hashes a complete canonical rolling-fingerprint table.
 ///
 /// # Errors
@@ -502,30 +495,15 @@ fn validate_value_range(first: u64, count: usize) -> Result<(), Error> {
 }
 
 fn parse_u16(bytes: &[u8], offset: usize) -> Result<u16, Error> {
-    let encoded = bytes
-        .get(offset..offset + 2)
-        .ok_or(Error::TruncatedPayload)?;
-    Ok(u16::from_le_bytes(
-        encoded.try_into().map_err(|_| Error::TruncatedPayload)?,
-    ))
+    wire::u16(bytes, offset).ok_or(Error::TruncatedPayload)
 }
 
 fn parse_u32(bytes: &[u8], offset: usize) -> Result<u32, Error> {
-    let encoded = bytes
-        .get(offset..offset + 4)
-        .ok_or(Error::TruncatedPayload)?;
-    Ok(u32::from_le_bytes(
-        encoded.try_into().map_err(|_| Error::TruncatedPayload)?,
-    ))
+    wire::u32(bytes, offset).ok_or(Error::TruncatedPayload)
 }
 
 fn parse_u64(bytes: &[u8], offset: usize) -> Result<u64, Error> {
-    let encoded = bytes
-        .get(offset..offset + 8)
-        .ok_or(Error::TruncatedPayload)?;
-    Ok(u64::from_le_bytes(
-        encoded.try_into().map_err(|_| Error::TruncatedPayload)?,
-    ))
+    wire::u64(bytes, offset).ok_or(Error::TruncatedPayload)
 }
 
 #[cfg(test)]

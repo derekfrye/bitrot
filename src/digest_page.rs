@@ -1,7 +1,9 @@
 //! Bounded pages containing strong data- or recovery-chunk digests.
 
-use crate::fingerprint::Digest;
+use crate::digest::Digest;
+use crate::paged_table;
 use crate::record::{FLAG_REQUIRED, Record};
+use crate::wire;
 use std::fmt;
 
 pub const RECORD_TYPE: u16 = 3;
@@ -48,6 +50,20 @@ pub struct Page {
     pub page_index: u32,
     pub first_digest_index: u64,
     pub digests: Vec<Digest>,
+}
+
+impl paged_table::Page for Page {
+    fn page_index(&self) -> u32 {
+        self.page_index
+    }
+
+    fn first_item_index(&self) -> u64 {
+        self.first_digest_index
+    }
+
+    fn item_count(&self) -> usize {
+        self.digests.len()
+    }
 }
 
 impl Page {
@@ -241,92 +257,27 @@ impl Table {
     where
         I: IntoIterator<Item = Page>,
     {
-        if digest_count > limits.max_digests {
-            return Err(AssemblyError::DigestLimitExceeded {
-                actual: digest_count,
-                maximum: limits.max_digests,
-            });
-        }
-        let page_size =
-            u64::try_from(MAX_DIGESTS_PER_PAGE).map_err(|_| AssemblyError::LengthOverflow)?;
-        let page_count = if digest_count == 0 {
-            0
-        } else {
-            ((digest_count - 1) / page_size) + 1
-        };
-        if page_count > u64::from(limits.max_pages) {
-            return Err(AssemblyError::PageLimitExceeded {
-                actual: page_count,
-                maximum: limits.max_pages,
-            });
-        }
-        let page_count =
-            usize::try_from(page_count).map_err(|_| AssemblyError::PageCountUnrepresentable)?;
-        usize::try_from(digest_count).map_err(|_| AssemblyError::DigestCountUnrepresentable)?;
-
-        let mut slots = Vec::with_capacity(page_count);
-        slots.resize_with(page_count, || None);
-        for page in pages {
-            if page.kind != kind {
-                return Err(AssemblyError::WrongKind {
-                    page_index: page.page_index,
-                    expected: kind,
-                    actual: page.kind,
-                });
-            }
-            let index = usize::try_from(page.page_index)
-                .map_err(|_| AssemblyError::PageCountUnrepresentable)?;
-            let Some(slot) = slots.get_mut(index) else {
-                return Err(AssemblyError::PageIndexOutOfRange {
-                    page_index: page.page_index,
-                    page_count: u32::try_from(page_count)
-                        .map_err(|_| AssemblyError::PageCountUnrepresentable)?,
-                });
-            };
-            let expected_first = u64::from(page.page_index)
-                .checked_mul(page_size)
-                .ok_or(AssemblyError::LengthOverflow)?;
-            if page.first_digest_index != expected_first {
-                return Err(AssemblyError::FirstDigestIndexMismatch {
-                    page_index: page.page_index,
-                    actual: page.first_digest_index,
-                    expected: expected_first,
-                });
-            }
-            let remaining = digest_count
-                .checked_sub(expected_first)
-                .ok_or(AssemblyError::LengthOverflow)?;
-            let expected_count = usize::try_from(remaining.min(page_size))
-                .map_err(|_| AssemblyError::LengthOverflow)?;
-            if page.digests.len() != expected_count {
-                return Err(AssemblyError::PageDigestCountMismatch {
-                    page_index: page.page_index,
-                    actual: page.digests.len(),
-                    expected: expected_count,
-                });
-            }
-
-            if let Some(existing) = slot {
-                if existing != &page {
-                    return Err(AssemblyError::ConflictingPage(page.page_index));
+        let pages = paged_table::assemble(
+            digest_count,
+            MAX_DIGESTS_PER_PAGE,
+            pages,
+            paged_table::Limits {
+                max_items: limits.max_digests,
+                max_pages: limits.max_pages,
+            },
+            |page| {
+                if page.kind == kind {
+                    Ok(())
+                } else {
+                    Err(AssemblyError::WrongKind {
+                        page_index: page.page_index,
+                        expected: kind,
+                        actual: page.kind,
+                    })
                 }
-            } else {
-                *slot = Some(page);
-            }
-        }
-
-        let mut missing = Vec::new();
-        for (index, page) in slots.iter().enumerate() {
-            if page.is_none() {
-                missing.push(
-                    u32::try_from(index).map_err(|_| AssemblyError::PageCountUnrepresentable)?,
-                );
-            }
-        }
-        if !missing.is_empty() {
-            return Err(AssemblyError::MissingPages(missing));
-        }
-        let pages: Vec<Page> = slots.into_iter().flatten().collect();
+            },
+        )
+        .map_err(map_paged_table_error)?;
         let actual_root = table_root_iter(
             kind,
             digest_count,
@@ -471,6 +422,50 @@ impl fmt::Display for AssemblyError {
 
 impl std::error::Error for AssemblyError {}
 
+fn map_paged_table_error(error: paged_table::Error<AssemblyError>) -> AssemblyError {
+    match error {
+        paged_table::Error::ItemLimitExceeded { actual, maximum } => {
+            AssemblyError::DigestLimitExceeded { actual, maximum }
+        }
+        paged_table::Error::PageLimitExceeded { actual, maximum } => {
+            AssemblyError::PageLimitExceeded { actual, maximum }
+        }
+        paged_table::Error::ItemCountUnrepresentable => AssemblyError::DigestCountUnrepresentable,
+        paged_table::Error::PageCountUnrepresentable => AssemblyError::PageCountUnrepresentable,
+        paged_table::Error::LengthOverflow => AssemblyError::LengthOverflow,
+        paged_table::Error::InvalidPage(error) => error,
+        paged_table::Error::PageIndexOutOfRange {
+            page_index,
+            page_count,
+        } => AssemblyError::PageIndexOutOfRange {
+            page_index,
+            page_count,
+        },
+        paged_table::Error::FirstItemIndexMismatch {
+            page_index,
+            actual,
+            expected,
+        } => AssemblyError::FirstDigestIndexMismatch {
+            page_index,
+            actual,
+            expected,
+        },
+        paged_table::Error::PageItemCountMismatch {
+            page_index,
+            actual,
+            expected,
+        } => AssemblyError::PageDigestCountMismatch {
+            page_index,
+            actual,
+            expected,
+        },
+        paged_table::Error::ConflictingPage(page_index) => {
+            AssemblyError::ConflictingPage(page_index)
+        }
+        paged_table::Error::MissingPages(pages) => AssemblyError::MissingPages(pages),
+    }
+}
+
 /// Hashes a canonical ordered digest table independently of page boundaries.
 ///
 /// # Errors
@@ -580,30 +575,15 @@ fn validate_digest_range(first_digest_index: u64, count: usize) -> Result<(), Er
 }
 
 fn parse_u16(bytes: &[u8], offset: usize) -> Result<u16, Error> {
-    let source = bytes
-        .get(offset..offset + 2)
-        .ok_or(Error::TruncatedPayload)?;
-    let mut encoded = [0_u8; 2];
-    encoded.copy_from_slice(source);
-    Ok(u16::from_le_bytes(encoded))
+    wire::u16(bytes, offset).ok_or(Error::TruncatedPayload)
 }
 
 fn parse_u32(bytes: &[u8], offset: usize) -> Result<u32, Error> {
-    let source = bytes
-        .get(offset..offset + 4)
-        .ok_or(Error::TruncatedPayload)?;
-    let mut encoded = [0_u8; 4];
-    encoded.copy_from_slice(source);
-    Ok(u32::from_le_bytes(encoded))
+    wire::u32(bytes, offset).ok_or(Error::TruncatedPayload)
 }
 
 fn parse_u64(bytes: &[u8], offset: usize) -> Result<u64, Error> {
-    let source = bytes
-        .get(offset..offset + 8)
-        .ok_or(Error::TruncatedPayload)?;
-    let mut encoded = [0_u8; 8];
-    encoded.copy_from_slice(source);
-    Ok(u64::from_le_bytes(encoded))
+    wire::u64(bytes, offset).ok_or(Error::TruncatedPayload)
 }
 
 #[cfg(test)]

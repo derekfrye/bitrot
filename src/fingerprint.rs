@@ -1,106 +1,15 @@
 //! Streaming strong fingerprints for source files and their data chunks.
 
+pub use crate::digest::Digest;
+pub use crate::geometry::{
+    ChunkSize, ChunkSizeError, DEFAULT_CHUNK_SIZE, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE,
+};
 use std::fmt;
 use std::io::{self, Read};
-
-pub const MIN_CHUNK_SIZE: u32 = 64 * 1024;
-pub const DEFAULT_CHUNK_SIZE: u32 = 4 * 1024 * 1024;
-pub const MAX_CHUNK_SIZE: u32 = 64 * 1024 * 1024;
 
 const SOURCE_DIGEST_CONTEXT: &str = "bitrot format v1 source file digest";
 const DATA_CHUNK_DIGEST_CONTEXT: &str = "bitrot format v1 data chunk digest";
 const RECOVERY_CHUNK_DIGEST_CONTEXT: &str = "bitrot format v1 recovery chunk digest";
-
-/// A full 256-bit BLAKE3 digest.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct Digest([u8; 32]);
-
-impl Digest {
-    #[must_use]
-    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
-    #[must_use]
-    pub const fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-
-    #[must_use]
-    pub const fn into_bytes(self) -> [u8; 32] {
-        self.0
-    }
-}
-
-impl From<blake3::Hash> for Digest {
-    fn from(hash: blake3::Hash) -> Self {
-        Self(*hash.as_bytes())
-    }
-}
-
-/// A format-valid data chunk size.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct ChunkSize(u32);
-
-impl ChunkSize {
-    /// Validates an experimental v1 chunk size.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error unless `bytes` is a power of two from 64 KiB through
-    /// 64 MiB, inclusive.
-    pub fn new(bytes: u64) -> Result<Self, ChunkSizeError> {
-        if bytes < u64::from(MIN_CHUNK_SIZE) {
-            return Err(ChunkSizeError::TooSmall(bytes));
-        }
-        if bytes > u64::from(MAX_CHUNK_SIZE) {
-            return Err(ChunkSizeError::TooLarge(bytes));
-        }
-        if !bytes.is_power_of_two() {
-            return Err(ChunkSizeError::NotPowerOfTwo(bytes));
-        }
-        let bytes = u32::try_from(bytes).map_err(|_| ChunkSizeError::TooLarge(bytes))?;
-        Ok(Self(bytes))
-    }
-
-    #[must_use]
-    pub const fn bytes(self) -> u32 {
-        self.0
-    }
-}
-
-impl Default for ChunkSize {
-    fn default() -> Self {
-        Self(DEFAULT_CHUNK_SIZE)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ChunkSizeError {
-    TooSmall(u64),
-    TooLarge(u64),
-    NotPowerOfTwo(u64),
-}
-
-impl fmt::Display for ChunkSizeError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::TooSmall(value) => write!(
-                formatter,
-                "chunk size {value} is below the minimum of {MIN_CHUNK_SIZE} bytes"
-            ),
-            Self::TooLarge(value) => write!(
-                formatter,
-                "chunk size {value} exceeds the maximum of {MAX_CHUNK_SIZE} bytes"
-            ),
-            Self::NotPowerOfTwo(value) => {
-                write!(formatter, "chunk size {value} is not a power of two")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ChunkSizeError {}
 
 /// Strong source identity produced by one complete read.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -237,25 +146,6 @@ mod tests {
 
     fn minimum() -> ChunkSize {
         ChunkSize::new(u64::from(MIN_CHUNK_SIZE)).unwrap()
-    }
-
-    #[test]
-    fn validates_experimental_chunk_size_bounds() {
-        assert_eq!(ChunkSize::default().bytes(), DEFAULT_CHUNK_SIZE);
-        assert!(ChunkSize::new(u64::from(MIN_CHUNK_SIZE)).is_ok());
-        assert!(ChunkSize::new(u64::from(MAX_CHUNK_SIZE)).is_ok());
-        assert!(matches!(
-            ChunkSize::new(u64::from(MIN_CHUNK_SIZE) - 1),
-            Err(ChunkSizeError::TooSmall(_))
-        ));
-        assert!(matches!(
-            ChunkSize::new(u64::from(MAX_CHUNK_SIZE) + 1),
-            Err(ChunkSizeError::TooLarge(_))
-        ));
-        assert!(matches!(
-            ChunkSize::new(u64::from(MIN_CHUNK_SIZE) + 1),
-            Err(ChunkSizeError::NotPowerOfTwo(_))
-        ));
     }
 
     #[test]

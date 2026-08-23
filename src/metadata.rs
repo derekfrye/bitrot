@@ -110,7 +110,7 @@ impl Metadata {
         )
         .map_err(Error::RecoveryTable)?;
         let rolling_fingerprints = rolling_page::Table::assemble(
-            expected_rolling_count(manifest),
+            geometry.full_data_chunks(),
             manifest.rolling_table_root(),
             rolling_pages,
             limits.rolling_table,
@@ -215,17 +215,12 @@ fn validate_set(record: &Record, manifest: Manifest) -> Result<(), Error> {
     }
 }
 
-fn expected_rolling_count(manifest: Manifest) -> u64 {
-    let geometry = manifest.geometry();
-    let short_final = geometry.final_data_chunk_len < geometry.chunk_size.bytes();
-    u64::from(geometry.data_chunks) - u64::from(short_final)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fingerprint::{ChunkSize, Digest, MIN_CHUNK_SIZE};
+    use crate::digest::Digest;
     use crate::geometry::Geometry;
+    use crate::geometry::{ChunkSize, MIN_CHUNK_SIZE};
 
     struct Fixture {
         expected: Metadata,

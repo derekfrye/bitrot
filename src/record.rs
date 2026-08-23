@@ -1,5 +1,7 @@
 //! Encoding and decoding for independently checksummed sidecar records.
 
+use crate::wire;
+
 use std::fmt;
 use std::io::{self, Read, Write};
 
@@ -282,24 +284,15 @@ fn read_exact_record<R: Read>(reader: &mut R, buffer: &mut [u8]) -> Result<(), E
 }
 
 fn parse_u16(bytes: &[u8], offset: usize) -> Result<u16, Error> {
-    let source = bytes.get(offset..offset + 2).ok_or(Error::Truncated)?;
-    let mut encoded = [0_u8; 2];
-    encoded.copy_from_slice(source);
-    Ok(u16::from_le_bytes(encoded))
+    wire::u16(bytes, offset).ok_or(Error::Truncated)
 }
 
 fn parse_u32(bytes: &[u8], offset: usize) -> Result<u32, Error> {
-    let source = bytes.get(offset..offset + 4).ok_or(Error::Truncated)?;
-    let mut encoded = [0_u8; 4];
-    encoded.copy_from_slice(source);
-    Ok(u32::from_le_bytes(encoded))
+    wire::u32(bytes, offset).ok_or(Error::Truncated)
 }
 
 fn parse_u64(bytes: &[u8], offset: usize) -> Result<u64, Error> {
-    let source = bytes.get(offset..offset + 8).ok_or(Error::Truncated)?;
-    let mut encoded = [0_u8; 8];
-    encoded.copy_from_slice(source);
-    Ok(u64::from_le_bytes(encoded))
+    wire::u64(bytes, offset).ok_or(Error::Truncated)
 }
 
 #[cfg(test)]

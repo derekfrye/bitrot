@@ -2,6 +2,7 @@
 
 use crate::manifest::Manifest;
 use crate::record::{FLAG_REQUIRED, Record};
+use crate::wire;
 use std::fmt;
 
 pub const RECORD_TYPE: u16 = 1;
@@ -125,27 +126,27 @@ impl Superblock {
                 expected: PAYLOAD_LEN,
             });
         }
-        let version = parse_u16(&record.payload, 0);
+        let version = parse_u16(&record.payload, 0)?;
         if version != PAYLOAD_VERSION {
             return Err(Error::UnsupportedPayloadVersion(version));
         }
-        let required_features = parse_u16(&record.payload, 2);
+        let required_features = parse_u16(&record.payload, 2)?;
         if required_features != 0 {
             return Err(Error::UnsupportedRequiredFeatures(required_features));
         }
-        if parse_u32(&record.payload, 4) != 0 {
+        if parse_u32(&record.payload, 4)? != 0 {
             return Err(Error::ReservedField);
         }
-        let first_manifest_offset = parse_u64(&record.payload, 8);
-        let second_manifest_offset = parse_u64(&record.payload, 16);
-        let observed_sidecar_len = parse_u64(&record.payload, 24);
+        let first_manifest_offset = parse_u64(&record.payload, 8)?;
+        let second_manifest_offset = parse_u64(&record.payload, 16)?;
+        let observed_sidecar_len = parse_u64(&record.payload, 24)?;
         validate_hints(
             first_manifest_offset,
             second_manifest_offset,
             observed_sidecar_len,
         )?;
-        let mut manifest_commitment = [0_u8; 32];
-        manifest_commitment.copy_from_slice(&record.payload[32..64]);
+        let manifest_commitment = wire::array(&record.payload, 32)
+            .ok_or_else(|| invalid_payload_length(&record.payload))?;
         Ok(Self {
             protection_set_id: record.protection_set_id,
             first_manifest_offset,
@@ -325,36 +326,32 @@ fn manifest_commitment(manifest: Manifest) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-fn parse_u16(bytes: &[u8], offset: usize) -> u16 {
-    u16::from_le_bytes(
-        bytes[offset..offset + 2]
-            .try_into()
-            .expect("fixed superblock field"),
-    )
+fn parse_u16(bytes: &[u8], offset: usize) -> Result<u16, Error> {
+    wire::u16(bytes, offset).ok_or_else(|| invalid_payload_length(bytes))
 }
 
-fn parse_u32(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(
-        bytes[offset..offset + 4]
-            .try_into()
-            .expect("fixed superblock field"),
-    )
+fn parse_u32(bytes: &[u8], offset: usize) -> Result<u32, Error> {
+    wire::u32(bytes, offset).ok_or_else(|| invalid_payload_length(bytes))
 }
 
-fn parse_u64(bytes: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes(
-        bytes[offset..offset + 8]
-            .try_into()
-            .expect("fixed superblock field"),
-    )
+fn parse_u64(bytes: &[u8], offset: usize) -> Result<u64, Error> {
+    wire::u64(bytes, offset).ok_or_else(|| invalid_payload_length(bytes))
+}
+
+fn invalid_payload_length(bytes: &[u8]) -> Error {
+    Error::PayloadLengthMismatch {
+        actual: bytes.len(),
+        expected: PAYLOAD_LEN,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::digest::Digest;
     use crate::digest_page::{Kind, Table};
-    use crate::fingerprint::{ChunkSize, Digest, MIN_CHUNK_SIZE};
     use crate::geometry::Geometry;
+    use crate::geometry::{ChunkSize, MIN_CHUNK_SIZE};
     use crate::record::{self, BASE_HEADER_LEN, DecodeLimits};
     use crate::rolling_page;
     use std::io::Cursor;

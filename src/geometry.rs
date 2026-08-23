@@ -1,10 +1,77 @@
 //! Checked source and recovery shard geometry.
 
-use crate::fingerprint::ChunkSize;
 use std::fmt;
+
+pub const MIN_CHUNK_SIZE: u32 = 64 * 1024;
+pub const DEFAULT_CHUNK_SIZE: u32 = 4 * 1024 * 1024;
+pub const MAX_CHUNK_SIZE: u32 = 64 * 1024 * 1024;
 
 /// Number of elements in the selected Leopard GF(2^16) field.
 pub const LEOPARD_FIELD_ORDER: u64 = 65_536;
+
+/// A format-valid data chunk size.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ChunkSize(u32);
+
+impl ChunkSize {
+    /// Validates an experimental v1 chunk size.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless `bytes` is a power of two from 64 KiB through
+    /// 64 MiB, inclusive.
+    pub fn new(bytes: u64) -> Result<Self, ChunkSizeError> {
+        if bytes < u64::from(MIN_CHUNK_SIZE) {
+            return Err(ChunkSizeError::TooSmall(bytes));
+        }
+        if bytes > u64::from(MAX_CHUNK_SIZE) {
+            return Err(ChunkSizeError::TooLarge(bytes));
+        }
+        if !bytes.is_power_of_two() {
+            return Err(ChunkSizeError::NotPowerOfTwo(bytes));
+        }
+        let bytes = u32::try_from(bytes).map_err(|_| ChunkSizeError::TooLarge(bytes))?;
+        Ok(Self(bytes))
+    }
+
+    #[must_use]
+    pub const fn bytes(self) -> u32 {
+        self.0
+    }
+}
+
+impl Default for ChunkSize {
+    fn default() -> Self {
+        Self(DEFAULT_CHUNK_SIZE)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChunkSizeError {
+    TooSmall(u64),
+    TooLarge(u64),
+    NotPowerOfTwo(u64),
+}
+
+impl fmt::Display for ChunkSizeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooSmall(value) => write!(
+                formatter,
+                "chunk size {value} is below the minimum of {MIN_CHUNK_SIZE} bytes"
+            ),
+            Self::TooLarge(value) => write!(
+                formatter,
+                "chunk size {value} exceeds the maximum of {MAX_CHUNK_SIZE} bytes"
+            ),
+            Self::NotPowerOfTwo(value) => {
+                write!(formatter, "chunk size {value} is not a power of two")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ChunkSizeError {}
 
 /// An exact positive recovery-to-data ratio.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -90,6 +157,12 @@ pub struct Geometry {
     pub final_data_chunk_len: u32,
 }
 
+#[derive(Clone, Copy)]
+struct SourceLayout {
+    data_chunks: u64,
+    final_data_chunk_len: u32,
+}
+
 impl Geometry {
     /// Computes a single coding group for a nonempty source.
     ///
@@ -103,24 +176,15 @@ impl Geometry {
         chunk_size: ChunkSize,
         redundancy: Redundancy,
     ) -> Result<Self, GeometryError> {
-        if source_len == 0 {
-            return Err(GeometryError::EmptySource);
-        }
-        let chunk_bytes = u64::from(chunk_size.bytes());
-        let data_chunks = ((source_len - 1) / chunk_bytes) + 1;
-        let recovery_chunks = redundancy.recovery_chunks(data_chunks)?;
-        let remainder = source_len % chunk_bytes;
-        let final_data_chunk_len = if remainder == 0 {
-            chunk_size.bytes()
-        } else {
-            u32::try_from(remainder).map_err(|_| GeometryError::LengthOverflow)?
-        };
+        let layout = source_layout(source_len, chunk_size)?;
+        let recovery_chunks = redundancy.recovery_chunks(layout.data_chunks)?;
 
-        let data_chunks =
-            u32::try_from(data_chunks).map_err(|_| GeometryError::UnsupportedShardCounts {
-                data_chunks,
+        let data_chunks = u32::try_from(layout.data_chunks).map_err(|_| {
+            GeometryError::UnsupportedShardCounts {
+                data_chunks: layout.data_chunks,
                 recovery_chunks,
-            })?;
+            }
+        })?;
         let recovery_chunks =
             u32::try_from(recovery_chunks).map_err(|_| GeometryError::UnsupportedShardCounts {
                 data_chunks: u64::from(data_chunks),
@@ -131,7 +195,7 @@ impl Geometry {
             chunk_size,
             data_chunks,
             recovery_chunks,
-            final_data_chunk_len,
+            layout.final_data_chunk_len,
         )
     }
 
@@ -149,27 +213,17 @@ impl Geometry {
         recovery_chunks: u32,
         final_data_chunk_len: u32,
     ) -> Result<Self, GeometryError> {
-        if source_len == 0 {
-            return Err(GeometryError::EmptySource);
-        }
-        let chunk_bytes = u64::from(chunk_size.bytes());
-        let expected_data_chunks = ((source_len - 1) / chunk_bytes) + 1;
-        if u64::from(data_chunks) != expected_data_chunks {
+        let layout = source_layout(source_len, chunk_size)?;
+        if u64::from(data_chunks) != layout.data_chunks {
             return Err(GeometryError::DataChunkCountMismatch {
                 actual: data_chunks,
-                expected: expected_data_chunks,
+                expected: layout.data_chunks,
             });
         }
-        let remainder = source_len % chunk_bytes;
-        let expected_final_len = if remainder == 0 {
-            chunk_size.bytes()
-        } else {
-            u32::try_from(remainder).map_err(|_| GeometryError::LengthOverflow)?
-        };
-        if final_data_chunk_len != expected_final_len {
+        if final_data_chunk_len != layout.final_data_chunk_len {
             return Err(GeometryError::FinalDataChunkLengthMismatch {
                 actual: final_data_chunk_len,
-                expected: expected_final_len,
+                expected: layout.final_data_chunk_len,
             });
         }
         if !leopard_supports(u64::from(data_chunks), u64::from(recovery_chunks)) {
@@ -193,6 +247,14 @@ impl Geometry {
         self.data_chunks as u64 + self.recovery_chunks as u64
     }
 
+    /// Returns the number of data chunks that occupy a complete chunk-sized
+    /// rolling window.
+    #[must_use]
+    pub const fn full_data_chunks(self) -> u64 {
+        let short_final = self.final_data_chunk_len < self.chunk_size.bytes();
+        self.data_chunks.saturating_sub(short_final as u32) as u64
+    }
+
     #[must_use]
     pub const fn padded_source_len(self) -> u64 {
         self.data_chunks as u64 * self.chunk_size.bytes() as u64
@@ -202,6 +264,24 @@ impl Geometry {
     pub const fn recovery_storage_len(self) -> u64 {
         self.recovery_chunks as u64 * self.chunk_size.bytes() as u64
     }
+}
+
+fn source_layout(source_len: u64, chunk_size: ChunkSize) -> Result<SourceLayout, GeometryError> {
+    if source_len == 0 {
+        return Err(GeometryError::EmptySource);
+    }
+    let chunk_bytes = u64::from(chunk_size.bytes());
+    let data_chunks = ((source_len - 1) / chunk_bytes) + 1;
+    let remainder = source_len % chunk_bytes;
+    let final_data_chunk_len = if remainder == 0 {
+        chunk_size.bytes()
+    } else {
+        u32::try_from(remainder).map_err(|_| GeometryError::LengthOverflow)?
+    };
+    Ok(SourceLayout {
+        data_chunks,
+        final_data_chunk_len,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -281,14 +361,31 @@ const fn gcd(mut left: u64, mut right: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fingerprint::{DEFAULT_CHUNK_SIZE, MIN_CHUNK_SIZE};
-
     fn chunks(bytes: u32) -> ChunkSize {
         ChunkSize::new(u64::from(bytes)).unwrap()
     }
 
     fn fifteen_percent() -> Redundancy {
         Redundancy::new(15, 100).unwrap()
+    }
+
+    #[test]
+    fn validates_experimental_chunk_size_bounds() {
+        assert_eq!(ChunkSize::default().bytes(), DEFAULT_CHUNK_SIZE);
+        assert!(ChunkSize::new(u64::from(MIN_CHUNK_SIZE)).is_ok());
+        assert!(ChunkSize::new(u64::from(MAX_CHUNK_SIZE)).is_ok());
+        assert!(matches!(
+            ChunkSize::new(u64::from(MIN_CHUNK_SIZE) - 1),
+            Err(ChunkSizeError::TooSmall(_))
+        ));
+        assert!(matches!(
+            ChunkSize::new(u64::from(MAX_CHUNK_SIZE) + 1),
+            Err(ChunkSizeError::TooLarge(_))
+        ));
+        assert!(matches!(
+            ChunkSize::new(u64::from(MIN_CHUNK_SIZE) + 1),
+            Err(ChunkSizeError::NotPowerOfTwo(_))
+        ));
     }
 
     #[test]
@@ -340,12 +437,14 @@ mod tests {
         assert_eq!(partial.data_chunks, 2);
         assert_eq!(partial.recovery_chunks, 1);
         assert_eq!(partial.final_data_chunk_len, 7);
+        assert_eq!(partial.full_data_chunks(), 1);
         assert_eq!(partial.padded_source_len(), u64::from(MIN_CHUNK_SIZE) * 2);
 
         let exact =
             Geometry::new(u64::from(MIN_CHUNK_SIZE) * 2, chunk_size, fifteen_percent()).unwrap();
         assert_eq!(exact.data_chunks, 2);
         assert_eq!(exact.final_data_chunk_len, MIN_CHUNK_SIZE);
+        assert_eq!(exact.full_data_chunks(), 2);
     }
 
     #[test]
