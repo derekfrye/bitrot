@@ -11,6 +11,12 @@ blake3 = "1.8.7"
 crc = "3.4.0"
 reed-solomon-simd = "=3.1.0"
 
+[target.'cfg(any(unix, windows))'.dependencies]
+cap-std = "4.0.3"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.189"
+
 [[bench]]
 name = "crc_compare"
 harness = false

@@ -607,9 +607,22 @@ The creator must write to a uniquely named temporary file in the destination
 directory, flush it, verify its records, and atomically install it. Default
 no-clobber publication may link the completed temporary inode into place and
 then remove its temporary name; explicit replacement uses an atomic rename.
+A successful install always triggers a destination-directory sync attempt,
+even if removing the no-clobber temporary link fails. Errors after installation
+state that the sidecar was published while cleanup or durability confirmation
+failed, so callers do not mistake them for an unchanged destination.
+The destination directory is opened once before creation, and every later
+lookup, temporary-file operation, inspection, publication, cleanup, and sync is
+resolved relative to that pinned directory handle. Renaming an ancestor during
+creation therefore cannot redirect publication into a replacement directory at
+the original pathname.
 A filesystem without the required atomic primitive fails safely rather than
 falling back to a racy existence check. Creation must never publish a partial
-sidecar.
+sidecar. Recovery spools and unpublished sidecars use recognizable partial-file
+names and hold advisory locks for their lifetime. A later creator may remove an
+old partial only after acquiring its lock and confirming that the pathname still
+identifies the opened inode. Verification reads the still-open temporary file,
+not a pathname that could have been substituted between close and reopen.
 
 ## Operations
 
@@ -642,7 +655,8 @@ redundancy size. Scratch data is removed after publication or error.
 
 An existing valid sidecar is not overwritten unless explicitly requested. A
 matching sidecar makes creation a successful no-op. A conflicting sidecar is
-reported and preserved.
+reported and preserved. Concurrent default publishers are first-writer-wins;
+concurrent explicit replacements are deliberately last-writer-wins.
 
 ### Verify
 

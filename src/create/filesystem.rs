@@ -13,12 +13,27 @@ use crate::recovery_set;
 use crate::rolling_page;
 use crate::sidecar::{AssemblyLimits, ReadLimits, Sidecar, WriteSummary};
 use crate::superblock::{self, Superblock};
+#[cfg(windows)]
+use cap_std::ambient_authority;
+#[cfg(any(unix, windows))]
+use cap_std::fs::{Dir, OpenOptions as DirectoryOpenOptions};
+#[cfg(unix)]
+use cap_std::fs::{MetadataExt as CapMetadataExt, OpenOptionsExt as CapOpenOptionsExt};
 use std::ffi::OsString;
 use std::fmt;
-use std::fs::{self, File, Metadata, OpenOptions};
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::fs::{self, File, Metadata, OpenOptions, TryLockError};
+use std::io::{self, Seek, SeekFrom, Write};
+use std::path::Path;
+#[cfg(not(any(unix, windows)))]
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(unix)]
+use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(unix)]
+const STALE_TEMPORARY_AGE: Duration = Duration::from_hours(24);
+static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
 
 /// Policy for a conflicting object already at the requested sidecar path.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -27,6 +42,8 @@ pub enum ExistingSidecar {
     #[default]
     Preserve,
     /// Atomically replace a nonmatching existing object after verification.
+    ///
+    /// Concurrent replacing publishers use last-writer-wins semantics.
     Replace,
 }
 
@@ -69,12 +86,23 @@ pub fn publish(
     }
 
     let parent = destination_parent(sidecar_path);
+    let directory = DestinationDirectory::open(parent)?;
+    let destination_name = sidecar_path
+        .file_name()
+        .ok_or(PublishError::DestinationHasNoFileName)?;
     let (mut source, snapshot) = open_source(source_path)?;
     let (fingerprint, geometry) = analyze(&mut source, options).map_err(PublishError::Build)?;
-    let (spool_path, spool_file) =
-        create_temporary(parent, sidecar_path, TemporaryKind::RecoverySpool)?;
-    let _spool_guard = TemporaryGuard::new(spool_path);
-    let mut spool = RecoverySpool::new(spool_file, geometry).map_err(PublishError::Spool)?;
+    cleanup_stale_temporaries(&directory, destination_name)?;
+    let spool_temporary =
+        create_temporary(&directory, destination_name, TemporaryKind::RecoverySpool)?;
+    let mut spool = RecoverySpool::new(
+        spool_temporary
+            .file
+            .try_clone()
+            .map_err(PublishError::Spool)?,
+        geometry,
+    )
+    .map_err(PublishError::Spool)?;
     encode_and_confirm(
         &mut source,
         options,
@@ -84,7 +112,7 @@ pub fn publish(
     )
     .map_err(PublishError::Build)?;
     snapshot.recheck(&source, source_path)?;
-    if destination_is_source(sidecar_path, &snapshot)? {
+    if destination_is_source(&directory, destination_name, &snapshot)? {
         return Err(PublishError::OverlappingPaths);
     }
     let recovery_digests = spool.digests().map_err(PublishError::Spool)?;
@@ -92,7 +120,7 @@ pub fn publish(
         build_metadata(fingerprint, geometry, recovery_digests).map_err(PublishError::Build)?;
     let plan = CanonicalPlan::new(&generated, &options.creator)?;
 
-    if let Some(matches) = inspect_existing(sidecar_path, &generated)? {
+    if let Some(matches) = inspect_existing(&directory, destination_name, &generated)? {
         if matches {
             return Ok(PublishOutcome::AlreadyCurrent);
         }
@@ -101,19 +129,19 @@ pub fn publish(
         }
     }
 
-    let (temporary_path, mut temporary) =
-        create_temporary(parent, sidecar_path, TemporaryKind::Sidecar)?;
-    let mut temporary_guard = TemporaryGuard::new(temporary_path);
-    let summary = plan.write(&mut temporary, &mut spool)?;
-    temporary.flush().map_err(PublishError::Flush)?;
-    temporary.sync_all().map_err(PublishError::SyncTemporary)?;
-    drop(temporary);
-
-    verify_temporary(temporary_guard.path(), &plan, summary)?;
+    let mut temporary = create_temporary(&directory, destination_name, TemporaryKind::Sidecar)?;
+    let summary = plan.write(&mut temporary.file, &mut spool)?;
+    temporary.file.flush().map_err(PublishError::Flush)?;
+    temporary
+        .file
+        .sync_all()
+        .map_err(PublishError::SyncTemporary)?;
+    verify_temporary(&mut temporary.file, &plan, summary)?;
+    temporary.verify_path_identity()?;
     let published = publish_temporary(
-        &mut temporary_guard,
-        sidecar_path,
-        parent,
+        &mut temporary,
+        &directory,
+        destination_name,
         &generated,
         existing,
     )?;
@@ -165,13 +193,6 @@ impl SourceSnapshot {
         }
     }
 
-    #[cfg(unix)]
-    fn same_identity(&self, metadata: &Metadata) -> bool {
-        use std::os::unix::fs::MetadataExt;
-
-        self.device == metadata.dev() && self.inode == metadata.ino()
-    }
-
     fn recheck(&self, source: &File, path: &Path) -> Result<(), PublishError> {
         let open_metadata = source.metadata().map_err(PublishError::SourceMetadata)?;
         let path_metadata = fs::symlink_metadata(path).map_err(PublishError::SourceMetadata)?;
@@ -187,17 +208,18 @@ impl SourceSnapshot {
 }
 
 fn destination_is_source(
-    destination: &Path,
+    directory: &DestinationDirectory,
+    destination: &std::ffi::OsStr,
     snapshot: &SourceSnapshot,
 ) -> Result<bool, PublishError> {
-    let metadata = match fs::symlink_metadata(destination) {
+    let metadata = match directory.symlink_metadata(destination) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(PublishError::InspectExisting(error)),
     };
     #[cfg(unix)]
     {
-        Ok(snapshot.same_identity(&metadata))
+        Ok(snapshot.device == metadata.device && snapshot.inode == metadata.inode)
     }
     #[cfg(not(unix))]
     {
@@ -214,13 +236,25 @@ fn open_source(path: &Path) -> Result<(File, SourceSnapshot), PublishError> {
     if !path_metadata.is_file() {
         return Err(PublishError::SourceNotRegularFile);
     }
-    let source = File::open(path).map_err(PublishError::OpenSource)?;
+    let source = open_read_no_follow(path).map_err(PublishError::OpenSource)?;
     let open_metadata = source.metadata().map_err(PublishError::SourceMetadata)?;
     let snapshot = SourceSnapshot::from_metadata(&open_metadata);
     if !snapshot.same_file(&path_metadata) {
         return Err(PublishError::SourceIdentityChanged);
     }
     Ok((source, snapshot))
+}
+
+fn open_read_no_follow(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path)
 }
 
 struct CanonicalPlan {
@@ -464,10 +498,19 @@ fn read_required_record(reader: &mut File, limits: DecodeLimits) -> Result<Recor
 }
 
 fn inspect_existing(
-    path: &Path,
+    directory: &DestinationDirectory,
+    name: &std::ffi::OsStr,
     expected: &ProtectionMetadata,
 ) -> Result<Option<bool>, PublishError> {
-    let file = match File::open(path) {
+    let path_metadata = match directory.symlink_metadata(name) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(PublishError::InspectExisting(error)),
+    };
+    if path_metadata.is_symlink() || !path_metadata.is_file() {
+        return Ok(Some(false));
+    }
+    let file = match directory.open_read_no_follow(name) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(PublishError::InspectExisting(error)),
@@ -488,6 +531,213 @@ fn destination_parent(path: &Path) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
+struct DestinationDirectory {
+    #[cfg(any(unix, windows))]
+    directory: Dir,
+    #[cfg(unix)]
+    sync_file: File,
+    #[cfg(not(any(unix, windows)))]
+    ambient_path: PathBuf,
+}
+
+impl DestinationDirectory {
+    fn open(path: &Path) -> Result<Self, PublishError> {
+        #[cfg(unix)]
+        let (directory, sync_file) = {
+            let sync_file = File::open(path).map_err(PublishError::OpenDirectory)?;
+            let directory =
+                Dir::from_std_file(sync_file.try_clone().map_err(PublishError::OpenDirectory)?);
+            (directory, sync_file)
+        };
+        #[cfg(not(unix))]
+        #[cfg(windows)]
+        let directory = Dir::open_ambient_dir(path, ambient_authority())
+            .map_err(PublishError::OpenDirectory)?;
+        #[cfg(not(any(unix, windows)))]
+        let ambient_path = path.to_owned();
+        Ok(Self {
+            #[cfg(any(unix, windows))]
+            directory,
+            #[cfg(unix)]
+            sync_file,
+            #[cfg(not(any(unix, windows)))]
+            ambient_path,
+        })
+    }
+
+    fn open_read_no_follow(&self, name: &std::ffi::OsStr) -> io::Result<File> {
+        #[cfg(any(unix, windows))]
+        {
+            let mut options = DirectoryOpenOptions::new();
+            options.read(true);
+            set_no_follow(&mut options);
+            self.directory
+                .open_with(name, &options)
+                .map(cap_std::fs::File::into_std)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            open_read_no_follow(&self.ambient_path.join(name))
+        }
+    }
+
+    #[cfg(unix)]
+    fn open_read_write_no_follow(&self, name: &std::ffi::OsStr) -> io::Result<File> {
+        let mut options = DirectoryOpenOptions::new();
+        options.read(true).write(true);
+        set_no_follow(&mut options);
+        self.directory
+            .open_with(name, &options)
+            .map(cap_std::fs::File::into_std)
+    }
+
+    fn create_new(&self, name: &std::ffi::OsStr) -> io::Result<File> {
+        #[cfg(any(unix, windows))]
+        {
+            let mut options = DirectoryOpenOptions::new();
+            options.read(true).write(true).create_new(true);
+            set_no_follow(&mut options);
+            self.directory
+                .open_with(name, &options)
+                .map(cap_std::fs::File::into_std)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(self.ambient_path.join(name))
+        }
+    }
+
+    fn symlink_metadata(&self, name: &std::ffi::OsStr) -> io::Result<EntryMetadata> {
+        #[cfg(any(unix, windows))]
+        {
+            self.directory
+                .symlink_metadata(name)
+                .map(|metadata| EntryMetadata::from_cap(&metadata))
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            fs::symlink_metadata(self.ambient_path.join(name)).map(EntryMetadata::from_std)
+        }
+    }
+
+    fn hard_link(&self, source: &std::ffi::OsStr, destination: &std::ffi::OsStr) -> io::Result<()> {
+        #[cfg(any(unix, windows))]
+        {
+            self.directory
+                .hard_link(source, &self.directory, destination)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            fs::hard_link(
+                self.ambient_path.join(source),
+                self.ambient_path.join(destination),
+            )
+        }
+    }
+
+    fn rename(&self, source: &std::ffi::OsStr, destination: &std::ffi::OsStr) -> io::Result<()> {
+        #[cfg(any(unix, windows))]
+        {
+            self.directory.rename(source, &self.directory, destination)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            fs::rename(
+                self.ambient_path.join(source),
+                self.ambient_path.join(destination),
+            )
+        }
+    }
+
+    fn remove_file(&self, name: &std::ffi::OsStr) -> io::Result<()> {
+        #[cfg(any(unix, windows))]
+        {
+            self.directory.remove_file(name)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            fs::remove_file(self.ambient_path.join(name))
+        }
+    }
+
+    fn sync(&self) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            self.sync_file.sync_all()
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(())
+        }
+    }
+}
+
+struct EntryMetadata {
+    is_file: bool,
+    is_symlink: bool,
+    #[cfg(not(unix))]
+    len: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl EntryMetadata {
+    #[cfg(any(unix, windows))]
+    fn from_cap(metadata: &cap_std::fs::Metadata) -> Self {
+        Self {
+            is_file: metadata.is_file(),
+            is_symlink: metadata.file_type().is_symlink(),
+            #[cfg(not(unix))]
+            len: metadata.len(),
+            modified: metadata
+                .modified()
+                .ok()
+                .map(cap_std::time::SystemTime::into_std),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn from_std(metadata: Metadata) -> Self {
+        Self {
+            is_file: metadata.is_file(),
+            is_symlink: metadata.file_type().is_symlink(),
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        }
+    }
+
+    const fn is_file(&self) -> bool {
+        self.is_file
+    }
+
+    const fn is_symlink(&self) -> bool {
+        self.is_symlink
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn set_no_follow(options: &mut DirectoryOpenOptions) {
+    #[cfg(unix)]
+    {
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = options;
+    }
+}
+
 #[derive(Clone, Copy)]
 enum TemporaryKind {
     RecoverySpool,
@@ -503,29 +753,31 @@ impl TemporaryKind {
     }
 }
 
-fn create_temporary(
-    parent: &Path,
-    destination: &Path,
+fn create_temporary<'directory>(
+    directory: &'directory DestinationDirectory,
+    destination_name: &std::ffi::OsStr,
     kind: TemporaryKind,
-) -> Result<(PathBuf, File), PublishError> {
-    let file_name = destination
-        .file_name()
-        .ok_or(PublishError::DestinationHasNoFileName)?;
-    for nonce in 0_u32..128 {
-        let mut temporary_name = OsString::from(file_name);
+) -> Result<TemporaryFile<'directory>, PublishError> {
+    let epoch_nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    for _ in 0_u32..128 {
+        let nonce = NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed);
+        let mut temporary_name = OsString::from(destination_name);
         temporary_name.push(format!(
-            ".tmp-{}-{}-{nonce}",
+            ".bitrot-partial-{}-{}-{epoch_nonce:x}-{nonce:x}",
             std::process::id(),
             kind.name()
         ));
-        let path = parent.join(temporary_name);
-        match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(file) => return Ok((path, file)),
+        match directory.create_new(&temporary_name) {
+            Ok(file) => {
+                file.try_lock().map_err(|error| match error {
+                    TryLockError::Error(error) => PublishError::LockTemporary(error),
+                    TryLockError::WouldBlock => PublishError::TemporaryLockContended,
+                })?;
+                return Ok(TemporaryFile::new(directory, temporary_name, file));
+            }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(PublishError::CreateTemporary(error)),
         }
@@ -533,17 +785,127 @@ fn create_temporary(
     Err(PublishError::TemporaryNameExhausted)
 }
 
+#[cfg(unix)]
+fn cleanup_stale_temporaries(
+    directory: &DestinationDirectory,
+    destination_name: &std::ffi::OsStr,
+) -> Result<(), PublishError> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let now = SystemTime::now();
+    let mut removed = false;
+
+    for entry in directory
+        .directory
+        .entries()
+        .map_err(PublishError::CleanupTemporaries)?
+    {
+        let entry = entry.map_err(PublishError::CleanupTemporaries)?;
+        let name = entry.file_name();
+        if !is_temporary_name_for(name.as_bytes(), destination_name.as_bytes()) {
+            continue;
+        }
+        let metadata = directory
+            .symlink_metadata(&name)
+            .map_err(PublishError::CleanupTemporaries)?;
+        if !metadata.is_file()
+            || metadata
+                .modified
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_none_or(|age| age < STALE_TEMPORARY_AGE)
+        {
+            continue;
+        }
+        let file = match directory.open_read_write_no_follow(&name) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(PublishError::CleanupTemporaries(error)),
+        };
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => continue,
+            Err(TryLockError::Error(error)) => {
+                return Err(PublishError::CleanupTemporaries(error));
+            }
+        }
+        let open_metadata = file.metadata().map_err(PublishError::CleanupTemporaries)?;
+        let path_metadata = match directory.symlink_metadata(&name) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(PublishError::CleanupTemporaries(error)),
+        };
+        if !same_entry_identity(&open_metadata, &path_metadata) {
+            continue;
+        }
+        directory
+            .remove_file(&name)
+            .map_err(PublishError::CleanupTemporaries)?;
+        removed = true;
+    }
+
+    if removed {
+        directory.sync().map_err(PublishError::CleanupTemporaries)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn is_temporary_name_for(candidate: &[u8], destination: &[u8]) -> bool {
+    let Some(suffix) = candidate.strip_prefix(destination) else {
+        return false;
+    };
+    let Some(fields) = suffix.strip_prefix(b".bitrot-partial-") else {
+        return false;
+    };
+    let mut fields = fields.split(|byte| *byte == b'-');
+    let Some(pid) = fields.next() else {
+        return false;
+    };
+    let Some(kind) = fields.next() else {
+        return false;
+    };
+    let Some(epoch) = fields.next() else {
+        return false;
+    };
+    let Some(nonce) = fields.next() else {
+        return false;
+    };
+    fields.next().is_none()
+        && !pid.is_empty()
+        && pid.iter().all(u8::is_ascii_digit)
+        && matches!(kind, b"recovery" | b"sidecar")
+        && is_lower_hex(epoch)
+        && is_lower_hex(nonce)
+}
+
+#[cfg(unix)]
+fn is_lower_hex(value: &[u8]) -> bool {
+    !value.is_empty()
+        && value
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+}
+
+#[cfg(not(unix))]
+fn cleanup_stale_temporaries(
+    _directory: &DestinationDirectory,
+    _destination_name: &std::ffi::OsStr,
+) -> Result<(), PublishError> {
+    Ok(())
+}
+
 fn verify_temporary(
-    path: &Path,
+    file: &mut File,
     plan: &CanonicalPlan,
     summary: WriteSummary,
 ) -> Result<(), PublishError> {
-    let mut file = File::open(path).map_err(PublishError::ReopenTemporary)?;
     let metadata = file.metadata().map_err(PublishError::TemporaryMetadata)?;
     if metadata.len() != summary.bytes_written {
         return Err(PublishError::VerificationMismatch);
     }
-    plan.verify(&mut file)
+    file.seek(SeekFrom::Start(0))
+        .map_err(PublishError::RewindTemporary)?;
+    plan.verify(file)
 }
 
 fn verification_limits(metadata: &ProtectionMetadata) -> Result<ReadLimits, PublishError> {
@@ -612,19 +974,17 @@ fn verification_limits(metadata: &ProtectionMetadata) -> Result<ReadLimits, Publ
 }
 
 fn publish_temporary(
-    temporary: &mut TemporaryGuard,
-    destination: &Path,
-    parent: &Path,
+    temporary: &mut TemporaryFile<'_>,
+    directory: &DestinationDirectory,
+    destination: &std::ffi::OsStr,
     expected: &ProtectionMetadata,
     existing: ExistingSidecar,
 ) -> Result<bool, PublishError> {
     match existing {
-        ExistingSidecar::Preserve => match fs::hard_link(temporary.path(), destination) {
-            Ok(()) => temporary
-                .remove()
-                .map_err(PublishError::PublishedButCleanupFailed)?,
+        ExistingSidecar::Preserve => match directory.hard_link(temporary.name(), destination) {
+            Ok(()) => finish_publication(|| temporary.remove(), || directory.sync())?,
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                if inspect_existing(destination, expected)? == Some(true) {
+                if inspect_existing(directory, destination, expected)? == Some(true) {
                     return Ok(false);
                 }
                 return Err(PublishError::ExistingConflict);
@@ -632,42 +992,86 @@ fn publish_temporary(
             Err(error) => return Err(PublishError::Publish(error)),
         },
         ExistingSidecar::Replace => {
-            fs::rename(temporary.path(), destination).map_err(PublishError::Publish)?;
+            directory
+                .rename(temporary.name(), destination)
+                .map_err(PublishError::Publish)?;
             temporary.disarm();
+            directory
+                .sync()
+                .map_err(PublishError::PublishedButSyncFailed)?;
         }
     }
-    sync_directory(parent).map_err(PublishError::SyncDirectory)?;
     Ok(true)
 }
 
-#[cfg(unix)]
-fn sync_directory(path: &Path) -> io::Result<()> {
-    File::open(path)?.sync_all()
+fn finish_publication(
+    cleanup: impl FnOnce() -> io::Result<()>,
+    sync: impl FnOnce() -> io::Result<()>,
+) -> Result<(), PublishError> {
+    let cleanup_error = cleanup().err();
+    let sync_error = sync().err();
+
+    match (cleanup_error, sync_error) {
+        (None, None) => Ok(()),
+        (Some(error), None) => Err(PublishError::PublishedButCleanupFailed(error)),
+        (None, Some(error)) => Err(PublishError::PublishedButSyncFailed(error)),
+        (Some(cleanup), Some(sync)) => {
+            Err(PublishError::PublishedButCleanupAndSyncFailed { cleanup, sync })
+        }
+    }
 }
 
-#[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> io::Result<()> {
-    Ok(())
-}
-
-struct TemporaryGuard {
-    path: PathBuf,
+struct TemporaryFile<'directory> {
+    directory: &'directory DestinationDirectory,
+    name: OsString,
+    file: File,
     armed: bool,
 }
 
-impl TemporaryGuard {
-    fn new(path: PathBuf) -> Self {
-        Self { path, armed: true }
+impl<'directory> TemporaryFile<'directory> {
+    fn new(directory: &'directory DestinationDirectory, name: OsString, file: File) -> Self {
+        Self {
+            directory,
+            name,
+            file,
+            armed: true,
+        }
     }
 
-    fn path(&self) -> &Path {
-        &self.path
+    fn name(&self) -> &std::ffi::OsStr {
+        &self.name
     }
 
     fn remove(&mut self) -> io::Result<()> {
-        fs::remove_file(&self.path)?;
+        if !self.path_still_names_file()? {
+            self.armed = false;
+            return Err(io::Error::other(
+                "temporary path no longer names the file created by this process",
+            ));
+        }
+        self.directory.remove_file(&self.name)?;
         self.armed = false;
         Ok(())
+    }
+
+    fn verify_path_identity(&self) -> Result<(), PublishError> {
+        if !self
+            .path_still_names_file()
+            .map_err(PublishError::TemporaryMetadata)?
+        {
+            return Err(PublishError::TemporaryIdentityChanged);
+        }
+        Ok(())
+    }
+
+    fn path_still_names_file(&self) -> io::Result<bool> {
+        let open_metadata = self.file.metadata()?;
+        let path_metadata = match self.directory.symlink_metadata(&self.name) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        Ok(path_metadata.is_file() && same_entry_identity(&open_metadata, &path_metadata))
     }
 
     fn disarm(&mut self) {
@@ -675,11 +1079,24 @@ impl TemporaryGuard {
     }
 }
 
-impl Drop for TemporaryGuard {
+impl Drop for TemporaryFile<'_> {
     fn drop(&mut self) {
-        if self.armed {
-            let _ = fs::remove_file(&self.path);
+        if self.armed && self.path_still_names_file().unwrap_or(false) {
+            let _ = self.directory.remove_file(&self.name);
         }
+    }
+}
+
+fn same_entry_identity(left: &Metadata, right: &EntryMetadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        left.dev() == right.device && left.ino() == right.inode
+    }
+    #[cfg(not(unix))]
+    {
+        left.len() == right.len && left.modified().ok() == right.modified
     }
 }
 
@@ -691,17 +1108,22 @@ pub enum PublishError {
     SourceIdentityChanged,
     DestinationHasNoFileName,
     TemporaryNameExhausted,
+    TemporaryLockContended,
+    TemporaryIdentityChanged,
     ExistingConflict,
     LimitOverflow,
     VerificationMismatch,
     RecoveryDigestMismatch(u32),
     WrittenLengthMismatch { actual: u64, expected: u64 },
+    OpenDirectory(io::Error),
     OpenSource(io::Error),
     SourceMetadata(io::Error),
     Build(BuildError),
     Spool(io::Error),
     InspectExisting(io::Error),
     CreateTemporary(io::Error),
+    LockTemporary(io::Error),
+    CleanupTemporaries(io::Error),
     Creator(creator::Error),
     DigestPage(digest_page::Error),
     RollingPage(rolling_page::Error),
@@ -710,13 +1132,14 @@ pub enum PublishError {
     RecordWrite(record::Error),
     Flush(io::Error),
     SyncTemporary(io::Error),
-    ReopenTemporary(io::Error),
+    RewindTemporary(io::Error),
     TemporaryMetadata(io::Error),
     VerifyRecord(record::Error),
     VerifyRecovery(recovery_chunk::Error),
     Publish(io::Error),
     PublishedButCleanupFailed(io::Error),
-    SyncDirectory(io::Error),
+    PublishedButSyncFailed(io::Error),
+    PublishedButCleanupAndSyncFailed { cleanup: io::Error, sync: io::Error },
 }
 
 impl fmt::Display for PublishError {
@@ -733,6 +1156,12 @@ impl fmt::Display for PublishError {
             }
             Self::TemporaryNameExhausted => {
                 formatter.write_str("cannot allocate a unique temporary sidecar name")
+            }
+            Self::TemporaryLockContended => {
+                formatter.write_str("newly created temporary sidecar was unexpectedly locked")
+            }
+            Self::TemporaryIdentityChanged => {
+                formatter.write_str("temporary sidecar path changed before publication")
             }
             Self::ExistingConflict => {
                 formatter.write_str("a nonmatching object already exists at the sidecar path")
@@ -751,6 +1180,9 @@ impl fmt::Display for PublishError {
                 formatter,
                 "temporary writer produced {actual} bytes instead of planned length {expected}"
             ),
+            Self::OpenDirectory(error) => {
+                write!(formatter, "cannot open destination directory: {error}")
+            }
             Self::OpenSource(error) => write!(formatter, "cannot open source: {error}"),
             Self::SourceMetadata(error) => write!(formatter, "cannot inspect source: {error}"),
             Self::Build(error) => write!(formatter, "cannot build sidecar: {error}"),
@@ -760,6 +1192,12 @@ impl fmt::Display for PublishError {
             }
             Self::CreateTemporary(error) => {
                 write!(formatter, "cannot create temporary sidecar: {error}")
+            }
+            Self::LockTemporary(error) => {
+                write!(formatter, "cannot lock temporary sidecar: {error}")
+            }
+            Self::CleanupTemporaries(error) => {
+                write!(formatter, "cannot clean stale temporary files: {error}")
             }
             Self::Creator(error) => write!(formatter, "creator encoding failed: {error}"),
             Self::DigestPage(error) => write!(formatter, "digest-page encoding failed: {error}"),
@@ -775,8 +1213,8 @@ impl fmt::Display for PublishError {
             Self::SyncTemporary(error) => {
                 write!(formatter, "cannot synchronize temporary sidecar: {error}")
             }
-            Self::ReopenTemporary(error) => {
-                write!(formatter, "cannot reopen temporary sidecar: {error}")
+            Self::RewindTemporary(error) => {
+                write!(formatter, "cannot rewind temporary sidecar: {error}")
             }
             Self::TemporaryMetadata(error) => {
                 write!(formatter, "cannot inspect temporary sidecar: {error}")
@@ -790,12 +1228,14 @@ impl fmt::Display for PublishError {
                 formatter,
                 "sidecar was published but its temporary link could not be removed: {error}"
             ),
-            Self::SyncDirectory(error) => {
-                write!(
-                    formatter,
-                    "cannot synchronize destination directory: {error}"
-                )
-            }
+            Self::PublishedButSyncFailed(error) => write!(
+                formatter,
+                "sidecar was published but its destination directory could not be synchronized: {error}"
+            ),
+            Self::PublishedButCleanupAndSyncFailed { cleanup, sync } => write!(
+                formatter,
+                "sidecar was published but its temporary link could not be removed ({cleanup}) and its destination directory could not be synchronized ({sync})"
+            ),
         }
     }
 }
@@ -803,18 +1243,22 @@ impl fmt::Display for PublishError {
 impl std::error::Error for PublishError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::OpenSource(error)
+            Self::OpenDirectory(error)
+            | Self::OpenSource(error)
             | Self::SourceMetadata(error)
             | Self::Spool(error)
             | Self::InspectExisting(error)
             | Self::CreateTemporary(error)
+            | Self::LockTemporary(error)
+            | Self::CleanupTemporaries(error)
             | Self::Flush(error)
             | Self::SyncTemporary(error)
-            | Self::ReopenTemporary(error)
+            | Self::RewindTemporary(error)
             | Self::TemporaryMetadata(error)
             | Self::Publish(error)
             | Self::PublishedButCleanupFailed(error)
-            | Self::SyncDirectory(error) => Some(error),
+            | Self::PublishedButSyncFailed(error) => Some(error),
+            Self::PublishedButCleanupAndSyncFailed { cleanup, .. } => Some(cleanup),
             Self::Build(error) => Some(error),
             Self::Creator(error) => Some(error),
             Self::DigestPage(error) => Some(error),
@@ -828,6 +1272,8 @@ impl std::error::Error for PublishError {
             | Self::SourceIdentityChanged
             | Self::DestinationHasNoFileName
             | Self::TemporaryNameExhausted
+            | Self::TemporaryLockContended
+            | Self::TemporaryIdentityChanged
             | Self::ExistingConflict
             | Self::LimitOverflow
             | Self::VerificationMismatch
@@ -842,8 +1288,11 @@ mod tests {
     use super::*;
     use crate::creator::Creator;
     use crate::geometry::{ChunkSize, MIN_CHUNK_SIZE, Redundancy};
+    use std::cell::Cell;
     use std::io::Cursor;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Barrier};
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
@@ -963,6 +1412,172 @@ mod tests {
         assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 2);
     }
 
+    #[test]
+    fn concurrent_preserving_publishers_install_exactly_once() {
+        const PUBLISHERS: usize = 8;
+
+        let directory = TestDirectory::new();
+        let source = directory.join("source.bin");
+        let destination = directory.join("source.bin.bitrot");
+        fs::write(&source, source_bytes()).unwrap();
+        let start = Arc::new(Barrier::new(PUBLISHERS));
+        let mut threads = Vec::new();
+
+        for _ in 0..PUBLISHERS {
+            let source = source.clone();
+            let destination = destination.clone();
+            let start = Arc::clone(&start);
+            threads.push(std::thread::spawn(move || {
+                start.wait();
+                publish(source, destination, &options(), ExistingSidecar::Preserve)
+            }));
+        }
+
+        let outcomes = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, PublishOutcome::Published(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, PublishOutcome::AlreadyCurrent))
+                .count(),
+            PUBLISHERS - 1
+        );
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn synchronizes_published_link_even_when_temporary_cleanup_fails() {
+        let synchronized = Cell::new(false);
+        let result = finish_publication(
+            || Err(io::Error::other("injected cleanup failure")),
+            || {
+                synchronized.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(synchronized.get());
+        assert!(matches!(
+            result,
+            Err(PublishError::PublishedButCleanupFailed(_))
+        ));
+    }
+
+    #[test]
+    fn reports_both_post_publication_failures() {
+        let result = finish_publication(
+            || Err(io::Error::other("injected cleanup failure")),
+            || Err(io::Error::other("injected synchronization failure")),
+        );
+
+        let Err(PublishError::PublishedButCleanupAndSyncFailed { cleanup, sync }) = result else {
+            panic!("both failures were not retained");
+        };
+        assert_eq!(cleanup.to_string(), "injected cleanup failure");
+        assert_eq!(sync.to_string(), "injected synchronization failure");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removes_old_unlocked_partials_but_preserves_locked_ones() {
+        use std::fs::FileTimes;
+
+        let directory = TestDirectory::new();
+        let destination = directory.join("source.bin.bitrot");
+        let stale = directory.join("source.bin.bitrot.bitrot-partial-999999-recovery-0-0");
+        let active = directory.join("source.bin.bitrot.bitrot-partial-999999-sidecar-0-1");
+        let stale_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&stale)
+            .unwrap();
+        let active_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&active)
+            .unwrap();
+        let old = FileTimes::new().set_modified(UNIX_EPOCH);
+        stale_file.set_times(old).unwrap();
+        active_file.set_times(old).unwrap();
+        active_file.try_lock().unwrap();
+        let anchored = DestinationDirectory::open(&directory.0).unwrap();
+
+        cleanup_stale_temporaries(&anchored, destination.file_name().unwrap()).unwrap();
+
+        assert!(!stale.exists());
+        assert!(active.exists());
+        drop(active_file);
+        cleanup_stale_temporaries(&anchored, destination.file_name().unwrap()).unwrap();
+        assert!(!active.exists());
+    }
+
+    #[test]
+    fn guard_does_not_remove_a_replacement_at_its_temporary_path() {
+        let directory = TestDirectory::new();
+        let destination = directory.join("source.bin.bitrot");
+        let anchored = DestinationDirectory::open(&directory.0).unwrap();
+        let temporary = create_temporary(
+            &anchored,
+            destination.file_name().unwrap(),
+            TemporaryKind::Sidecar,
+        )
+        .unwrap();
+        let temporary_path = directory.0.join(temporary.name());
+        let moved = directory.join("moved-partial");
+        fs::rename(&temporary_path, &moved).unwrap();
+        fs::write(&temporary_path, b"not ours").unwrap();
+
+        assert!(matches!(
+            temporary.verify_path_identity(),
+            Err(PublishError::TemporaryIdentityChanged)
+        ));
+        drop(temporary);
+        assert_eq!(fs::read(&temporary_path).unwrap(), b"not ours");
+        assert!(moved.exists());
+    }
+
+    #[test]
+    fn destination_operations_remain_in_the_open_directory_after_rename() {
+        let root = TestDirectory::new();
+        let original = root.join("destination");
+        let moved = root.join("moved-destination");
+        fs::create_dir(&original).unwrap();
+        let anchored = DestinationDirectory::open(&original).unwrap();
+        let mut temporary = create_temporary(
+            &anchored,
+            std::ffi::OsStr::new("movie.bitrot"),
+            TemporaryKind::Sidecar,
+        )
+        .unwrap();
+        temporary.file.write_all(b"complete sidecar").unwrap();
+        temporary.file.sync_all().unwrap();
+
+        fs::rename(&original, &moved).unwrap();
+        fs::create_dir(&original).unwrap();
+        anchored
+            .hard_link(temporary.name(), std::ffi::OsStr::new("movie.bitrot"))
+            .unwrap();
+        temporary.remove().unwrap();
+        anchored.sync().unwrap();
+
+        assert_eq!(
+            fs::read(moved.join("movie.bitrot")).unwrap(),
+            b"complete sidecar"
+        );
+        assert!(!original.join("movie.bitrot").exists());
+    }
+
     #[cfg(unix)]
     #[test]
     fn refuses_to_replace_a_hard_link_to_the_source() {
@@ -1003,5 +1618,31 @@ mod tests {
             Err(PublishError::SourceIsSymlink)
         ));
         assert!(!destination.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn does_not_follow_an_existing_sidecar_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new();
+        let source = directory.join("source.bin");
+        let real_sidecar = directory.join("real.bitrot");
+        let destination = directory.join("source.bin.bitrot");
+        fs::write(&source, source_bytes()).unwrap();
+        publish(
+            &source,
+            &real_sidecar,
+            &options(),
+            ExistingSidecar::Preserve,
+        )
+        .unwrap();
+        symlink(&real_sidecar, &destination).unwrap();
+
+        assert!(matches!(
+            publish(&source, &destination, &options(), ExistingSidecar::Preserve),
+            Err(PublishError::ExistingConflict)
+        ));
+        assert_eq!(fs::read_link(&destination).unwrap(), real_sidecar);
     }
 }
